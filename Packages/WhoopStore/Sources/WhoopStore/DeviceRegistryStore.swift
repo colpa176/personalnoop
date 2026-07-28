@@ -110,6 +110,13 @@ public struct DeviceRegistryStore: Sendable {
         // v31-deep-capture-channels: the banked 5/MG v18 auxiliary fields are deviceId-keyed per-second
         // rows like every stream above, so a "delete all of this device's data" must clear them too.
         "v18AuxSample",
+        // v32-coach-conversation: the stored coach transcript is deviceId-keyed. In practice its rows sit
+        // under the STABLE `WhoopStore.coachDeviceId` namespace, not a strap id, so forgetting a strap
+        // never matches one — the same way `metricSeries`' "noop-mood" rows are untouched by a strap
+        // delete. Listed anyway: the column exists, and a delete-means-gone app should not rely on "no
+        // caller passes that id" to keep the guarantee. Clearing the transcript itself is
+        // `clearCoachTurns` (Settings → Coach → Clear conversation history).
+        "coachTurn",
     ]
 
     /// Permanently delete every recorded sample/derived row belonging to one device, across all

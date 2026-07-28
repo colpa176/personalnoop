@@ -694,6 +694,42 @@ extension WhoopStore {
                 t.primaryKey(["deviceId", "ts"])
             }
         }
+
+        // v32: durable AI Coach transcript. The coach's chat lived only in `AICoachEngine.messages`, an
+        // in-memory array on a single app-lifetime object, so every relaunch opened a blank transcript and
+        // the "Today's brief" re-fired as if the conversation had never happened.
+        //
+        // One row per TURN, keyed by the turn's own UUID rather than (deviceId, ts): two turns can land in
+        // the same second (a fast local model replies inside one), and a value-based key would silently
+        // drop the second — the data-loss trap the v24 note warns about. `sessionId` is the LOCAL day the
+        // turn was spoken on (`yyyy-MM-dd`), which is what groups a transcript into "sessions" for a
+        // once-a-day coaching app; `ts` orders within and across them.
+        //
+        // `deviceId` here is the STABLE `CoachConversationStore.coachDeviceId` namespace, never the active
+        // strap id. The transcript is user-authored text, not strap data: a remove+re-add gives the strap a
+        // fresh id (#814) and would otherwise orphan every past conversation.
+        //
+        // Additive, a NEW table, no existing row touched, so an old reader is unaffected. Retention is a
+        // rolling per-device row cap (`WhoopStore.coachTurnRetentionRows`) applied on append, so a
+        // long-lived chat is bounded on disk the same way it is bounded in memory.
+        //
+        // No Android Room twin in this commit: the Kotlin CoachViewModel keeps its in-memory transcript,
+        // so there is no Kotlin writer for this table and nothing for the schemas to disagree about. A
+        // maintainer adding Android persistence should land the matching Room migration then.
+        migrator.registerMigration("v32-coach-conversation") { db in
+            try db.create(table: "coachTurn") { t in
+                t.column("id", .text).primaryKey()          // the turn's UUID (ChatMessage.id)
+                t.column("deviceId", .text).notNull()
+                t.column("sessionId", .text).notNull()      // local day, YYYY-MM-DD
+                t.column("ts", .integer).notNull()          // unix seconds
+                t.column("role", .text).notNull()           // "user" | "assistant"
+                t.column("text", .text).notNull()
+            }
+            // Transcript reads walk one device in time order (and prune by the same order).
+            try db.create(index: "idx_coachTurn_device_ts",
+                          on: "coachTurn", columns: ["deviceId", "ts"])
+        }
+
         return migrator
     }
 }

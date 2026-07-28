@@ -80,7 +80,12 @@ struct CoachView: View {
                 }
             }
         }
-        .task(id: coach.dataConsent) { await coach.startBriefIfNeeded() }
+        // Restore the stored transcript, then (only if it's genuinely empty) open with today's brief.
+        // `loadHistoryIfNeeded` is idempotent, so re-running on a consent flip costs nothing.
+        .task(id: coach.dataConsent) {
+            await coach.loadHistoryIfNeeded()
+            await coach.startBriefIfNeeded()
+        }
     }
 
     /// Explicit, revocable permission for the coach to read & send the user's data. Off by default.

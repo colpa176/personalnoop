@@ -154,6 +154,14 @@ struct SettingsView: View {
     /// Confirm gate for the "Recalibrate Charge baseline" action (it re-learns the HRV anchor from tonight).
     @State private var showRecalibrateConfirm = false
 
+    /// Confirm gate for wiping the stored Coach transcript (v32 `coachTurn`) — a real delete, so it asks.
+    @State private var showClearCoachHistoryConfirm = false
+    /// Stored coach turns, read from the store for the Coach card's subtitle. Starts at 0, which also
+    /// leaves "Clear" disabled until the real count arrives — the safe way round for a destructive control.
+    @State private var coachTurnCount = 0
+    /// Bumped after a clear to re-key the count's `.task` and re-read it.
+    @State private var coachTurnCountSeq = 0
+
     /// "What's New" changelog sheet, reachable any time from About.
     @State private var showWhatsNew = false
 
@@ -207,6 +215,7 @@ struct SettingsView: View {
                 powerSavingCard.staggeredAppear(index: 5)
                 streakCard.staggeredAppear(index: 6)
                 featuresCard.staggeredAppear(index: 7)
+                coachCard.staggeredAppear(index: 8)
 
                 // Lower-frequency sections collapse behind a single default-closed disclosure so the
                 // screen opens at ~6 sections instead of 11. Nothing is removed; every section here
@@ -239,6 +248,13 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("This restarts the roughly 4-night build-up for Charge and your HRV baseline. Your history stays. Use it if a bad first week, like wearing it while sick, set your baseline off.")
+        }
+        .confirmationDialog("Clear your coach conversation?",
+                            isPresented: $showClearCoachHistoryConfirm, titleVisibility: .visible) {
+            Button("Clear conversation", role: .destructive) { clearCoachHistory() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Every stored message is deleted from \(Platform.deviceNounPhrase) and the coach starts fresh. This can't be undone. Your metrics, journal and scores are not affected.")
         }
         .confirmationDialog("Mark optical experiment phase",
                             isPresented: $showOpticalPhasePicker, titleVisibility: .visible) {
@@ -1269,6 +1285,68 @@ struct SettingsView: View {
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    // MARK: - Coach (stored conversation)
+
+    /// The Coach's conversation is now kept in the on-device database (v32 `coachTurn`) so it survives a
+    /// relaunch instead of opening blank every time. This is the way back out: a plain, confirmed wipe.
+    /// Deliberately here and not on the Coach screen itself — a destructive, rarely-wanted action does
+    /// not belong one mis-tap from the composer.
+    private var coachCard: some View {
+        SettingsSection(
+            icon: "bubble.left.and.bubble.right.fill",
+            title: "Coach",
+            blurb: "Your coaching conversation is remembered between sessions, stored on \(Platform.deviceNounPhrase) in the same local database as everything else. Nothing about it is uploaded."
+        ) {
+            VStack(alignment: .leading, spacing: NoopMetrics.space2 + 2) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Conversation history")
+                            .font(StrandFont.subhead)
+                            .foregroundStyle(StrandPalette.textPrimary)
+                        Text(coachHistoryDetail)
+                            .font(StrandFont.caption)
+                            .foregroundStyle(StrandPalette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button(role: .destructive) {
+                        showClearCoachHistoryConfirm = true
+                    } label: {
+                        Text("Clear")
+                    }
+                    .buttonStyle(NoopButtonStyle(.secondary))
+                    .disabled(coachTurnCount == 0)
+                    .accessibilityLabel("Clear coach conversation history")
+                }
+
+                Text("Clearing removes every stored turn and starts the coach fresh. Your metrics, journal and scores are untouched.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // Re-read the count on appear and after a clear, so the row never claims turns that are gone.
+            .task(id: coachTurnCountSeq) { coachTurnCount = await model.coach.storedTurnCount() }
+        }
+    }
+
+    /// Subtitle for the history row — the real stored count, or an honest empty state. Whole-phrase
+    /// variants per count so translators see complete sentences.
+    private var coachHistoryDetail: String {
+        switch coachTurnCount {
+        case 0: return String(localized: "Nothing stored yet.")
+        case 1: return String(localized: "1 message stored on \(Platform.deviceNounPhrase).")
+        default: return String(localized: "\(coachTurnCount) messages stored on \(Platform.deviceNounPhrase).")
+        }
+    }
+
+    /// Wipe the stored transcript, then bump the seq so the count row re-reads.
+    private func clearCoachHistory() {
+        Task {
+            await model.coach.clearHistory()
+            coachTurnCountSeq &+= 1
         }
     }
 

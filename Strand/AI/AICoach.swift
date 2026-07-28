@@ -28,11 +28,29 @@ struct ChatMessage: Identifiable, Equatable {
     let id: UUID
     let role: Role
     let text: String
+    /// When the turn was spoken. Carried so a turn restored from the store keeps its original time
+    /// rather than being restamped to "when the app happened to reopen".
+    let at: Date
 
-    init(id: UUID = UUID(), role: Role, text: String) {
+    init(id: UUID = UUID(), role: Role, text: String, at: Date = Date()) {
         self.id = id
         self.role = role
         self.text = text
+        self.at = at
+    }
+
+    /// Rehydrate a stored turn. An unrecognised role is dropped by the caller rather than guessed at.
+    init?(_ turn: CoachTurn) {
+        guard let role = Role(rawValue: turn.role), let id = UUID(uuidString: turn.id) else { return nil }
+        self.init(id: id, role: role, text: turn.text,
+                  at: Date(timeIntervalSince1970: TimeInterval(turn.ts)))
+    }
+
+    /// The storable form of this turn. `sessionId` is the LOCAL day it was spoken on, which is how the
+    /// store groups a transcript into sessions.
+    func storedTurn(sessionId: String) -> CoachTurn {
+        CoachTurn(id: id.uuidString, sessionId: sessionId, ts: Int(at.timeIntervalSince1970),
+                  role: role.rawValue, text: text)
     }
 }
 
@@ -465,6 +483,66 @@ final class AICoachEngine: ObservableObject {
         if messages.count > Self.maxStoredMessages {
             messages.removeFirst(messages.count - Self.maxStoredMessages)
         }
+        persist(message)
+    }
+
+    // MARK: - Durable transcript (v32 `coachTurn`)
+    //
+    // `messages` is the in-memory transcript; the store is its durable mirror. The two caps are
+    // deliberately different: `maxStoredMessages` (40) bounds what is held in RAM and rendered, while
+    // `WhoopStore.coachTurnRetentionRows` (500) bounds what is kept on disk — so trimming the live
+    // array never deletes history, and reopening the app restores the most recent window of it.
+    //
+    // Local-only, like everything else in NOOP: the transcript lands in the same on-device SQLite file
+    // as the strap streams. Persisting a turn adds no network call — a turn only exists because the user
+    // already chose to send it.
+
+    /// True once a load has been attempted, so re-entering the Coach screen doesn't re-read (or worse,
+    /// duplicate) the transcript. Set even when the load fails, so a broken store degrades to a blank
+    /// chat instead of retrying on every appearance.
+    private var historyLoaded = false
+
+    /// Restore the stored transcript into `messages`. Idempotent and safe to call from `.task`. Called
+    /// before `startBriefIfNeeded`, whose `messages.isEmpty` guard is what stops the daily brief from
+    /// re-firing over a conversation the user already had.
+    func loadHistoryIfNeeded() async {
+        guard !historyLoaded else { return }
+        historyLoaded = true
+        guard messages.isEmpty else { return }   // a send raced the load; the live turns win
+        guard let store = await repo.storeHandle() else { return }
+        let turns = (try? await store.coachTurns(limit: Self.maxStoredMessages)) ?? []
+        guard !turns.isEmpty else { return }
+        // Drop (rather than guess at) any row whose role or id no longer parses.
+        messages = turns.compactMap(ChatMessage.init)
+    }
+
+    /// Mirror one turn into the store. Fire-and-forget: a failed write must never block or fail the
+    /// chat itself — the turn is already in `messages` and on screen, and losing durability is a far
+    /// smaller harm than dropping the reply the user is waiting on.
+    private func persist(_ message: ChatMessage) {
+        let turn = message.storedTurn(sessionId: Repository.localDayKey(message.at))
+        Task {
+            guard let store = await repo.storeHandle() else { return }
+            try? await store.appendCoachTurn(turn)
+        }
+    }
+
+    /// Erase the conversation — both the live transcript and its stored mirror. Backs the Settings
+    /// control. Clears `historyLoaded` so the next open starts genuinely fresh (and, with data consent
+    /// on, lets `startBriefIfNeeded` produce a new brief for an empty chat).
+    func clearHistory() async {
+        messages.removeAll()
+        errorText = nil
+        historyLoaded = false
+        guard let store = await repo.storeHandle() else { return }
+        _ = try? await store.clearCoachTurns()
+    }
+
+    /// How many turns are on disk — drives the Settings row's subtitle and disables the clear control
+    /// when there is nothing to clear.
+    func storedTurnCount() async -> Int {
+        guard let store = await repo.storeHandle() else { return 0 }
+        return (try? await store.coachTurnCount()) ?? 0
     }
 
     /// Send a question: append it, build the metrics context, call the chosen provider with the
@@ -501,6 +579,9 @@ final class AICoachEngine: ObservableObject {
     /// Proactively generate "Today's brief" the first time the Coach opens, readiness + a training
     /// prescription + one recovery tip, without the user typing. Requires a key + data consent.
     func startBriefIfNeeded() async {
+        // Restore first: the `messages.isEmpty` guard below is what stops the brief re-firing over a
+        // conversation the user already had, so it has to see the RESTORED transcript, not a blank one.
+        await loadHistoryIfNeeded()
         guard isConfigured, dataConsent, messages.isEmpty, !sending else { return }
         guard let key = resolvedKey else { return }
         errorText = nil
