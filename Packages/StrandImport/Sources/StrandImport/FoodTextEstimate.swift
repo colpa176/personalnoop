@@ -137,10 +137,16 @@ public enum FoodTextEstimator {
     /// unit or stray text ("620 kcal", "~35g"). Explicit null, booleans and ranges ("400-600") are
     /// rejected: a range is not an estimate, and picking an end of it would be inventing precision.
     static func coerceNumber(_ raw: Any) -> Double? {
-        if raw is Bool { return nil }                       // `true` is not a quantity
+        // JSONSerialization hands back every number as NSNumber, so this branch covers ints and doubles
+        // alike. Booleans arrive as the distinct __NSCFBoolean, identified by CoreFoundation type id —
+        // NOT by `is Bool`, which succeeds for any NSNumber whose value is 0 or 1 and would therefore
+        // have thrown away a legitimate `"fat_g": 0`, turning a recorded zero into "unknown".
+        if let n = raw as? NSNumber {
+            guard CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+            return n.doubleValue
+        }
         if let d = raw as? Double { return d }
         if let i = raw as? Int { return Double(i) }
-        if let n = raw as? NSNumber { return n.doubleValue }
         guard let s = raw as? String else { return nil }
 
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)

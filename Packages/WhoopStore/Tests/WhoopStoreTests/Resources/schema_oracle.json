@@ -32,7 +32,9 @@
     "v28-raw-imu",
     "v29-score-input-provenance",
     "v30-rr-ord",
-    "v31-deep-capture-channels"
+    "v31-deep-capture-channels",
+    "v32-coach-conversation",
+    "v33-food-log"
   ],
   "divergenceReasons": {
     "android-orphan-synced-column": "REAL COLUMN DRIFT: `synced` exists on Android only. GRDB's v10 note is explicit that stepSample gets no `synced` column ('unused; see StreamStore'), and v12's ppgHrSample never had one either; the Room entities copied the flag from the older per-second entities. Nothing reads it on Android \u2014 the per-row upload flag belongs to an upload path that does not exist there \u2014 so it is dead width, not divergent data. Removing it needs a Room table rebuild.",
@@ -177,6 +179,61 @@
       ],
       "androidColumnOrderDivergence": "battery-alter-append-order",
       "indices": []
+    },
+    "coachTurn": {
+      "platform": "ios_only",
+      "reason": "Durable AI Coach transcript (GRDB v32). Android's CoachViewModel keeps its chat in memory, so there is no Kotlin writer and no Room twin to compare against. `id` is TEXT PRIMARY KEY, which SQLite leaves NULLable (see sqlite-text-pk-nullable); with no Android side there is no drift to record for it.",
+      "columns": [
+        {
+          "name": "id",
+          "affinity": "TEXT",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "deviceId",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "sessionId",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "ts",
+          "affinity": "INTEGER",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "role",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "text",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        }
+      ],
+      "primaryKey": [
+        "id"
+      ],
+      "indices": [
+        {
+          "name": "idx_coachTurn_device_ts",
+          "unique": false,
+          "columns": [
+            "deviceId",
+            "ts"
+          ]
+        }
+      ]
     },
     "cursors": {
       "platform": "ios_only",
@@ -512,6 +569,86 @@
         "kind"
       ],
       "indices": []
+    },
+    "foodLogEntry": {
+      "platform": "ios_only",
+      "reason": "Manually logged food entries (GRDB v33). There is no Kotlin food-log writer, so there is no Room twin to compare against. The macro columns are deliberately nullable with no DEFAULT: an unrecorded macro must stay absent rather than become a fabricated 0.",
+      "columns": [
+        {
+          "name": "id",
+          "affinity": "TEXT",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "deviceId",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "day",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "ts",
+          "affinity": "INTEGER",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "text",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        },
+        {
+          "name": "kcal",
+          "affinity": "REAL",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "proteinG",
+          "affinity": "REAL",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "carbsG",
+          "affinity": "REAL",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "fatG",
+          "affinity": "REAL",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "source",
+          "affinity": "TEXT",
+          "notNull": true,
+          "default": null
+        }
+      ],
+      "primaryKey": [
+        "id"
+      ],
+      "indices": [
+        {
+          "name": "idx_foodLogEntry_device_day_ts",
+          "unique": false,
+          "columns": [
+            "deviceId",
+            "day",
+            "ts"
+          ]
+        }
+      ]
     },
     "gravitySample": {
       "platform": "both",

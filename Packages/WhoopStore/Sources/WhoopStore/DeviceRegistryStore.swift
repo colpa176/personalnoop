@@ -117,6 +117,10 @@ public struct DeviceRegistryStore: Sendable {
         // caller passes that id" to keep the guarantee. Clearing the transcript itself is
         // `clearCoachTurns` (Settings → Coach → Clear conversation history).
         "coachTurn",
+        // v33-food-log: same shape and same reasoning as coachTurn — deviceId-keyed, but its rows live
+        // under the stable `WhoopStore.foodDeviceId` namespace rather than a strap id, so forgetting a
+        // strap never matches one. Listed so the column is covered rather than trusted.
+        "foodLogEntry",
     ]
 
     /// Permanently delete every recorded sample/derived row belonging to one device, across all

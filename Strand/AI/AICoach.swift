@@ -513,7 +513,7 @@ final class AICoachEngine: ObservableObject {
         let turns = (try? await store.coachTurns(limit: Self.maxStoredMessages)) ?? []
         guard !turns.isEmpty else { return }
         // Drop (rather than guess at) any row whose role or id no longer parses.
-        messages = turns.compactMap(ChatMessage.init)
+        messages = turns.compactMap { ChatMessage($0) }
     }
 
     /// Mirror one turn into the store. Fire-and-forget: a failed write must never block or fail the

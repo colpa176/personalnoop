@@ -214,10 +214,21 @@ extension WhoopStore {
 
     // MARK: - Row mapping
 
+    /// Every column is bound to an explicitly-typed local first. `FoodLogEntry` has two inits with the
+    /// same argument labels (one taking `FoodEntrySource`, one taking the raw `String`), so leaving the
+    /// types to be inferred from GRDB's generic `Row` subscript would make the call ambiguous.
     private static func entry(from row: Row) -> FoodLogEntry {
-        FoodLogEntry(id: row["id"], day: row["day"], ts: row["ts"], text: row["text"],
-                     kcal: row["kcal"], proteinG: row["proteinG"],
-                     carbsG: row["carbsG"], fatG: row["fatG"],
-                     source: row["source"])
+        let id: String = row["id"]
+        let day: String = row["day"]
+        let ts: Int = row["ts"]
+        let text: String = row["text"]
+        let kcal: Double? = row["kcal"]
+        let proteinG: Double? = row["proteinG"]
+        let carbsG: Double? = row["carbsG"]
+        let fatG: Double? = row["fatG"]
+        let source: String = row["source"]
+        return FoodLogEntry(id: id, day: day, ts: ts, text: text,
+                            kcal: kcal, proteinG: proteinG, carbsG: carbsG, fatG: fatG,
+                            source: source)
     }
 }
