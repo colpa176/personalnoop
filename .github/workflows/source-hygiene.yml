@@ -18,8 +18,12 @@ on:
     branches: [main]
   # Audit main itself too, not just PRs into it — a release pushes straight to main with no PR, so a
   # PR-only trigger would let a regression land unaudited. Same reasoning as i18n-coverage.yml.
+  #
+  # Fork change: every branch, not just main, matching app-build / swift-packages / i18n-coverage. A
+  # fork that merges straight to main would otherwise first learn about a detached doc comment once it
+  # was already on the branch the phone installs from. Seconds of ubuntu-latest per branch.
   push:
-    branches: [main]
+    branches: ['**']
 
 concurrency:
   group: source-hygiene-${{ github.ref }}
