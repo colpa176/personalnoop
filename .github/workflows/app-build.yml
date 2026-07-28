@@ -19,8 +19,16 @@ on:
       - 'Packages/**'
       - 'project.yml'
       - '.github/workflows/app-build.yml'
+  # Fork change: build EVERY branch, not just main. This is the ONLY job that compiles the app targets —
+  # `swift-packages.yml` covers `Packages/**` alone — so a change under `Strand/`, `StrandiOS/` or
+  # `StrandiOSWidgets/` has no other gate at all. Restricted to main, an app-target compile error was only
+  # discoverable once it had already been merged into the branch the phone installs from, which is exactly
+  # backwards. The `paths` filter and the cancel-in-progress concurrency group keep this cheap.
+  #
+  # NOTE: the `cleanup` job below deletes `ci/`-prefixed branches after a run (they are disposable dispatch
+  # branches). Do not name a real working branch `ci/…`.
   push:
-    branches: [main]
+    branches: ['**']
     paths:
       - 'Strand/**'
       - 'StrandiOS/**'

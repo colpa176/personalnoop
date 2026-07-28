@@ -13,8 +13,13 @@ on:
     paths:
       - 'Packages/**'
       - '.github/workflows/swift-packages.yml'
+  # Fork change: build EVERY branch, not just main. A branch that only ever compiles once it has been
+  # merged tests nothing — the point of working on a branch is to catch the break before it reaches main
+  # (and, for a sideloaded install, before the phone auto-updates from main). The `paths` filter and the
+  # cancel-in-progress concurrency group below still keep this cheap: a branch push that touches no
+  # package file starts no job, and a rapid re-push cancels the previous run.
   push:
-    branches: [main]
+    branches: ['**']
     paths:
       - 'Packages/**'
       - '.github/workflows/swift-packages.yml'
