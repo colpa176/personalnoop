@@ -50,6 +50,30 @@ extension WhoopStore {
         return n
     }
 
+    // MARK: - Delete
+
+    /// Remove specific `keys` for one day under one source. Returns rows deleted.
+    ///
+    /// The upsert above can only ever write a value, so a caller that re-derives a day's rollup from
+    /// some other table has no way to express "this metric is no longer present for this day" — the last
+    /// value written would linger as a stale total after the row it came from was deleted. This is that
+    /// missing half. Scoped to an explicit key list and a single day so it can never widen into the
+    /// window-wide delete the migration guidance warns about.
+    @discardableResult
+    public func deleteMetricSeries(deviceId: String, day: String, keys: [String]) async throws -> Int {
+        guard !keys.isEmpty else { return 0 }
+        return try syncWrite { db in
+            var n = 0
+            for key in keys {
+                try db.execute(sql: """
+                    DELETE FROM metricSeries WHERE deviceId = ? AND day = ? AND key = ?
+                    """, arguments: [deviceId, day, key])
+                n += db.changesCount
+            }
+            return n
+        }
+    }
+
     // MARK: - Reads
 
     /// Points for a single `key` on days in [from, to] (lexicographic YYYY-MM-DD compare),

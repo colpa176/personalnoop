@@ -730,6 +730,49 @@ extension WhoopStore {
                           on: "coachTurn", columns: ["deviceId", "ts"])
         }
 
+        // v33: manually logged food entries. The nutrition model NOOP already has is DAILY TOTALS in the
+        // long-format `metricSeries` table (`NutritionCsvImporter` → source "nutrition-csv", keys
+        // calories_in / protein_g / carbs_g / fat_g). That shape cannot hold "chicken breast and rice for
+        // lunch, 620 kcal": a (day, key, value) row has nowhere to put the item text, the time, or where
+        // the numbers came from. So per-entry rows need their own table.
+        //
+        // This is NOT a parallel nutrition model. Entries roll UP into those very same metricSeries keys
+        // (`FoodLogStore.dayTotals` → the app's `saveFoodEntry`), so Explore, Compare and Insights read
+        // logged food through the exact path they already read an imported CSV through — no new chart, no
+        // second set of keys. The rollup is written under its OWN source id ("food-log") rather than
+        // "nutrition-csv" because metricSeries upserts are latest-wins on (deviceId, day, key): sharing
+        // the id would make a Cronometer import and a manual entry silently clobber each other's totals
+        // for the same day, in whichever order they happened to be written.
+        //
+        // `deviceId` is the stable `FoodLogStore.foodDeviceId` namespace — same reasoning as v32, this is
+        // user-authored data that must survive a strap remove+re-add (#814).
+        //
+        // `kcal` / `proteinG` / `carbsG` / `fatG` are NULLABLE and carry NO DEFAULT. An estimate that
+        // could not resolve a macro must stay ABSENT rather than become a fabricated 0 — the same rule
+        // the caffeine log follows for an unknown dose ("we never invent mg") — and the day totals sum
+        // only the values actually present. `source` records how the numbers were produced ("ai" |
+        // "manual") so an LLM's guess is never displayed as though it had been measured.
+        //
+        // Additive, a NEW table, no existing row touched. No Android Room twin: there is no Kotlin
+        // food-log writer, so there is no schema for the two platforms to disagree about.
+        migrator.registerMigration("v33-food-log") { db in
+            try db.create(table: "foodLogEntry") { t in
+                t.column("id", .text).primaryKey()          // the entry's UUID
+                t.column("deviceId", .text).notNull()
+                t.column("day", .text).notNull()            // local day, YYYY-MM-DD
+                t.column("ts", .integer).notNull()          // unix seconds, when it was logged
+                t.column("text", .text).notNull()           // what the user typed
+                t.column("kcal", .double)
+                t.column("proteinG", .double)
+                t.column("carbsG", .double)
+                t.column("fatG", .double)
+                t.column("source", .text).notNull()         // "ai" | "manual"
+            }
+            // The card reads one device's entries for one day, in time order.
+            try db.create(index: "idx_foodLogEntry_device_day_ts",
+                          on: "foodLogEntry", columns: ["deviceId", "day", "ts"])
+        }
+
         return migrator
     }
 }

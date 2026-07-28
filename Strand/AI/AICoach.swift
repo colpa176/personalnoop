@@ -695,6 +695,29 @@ final class AICoachEngine: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
+    /// A ONE-SHOT completion that is not part of the coaching chat: it carries its own system prompt,
+    /// sends exactly the text handed to it, and touches neither `messages` nor the stored transcript.
+    /// Used by the food-log macro estimate, which reuses the connection the user already configured
+    /// rather than introducing a second provider setup.
+    ///
+    /// Deliberately NOT gated on `dataConsent`: that toggle governs whether the user's BIOMETRIC data
+    /// rides along with a question, and nothing here sends any. What goes out is the sentence the user
+    /// typed and submitted, and only when they tap the button that sends it — the same "nothing is sent
+    /// until you ask" contract the composer has.
+    ///
+    /// Throws `AICoachError.noKey` when no provider is configured, which is the caller's cue to fall
+    /// back to a manual, zero-network path.
+    func complete(systemPrompt: String, userText: String) async throws -> String {
+        guard isConfigured, let key = resolvedKey else { throw AICoachError.noKey }
+        return try await provider.client.send(
+            key: key,
+            model: model,
+            systemPrompt: systemPrompt,
+            messages: [(.user, userText)],
+            session: session
+        )
+    }
+
     /// Dispatch to the user's chosen provider client.
     private func callProvider(key: String,
                               messages: [(role: ChatMessage.Role, content: String)]) async throws -> String {

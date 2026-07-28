@@ -83,6 +83,12 @@ private struct HealthSectionsStack: View {
             // awareness, each driven by a pure StrandAnalytics engine result the analytics pass
             // computed and AppModel publishes. Its own view depending on `model` + `repo`.
             SkinTempSection()
+            // Food log: type what you ate, optionally have the configured Coach model estimate the
+            // macros, see the day's running totals. Self-contained (owns its own load/state), and sits
+            // here rather than on Today because its totals belong beside the other body data — and
+            // because the day's nutrition rolls up into the same metric-series keys the nutrition CSV
+            // importer under "Records & sources" below already writes. Depends only on `repo`/`model`.
+            FoodLogCard()
             // v5 deep-links: the records logbook + the multi-device fused record, reachable
             // from their honest Health home as drill-in rows (not their own destinations).
             HealthHubLinksSection()

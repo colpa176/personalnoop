@@ -23,6 +23,7 @@ struct MetricDescriptor: Identifiable, Hashable {
         case "apple-health": return "Apple Health"
         case "xiaomi-band":  return "Mi Band"
         case "nutrition-csv": return String(localized: "Nutrition")
+        case "food-log":     return String(localized: "Food Log")
         case "noop-mood":    return String(localized: "Mood")
         default:             return "Whoop"   // "my-whoop" + on-device computed sources
         }
@@ -187,6 +188,14 @@ enum MetricCatalog {
         d("protein_g", String(localized: "Protein"), "Nutrition", "g", "nutrition-csv", "p.circle", 0, nil),
         d("carbs_g", String(localized: "Carbs"), "Nutrition", "g", "nutrition-csv", "c.circle", 0, nil),
         d("fat_g", String(localized: "Fat"), "Nutrition", "g", "nutrition-csv", "f.circle", 0, nil),
+
+        // ── Food log (typed in NOOP, rolled up daily). Same four keys as the CSV import above so the
+        //    two are directly comparable, under a distinct `source` so neither can overwrite the other's
+        //    totals for a day (metricSeries upserts are latest-wins on (deviceId, day, key)).
+        d("calories_in", String(localized: "Calories In"), "Nutrition", "kcal", "food-log", "fork.knife", 0, nil),
+        d("protein_g", String(localized: "Protein"), "Nutrition", "g", "food-log", "p.circle", 0, nil),
+        d("carbs_g", String(localized: "Carbs"), "Nutrition", "g", "food-log", "c.circle", 0, nil),
+        d("fat_g", String(localized: "Fat"), "Nutrition", "g", "food-log", "f.circle", 0, nil),
 
         // ── Mind (daily mood check-in, 1–5; non-clinical self-tracking)
         d("mood", String(localized: "Mood"), "Mind", "/5", "noop-mood", "face.smiling", 0, true),
