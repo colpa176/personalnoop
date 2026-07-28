@@ -18,8 +18,13 @@ on:
   # it then red-checked EVERY contributor's PR on a line none of them touched (9.0.1, fixed by
   # #514). Auditing the push surfaces it on main the moment it lands, so it is fixed before anyone
   # else trips over it. Same 8-second job; no new cost.
+  #
+  # Fork change: every branch, not just main. This gate is what catches new UI copy landing without its
+  # translations, and a fork that merges straight to main (no PR) would otherwise only ever learn about
+  # a gap AFTER it is on the branch the phone installs from. It is a pure-Python 8-second job on
+  # ubuntu-latest, so running it per branch costs essentially nothing.
   push:
-    branches: [main]
+    branches: ['**']
 
 concurrency:
   group: i18n-coverage-${{ github.ref }}
