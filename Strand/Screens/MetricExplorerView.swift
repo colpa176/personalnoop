@@ -624,6 +624,41 @@ struct MetricDetailView: View {
 
     private var latest: (day: String, value: Double)? { series.last }
 
+    /// Metric-specific empty-state guidance for the metrics the generic "import a WHOOP export" copy is
+    /// WRONG about, or nil to use that generic copy.
+    ///
+    /// The generic line is a dead end for these three — it names the one action that cannot unblock them,
+    /// which is the same failure the `fitness_age` branch below was special-cased to fix:
+    ///
+    ///   • `weight` — the strap has no weight sensor at all, so no export will ever carry it. It is sourced
+    ///     from Apple Health body mass, which `HealthKitBridge` already reads (`.bodyMass`, under the
+    ///     apple-health source, #20).
+    ///   • `steps_est` — NOT import-gated. The estimate runs on the strap's own LIVE motion volume, but
+    ///     `IntelligenceEngine` keeps it inert until it has a calibration, and calibrating needs days with
+    ///     BOTH strap motion and a real phone step count (or a manual coefficient). An export never
+    ///     supplies either.
+    ///   • `spo2` — the 4.0's raw red/IR channels ARE decoded live (#93), but they are banked as raw ADC;
+    ///     turning them into a blood-oxygen PERCENT needs WHOOP's own calibration curve, so this key
+    ///     genuinely is export-only. Worth saying plainly rather than implying it behaves like the rest.
+    ///
+    /// Matched on (key, source) rather than key alone: `spo2` and `steps` also exist under `xiaomi-band`,
+    /// where a WHOOP export is beside the point and this WHOOP-specific wording would be wrong.
+    static func emptyStateGuidance(key: String, source: String) -> (copy: LocalizedStringKey, symbol: String)? {
+        switch (key, source) {
+        case ("weight", "apple-health"):
+            return ("Your strap has no weight sensor, so a WHOOP export will never fill this. Weight comes from Apple Health — connect it in Data Sources and log your weight there.",
+                    "scalemass")
+        case ("steps_est", "my-whoop"):
+            return ("This estimate reads your strap's own motion, so it needs no import — but it stays blank until it has been calibrated against real step counts. Connect Apple Health in Data Sources for a few days, or set a manual step coefficient in Settings.",
+                    "figure.walk.motion")
+        case ("spo2", "my-whoop"):
+            return ("Your strap's blood-oxygen sensor is read live, but turning that into a percentage needs WHOOP's own calibration — so this one really does come from a WHOOP export in Data Sources.",
+                    "drop")
+        default:
+            return nil
+        }
+    }
+
     // MARK: Body
 
     var body: some View {
@@ -671,6 +706,11 @@ struct MetricDetailView: View {
                                 .buttonStyle(.plain)
                             }
                         }
+                    } else if let g = Self.emptyStateGuidance(key: metric.key, source: metric.source) {
+                        // A metric a WHOOP export can never fill, or cannot fill on its own. Same reasoning
+                        // as the fitness_age branch above: the generic copy names an action that does not
+                        // help, which is a dead end rather than an inaccuracy.
+                        ComingSoon(what: g.copy, symbol: g.symbol)
                     } else {
                         ComingSoon(what: "Import your history first. A WHOOP export in Data Sources fills every metric you can explore here in about a minute.")
                     }
