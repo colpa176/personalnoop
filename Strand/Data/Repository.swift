@@ -488,6 +488,12 @@ final class Repository: ObservableObject {
     }()
     static func localDayKey(_ date: Date) -> String { dayKeyFormatter.string(from: date) }
 
+    /// Inverse of `localDayKey` — the local midnight a `yyyy-MM-dd` key names, or nil when the string
+    /// isn't a day key. Chart series are keyed by day STRING in the store but plotted against `Date`,
+    /// so the two directions have to share one formatter (this one) rather than each caller minting its
+    /// own with a different locale or zone.
+    static func localDay(fromKey key: String) -> Date? { dayKeyFormatter.date(from: key) }
+
     /// The hour the LOGICAL day rolls (04:00 local). Between midnight and this hour, "Today" stays put.
     nonisolated static let logicalDayRolloverHour = 4
 

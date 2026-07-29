@@ -39,6 +39,24 @@ extension Repository {
         return try? await store.foodDayTotals(day: day)
     }
 
+    /// Per-day totals across an inclusive day range, oldest day first. One grouped read, so the Nutrition
+    /// tab's trend graphs don't fan out into a query per day. Days with nothing logged are absent from the
+    /// result (never zero rows), so a gap in the trend reads as "nothing logged", not as "ate nothing".
+    func foodTotals(from: String, to: String) async -> [FoodDayTotals] {
+        guard let store = await storeHandle() else { return [] }
+        return (try? await store.foodDayTotals(from: from, to: to)) ?? []
+    }
+
+    /// The last `days` local day keys, oldest first, ending today — the x-axis the nutrition trends walk.
+    /// Shared by the food and hydration series so both graphs cover exactly the same window.
+    static func recentDayKeys(_ days: Int, now: Date = Date()) -> [String] {
+        guard days > 0 else { return [] }
+        let cal = Calendar.current
+        return (0..<days).reversed().compactMap { back in
+            cal.date(byAdding: .day, value: -back, to: now).map { localDayKey($0) }
+        }
+    }
+
     // MARK: - Write
 
     /// Save (or edit) one entry, then re-derive and publish that day's totals.

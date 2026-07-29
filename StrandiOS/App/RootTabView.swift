@@ -26,12 +26,12 @@ struct RootTabView: View {
     /// root view alive, so an at-root re-tap keeps scroll position and never re-runs `.task`
     /// (#198; the #197 resetID/`.id()` rebuild reset both). Requires the tab roots' first-hop
     /// links to push `TabRoute`/`MoreDestination` VALUES — closure-destination links bypass the path.
-    @State private var tabPaths: [NavigationPath] = Array(repeating: NavigationPath(), count: 4)
+    @State private var tabPaths: [NavigationPath] = Array(repeating: NavigationPath(), count: RootTabView.tabCount)
     /// One scroll-to-top token per tab. Bumped when the user re-taps the active tab while it's ALREADY
     /// at its root — the other half of the iOS convention #197/#198 left unserved (an at-root re-tap was
     /// a no-op). Threaded into each tab's root via `\.scrollToTopSignal`; ScreenScaffold / LiquidTodayView
     /// scroll to their top anchor when their tab's token changes.
-    @State private var scrollTop: [Int] = Array(repeating: 0, count: 4)
+    @State private var scrollTop: [Int] = Array(repeating: 0, count: RootTabView.tabCount)
     /// Which More-tab groups are expanded (S2). Insights + Body stay open at rest; Data + App collapse to
     /// just their header until tapped. Persisted (#860 item 2): the user's open/closed choice must SURVIVE
     /// leaving and re-entering the More tab (and relaunch), not reset to the seed every visit. Backed by an
@@ -39,6 +39,13 @@ struct RootTabView: View {
     /// `Set<String>` through `MoreSectionPrefs` so the section logic below is unchanged.
     @AppStorage(MoreSectionPrefs.storageKey) private var expandedMoreSectionsCSV = MoreSectionPrefs.defaultCSV
     private var expandedMoreSections: Set<String> { MoreSectionPrefs.decode(expandedMoreSectionsCSV) }
+
+    /// How many primary tabs the bar carries (Today / Trends / Sleep / Nutrition / More). `tabPaths`,
+    /// `scrollTop` and the anywhere-swipe clamp all size themselves from this, so adding a tab is one
+    /// constant plus its `tab(...)` row rather than four separate literals that can silently disagree —
+    /// a stale clamp would make the last tab unreachable by swipe, and a short array would crash on
+    /// `tabPaths[4]`. `FloatingTabBar.nav` below must list the same number of items.
+    static let tabCount = 5
 
     /// V8 liquid redesign is the default Today; the Settings toggle lets a user fall back to the classic
     /// Today if they prefer it (keyed identically to the SettingsView toggle). Default ON.
@@ -78,7 +85,7 @@ struct RootTabView: View {
                 guard selectedTab != 0 else { return }
                 let dx = v.translation.width, dy = v.translation.height
                 guard abs(dx) > 60, abs(dx) > abs(dy) * 1.6 else { return }
-                let next = min(3, max(0, selectedTab + (dx < 0 ? 1 : -1)))
+                let next = min(Self.tabCount - 1, max(0, selectedTab + (dx < 0 ? 1 : -1)))
                 if next != selectedTab {
                     withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = next }
                 }
@@ -97,7 +104,11 @@ struct RootTabView: View {
                 tab(todayTabRoot, "Today", "square.grid.2x2", path: $tabPaths[0], scrollSignal: scrollTop[0]).tag(0)
                 tab(TrendsView(), "Trends", "chart.line.uptrend.xyaxis", path: $tabPaths[1], scrollSignal: scrollTop[1]).tag(1)
                 tab(SleepView(), "Sleep", "bed.double", path: $tabPaths[2], scrollSignal: scrollTop[2]).tag(2)
-                moreTab(path: $tabPaths[3], scrollSignal: scrollTop[3]).tag(3)
+                tab(NutritionView(), "Nutrition", "fork.knife", path: $tabPaths[3], scrollSignal: scrollTop[3]).tag(3)
+                // More stays LAST — the catch-all index belongs at the end of the bar, so Nutrition is
+                // inserted before it rather than appended after (which is also why every index below
+                // moved from 3 to 4).
+                moreTab(path: $tabPaths[4], scrollSignal: scrollTop[4]).tag(4)
             }
             .tint(StrandPalette.accent)
             .toolbar(.hidden, for: .tabBar)
@@ -665,16 +676,14 @@ private struct FloatingTabBar: View {
     private let nav = [Item(title: "Today", icon: "square.grid.2x2", tag: 0),
                        Item(title: "Trends", icon: "chart.line.uptrend.xyaxis", tag: 1),
                        Item(title: "Sleep", icon: "bed.double", tag: 2),
-                       Item(title: "More", icon: "ellipsis", tag: 3)]
+                       Item(title: "Nutrition", icon: "fork.knife", tag: 3),
+                       Item(title: "More", icon: "ellipsis", tag: 4)]
 
     var body: some View {
-        // One frosted glass bar, four evenly-spaced tabs. The quick-action "+" now lives in the
+        // One frosted glass bar, five evenly-spaced tabs. The quick-action "+" now lives in the
         // top-right of each screen's header (balancing the profile avatar on the left).
         HStack(spacing: 2) {
-            tabButton(nav[0])
-            tabButton(nav[1])
-            tabButton(nav[2])
-            tabButton(nav[3])
+            ForEach(nav) { tabButton($0) }
         }
         .padding(.vertical, 7)
         .padding(.horizontal, 8)

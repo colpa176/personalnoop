@@ -198,6 +198,38 @@ extension WhoopStore {
         }
     }
 
+    /// Per-day summed macros across a day range (inclusive, lexicographic `yyyy-MM-dd` compare), oldest
+    /// day first. One GROUP BY instead of a `foodDayTotals(day:)` per day, so a 90-day nutrition trend is
+    /// a single read rather than 90 round-trips.
+    ///
+    /// Days with NO entries are simply absent from the result rather than present as zero rows — the same
+    /// rule the single-day rollup follows. A gap in a trend line means "nothing logged", which is not the
+    /// same claim as "ate nothing", and the caller must stay able to tell those apart.
+    public func foodDayTotals(deviceId: String = WhoopStore.foodDeviceId,
+                              from: String, to: String) async throws -> [FoodDayTotals] {
+        try syncRead { db in
+            try Row.fetchAll(db, sql: """
+                SELECT day, COUNT(*) AS n,
+                       SUM(kcal) AS kcal, SUM(proteinG) AS proteinG,
+                       SUM(carbsG) AS carbsG, SUM(fatG) AS fatG
+                FROM foodLogEntry
+                WHERE deviceId = ? AND day >= ? AND day <= ?
+                GROUP BY day
+                ORDER BY day ASC
+                """, arguments: [deviceId, from, to])
+                .map { row in
+                    let day: String = row["day"]
+                    let count: Int = row["n"]
+                    let kcal: Double? = row["kcal"]
+                    let proteinG: Double? = row["proteinG"]
+                    let carbsG: Double? = row["carbsG"]
+                    let fatG: Double? = row["fatG"]
+                    return FoodDayTotals(day: day, kcal: kcal, proteinG: proteinG,
+                                         carbsG: carbsG, fatG: fatG, entryCount: count)
+                }
+        }
+    }
+
     /// Distinct days that have at least one entry, newest first.
     public func foodLogDays(deviceId: String = WhoopStore.foodDeviceId,
                             limit: Int = 400) async throws -> [String] {

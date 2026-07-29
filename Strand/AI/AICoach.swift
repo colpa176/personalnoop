@@ -619,6 +619,12 @@ final class AICoachEngine: ObservableObject {
         // with consent on), so it rides the SAME consent + text-only channel as the HRV/RHR summary, a
         // derived number, never raw R-R egress. Omitted when there aren't enough clean beats yet.
         if let line = await stressIndexLine() { ctx += "\n\n" + line }
+        // Nutrition + hydration the user logged on the Nutrition tab. The tab itself is deliberately
+        // analysis-free: it logs and it graphs, and every "do I sleep worse after high-carb days?"
+        // question is answered HERE instead, which only works if the coach can actually see the rows.
+        // Summary-only (per-day totals, never the meal text), riding the same consent + text-only
+        // channel as the metrics summary.
+        if let block = await nutritionBlock() { ctx += "\n\n" + block }
         if includeOnDeviceSignals {
             let block = await onDeviceSignalsBlock()
             if !block.isEmpty { ctx += "\n\n" + block }
@@ -640,6 +646,53 @@ final class AICoachEngine: ObservableObject {
             deviceId: repo.deviceId, from: from, to: to, limit: 200_000)) ?? []
         guard let si = StressIndex.stressIndex(rr: rr) else { return nil }
         return Self.stressIndexSummary(si: si)
+    }
+
+    /// Recent logged nutrition + hydration as day-total lines, or nil when nothing has been logged in the
+    /// window (so the block is simply absent rather than an empty heading).
+    ///
+    /// SUMMARY-ONLY, and deliberately narrower than what the Nutrition tab stores: the per-day macro
+    /// totals and water volume go out, the verbatim meal TEXT never does. "Two slices of my mum's
+    /// birthday cake" is a diary entry about a person's life, and the coach can reason about carbs
+    /// without it. That keeps the egress surface the same shape as the metrics summary — derived
+    /// numbers, no raw rows.
+    func nutritionBlock(days: Int = 14, now: Date = Date()) async -> String? {
+        let keys = Repository.recentDayKeys(days, now: now)
+        guard let first = keys.first, let last = keys.last else { return nil }
+
+        let totals = await repo.foodTotals(from: first, to: last)
+        let water = await repo.hydrationHistory(days: days, now: now)
+        let waterByDay = Dictionary(water.map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
+
+        var lines: [String] = []
+        for day in keys {
+            let t = totals.first { $0.day == day }
+            let ml = waterByDay[day] ?? 0
+            // A day with neither food nor water logged contributes no line at all — an absent day means
+            // "not logged", which must not read as a day of eating and drinking nothing.
+            guard !(t?.isEmpty ?? true) || ml > 0 else { continue }
+            lines.append("  \(day): \(Self.nutritionDayLine(totals: t, waterML: ml))")
+        }
+        guard !lines.isEmpty else { return nil }
+
+        return """
+        LOGGED NUTRITION + HYDRATION (last \(days) days, the user's own manual log — an \
+        estimate they typed or accepted, not measured; days they didn't log are omitted, which is \
+        NOT the same as a day of eating nothing):
+        """ + "\n" + lines.joined(separator: "\n")
+    }
+
+    /// Pure formatter for one day's nutrition line, kept separate so it is unit-testable without a store.
+    /// Only the values that are actually present are named; an unrecorded macro is omitted rather than
+    /// reported as 0, matching the store's own nil-not-zero rule.
+    static func nutritionDayLine(totals: FoodDayTotals?, waterML: Double) -> String {
+        var parts: [String] = []
+        if let k = totals?.kcal { parts.append("\(Int(k.rounded())) kcal") }
+        if let p = totals?.proteinG { parts.append("protein \(Int(p.rounded()))g") }
+        if let c = totals?.carbsG { parts.append("carbs \(Int(c.rounded()))g") }
+        if let f = totals?.fatG { parts.append("fat \(Int(f.rounded()))g") }
+        if waterML > 0 { parts.append("water \(Int(waterML.rounded())) ml") }
+        return parts.isEmpty ? "nothing logged" : parts.joined(separator: ", ")
     }
 
     /// Pure formatter for the derived stress line, kept separate so it is unit-testable without a store.
