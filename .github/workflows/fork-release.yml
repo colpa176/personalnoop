@@ -324,8 +324,12 @@ jobs:
           if git diff --quiet altstore-source.json; then
             echo "altstore-source.json already current for ${VER}."; exit 0
           fi
-          git config user.name 'ryanbr'
-          git config user.email 'mp3geek@gmail.com'
+          # Fork change: commit as this fork's own identity. Upstream hardcodes the maintainer's name +
+          # real email here, which on a fork attributes the release commit to someone who had no part in
+          # it AND writes a third party's real address into this repo's history — this fork deliberately
+          # uses a noreply address to stay anonymous.
+          git config user.name 'colpa176'
+          git config user.email 'colpa176@users.noreply.github.com'
           git add altstore-source.json
           git commit -m "Release ${VER}: add to AltStore source"
           git push origin HEAD:main || {
