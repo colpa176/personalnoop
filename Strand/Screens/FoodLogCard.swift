@@ -18,6 +18,21 @@ import StrandImport
 /// (see `Repository.saveFoodEntry`), so a logged meal reaches Explore/Compare/Insights through the path
 /// imported nutrition already uses.
 struct FoodLogCard: View {
+    /// Order the "Logged today" list newest-first instead of oldest-first. The Nutrition tab is a
+    /// running log the user adds to through the day, where the entry just saved should be at the top
+    /// (the quick-add convention MyFitnessPal / Cronometer / MacroFactor all follow); the Health hub
+    /// reads as a chronological day and keeps the oldest-first default, so neither host changes the
+    /// other. Display-only — `entries` is always stored and summed in time order.
+    var newestFirst: Bool = false
+
+    /// Explicit, so the card stays constructible from another file. The card holds `@State private`
+    /// properties, which drags the access level of a SYNTHESISED memberwise init down with them — the
+    /// existing `FoodLogCard()` calls only kept working because that's the zero-argument DEFAULT init,
+    /// which is unaffected. Adding a parameter would otherwise have been callable only from this file.
+    init(newestFirst: Bool = false) {
+        self.newestFirst = newestFirst
+    }
+
     @EnvironmentObject var repo: Repository
     @EnvironmentObject var model: AppModel
 
@@ -229,7 +244,9 @@ struct FoodLogCard: View {
         Text("Logged today")
             .font(StrandFont.caption)
             .foregroundStyle(StrandPalette.textTertiary)
-        ForEach(entries) { entry in
+        // `Array(...)` on both arms deliberately: `entries.reversed()` is a `ReversedCollection`, which
+        // will not unify with `[FoodLogEntry]` across a ternary.
+        ForEach(newestFirst ? Array(entries.reversed()) : entries) { entry in
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(entry.text)

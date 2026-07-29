@@ -242,6 +242,64 @@ final class FoodLogStoreTests: XCTestCase {
         XCTAssertEqual(removed, 0)
     }
 
+    // MARK: - range rollup (nutrition trend)
+
+    func testRangeTotalsGroupByDayOldestFirst() async throws {
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertFoodLogEntry(entry(id: "a", day: "2026-07-27", ts: 10, text: "eggs", kcal: 200, proteinG: 12))
+        try await store.upsertFoodLogEntry(entry(id: "b", day: "2026-07-27", ts: 20, text: "toast", kcal: 150, proteinG: 5))
+        try await store.upsertFoodLogEntry(entry(id: "c", day: "2026-07-28", ts: 10, text: "steak", kcal: 700, proteinG: 50))
+
+        let rows = try await store.foodDayTotals(from: "2026-07-01", to: "2026-07-31")
+        XCTAssertEqual(rows.map(\.day), ["2026-07-27", "2026-07-28"], "oldest day first")
+        XCTAssertEqual(rows[0].kcal, 350, "same-day entries sum")
+        XCTAssertEqual(rows[0].proteinG, 17)
+        XCTAssertEqual(rows[0].entryCount, 2)
+        XCTAssertEqual(rows[1].kcal, 700)
+        XCTAssertEqual(rows[1].entryCount, 1)
+    }
+
+    /// The range is inclusive on both ends and excludes days outside it.
+    func testRangeTotalsRespectInclusiveBounds() async throws {
+        let store = try await WhoopStore.inMemory()
+        for day in ["2026-07-26", "2026-07-27", "2026-07-28", "2026-07-29"] {
+            try await store.upsertFoodLogEntry(entry(id: day, day: day, ts: 10, text: "meal", kcal: 100))
+        }
+        let rows = try await store.foodDayTotals(from: "2026-07-27", to: "2026-07-28")
+        XCTAssertEqual(rows.map(\.day), ["2026-07-27", "2026-07-28"])
+    }
+
+    /// A day nobody logged is ABSENT, never a zero row — "nothing logged" and "ate nothing" are
+    /// different claims and the trend must stay able to distinguish them.
+    func testRangeTotalsOmitDaysWithNoEntries() async throws {
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertFoodLogEntry(entry(id: "a", day: "2026-07-27", ts: 10, text: "meal", kcal: 100))
+        try await store.upsertFoodLogEntry(entry(id: "b", day: "2026-07-29", ts: 10, text: "meal", kcal: 100))
+
+        let rows = try await store.foodDayTotals(from: "2026-07-26", to: "2026-07-30")
+        XCTAssertEqual(rows.map(\.day), ["2026-07-27", "2026-07-29"], "the empty days are absent, not zero")
+    }
+
+    /// A macro NO entry that day recorded stays nil rather than summing to a 0 nobody claimed — the same
+    /// rule `foodDayTotals(day:)` follows, preserved through the GROUP BY.
+    func testRangeTotalsKeepAnUnrecordedMacroNil() async throws {
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertFoodLogEntry(entry(id: "a", day: "2026-07-27", ts: 10, text: "mystery", kcal: 400))
+
+        let rows = try await store.foodDayTotals(from: "2026-07-27", to: "2026-07-27")
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].kcal, 400)
+        XCTAssertNil(rows[0].proteinG, "no entry recorded protein — it must not become 0 g")
+        XCTAssertNil(rows[0].fatG)
+    }
+
+    func testRangeTotalsAreScopedByDevice() async throws {
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertFoodLogEntry(entry(id: "mine", day: "2026-07-27", ts: 10, text: "meal", kcal: 100))
+        let rows = try await store.foodDayTotals(deviceId: "someone-else", from: "2026-07-01", to: "2026-07-31")
+        XCTAssertTrue(rows.isEmpty)
+    }
+
     // MARK: - helper
 
     private func entry(id: String, day: String = "2026-07-28", ts: Int, text: String,
