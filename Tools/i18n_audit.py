@@ -433,7 +433,7 @@ def scan_android() -> list[tuple[str, int, str]]:
                         continue
                     seen.add(offset)
                     line_no = text.count("\n", 0, offset) + 1
-                    findings.append((str(path.relative_to(ROOT)), line_no, literal))
+                    findings.append((path.relative_to(ROOT).as_posix(), line_no, literal))
 
             # The call's own first (content) argument only — catches
             # `Text(if (x) "a" else "b")` — never the whole call span, which
@@ -854,7 +854,7 @@ def scan_ios() -> tuple[list[tuple[str, int, str]], dict[str, list[str]]]:
                         continue
                     entry = swift_catalog_lookup(cat, literal)
                     line_no = text.count("\n", 0, offset) + 1
-                    rel = str(path.relative_to(ROOT))
+                    rel = path.relative_to(ROOT).as_posix()
                     if entry is None:
                         hardcoded.append((rel, line_no, literal))
                         continue
@@ -1017,7 +1017,7 @@ def ci_check(base_ref: str) -> int:
         # and gate them below. Reloading each catalog for a second pass wasted a full re-parse of a
         # 3255-string file.
         for extra in sorted(shipped_apple_langs(cat) - set(LANGS)):
-            extra_apple_gaps[f"{catalog_path.relative_to(ROOT)}:{extra}"] = sum(
+            extra_apple_gaps[f"{catalog_path.relative_to(ROOT).as_posix()}:{extra}"] = sum(
                 1 for v in cat.get("strings", {}).values()
                 if v.get("shouldTranslate") is not False and not _is_translated(v, extra)
             )
