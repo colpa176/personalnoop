@@ -155,16 +155,16 @@ struct NutritionView: View {
         }
     }
 
-    /// One trend card. Bars (not a line) because these are DAILY TOTALS — a discrete amount per day,
-    /// with legitimate gaps on days nothing was logged; a continuous line would imply the gaps were
-    /// interpolated values.
+    /// One trend card. Dot/line (the app's standard trend idiom): a marker sits on every day that was
+    /// actually logged, so a reader can still see which days carry a reading, and the connecting line
+    /// makes the run of daily totals comparable at a glance. The domain stays anchored at 0 — these are
+    /// totals, so height above the baseline has to keep meaning what it means in every other total chart.
     private func chart(_ title: LocalizedStringKey, points pts: [TrendPoint], gradient: Gradient,
                        height: CGFloat = NoopMetrics.chartHeight) -> some View {
         ChartCard(title: title, height: height) {
             TrendChart(points: pts,
                        gradient: gradient,
                        valueRange: 0...max(1, pts.map(\.value).max() ?? 1),
-                       showsBars: true,
                        height: height)
         }
     }
