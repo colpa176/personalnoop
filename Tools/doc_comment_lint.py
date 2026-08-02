@@ -125,12 +125,17 @@ def main() -> int:
     scanned = 0
     for glob in GLOBS:
         for path in sorted(ROOT.glob(glob)):
-            if any(p in str(path) for p in SKIP_PARTS):
+            # POSIX separators throughout: SKIP_PARTS and the baseline file are both written with
+            # "/", but str(path) yields "android\app\..." on Windows — so a plain str() skipped no
+            # build directory and matched no baseline entry, and the gate failed locally on a tree
+            # that is green in CI. Every comparison below is against the as_posix() form.
+            posix = path.as_posix()
+            if any(p in posix for p in SKIP_PARTS):
                 continue
             scanned += 1
             found = findings(path)
             if found:
-                rel = str(path.relative_to(ROOT))
+                rel = path.relative_to(ROOT).as_posix()
                 by_file[rel] = [f"{rel}:{ln}  {why}" for ln, why in found]
 
     regressions = [h for f, hs in sorted(by_file.items())
