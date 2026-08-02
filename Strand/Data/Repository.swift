@@ -1895,7 +1895,14 @@ final class Repository: ObservableObject {
             return uniqued(candidates)
         }
         if preferredSource == appleHealthSource {
-            var candidates = [MetricSourceCandidate(source: appleHealthSource, key: key)]
+            var candidates: [MetricSourceCandidate] = []
+            // Hand-typed weight outranks Apple Health for the day it covers — the same precedence
+            // `mergingManualWeight` applies to the chart series, kept here so the readings table
+            // attributes that day to the manual entry instead of mislabelling it as Apple Health.
+            if key == ManualWeightStore.key {
+                candidates.append(MetricSourceCandidate(source: ManualWeightStore.deviceId, key: key))
+            }
+            candidates.append(MetricSourceCandidate(source: appleHealthSource, key: key))
             // Health Connect is an Apple-equivalent body-metric source (Android only , harmless no-op on
             // iOS/Mac, which never write a "health-connect" series). Kept here so the resolver is
             // byte-identical to Android's, where it makes a Health-Connect-only weight history resolve in
@@ -1949,7 +1956,10 @@ final class Repository: ObservableObject {
     /// byte-identical. The flag is forwarded to the non-strap `series(...)` delegation below so every source
     /// path honours it.
     func exploreSeries(key: String, source: String, days: Int = 4000, fullHistory: Bool = false) async -> [(day: String, value: Double)] {
-        guard source == "my-whoop" else { return await series(key: key, source: source, days: days, fullHistory: fullHistory) }
+        guard source == "my-whoop" else {
+            let base = await series(key: key, source: source, days: days, fullHistory: fullHistory)
+            return await mergingManualWeight(into: base, key: key, source: source, days: days)
+        }
         guard let store = await ensureStore() else { return [] }
         let now = Date()
         let from = fullHistory ? "0000-01-01" : Self.dayString(now.addingTimeInterval(-Double(days) * 86_400))
@@ -1976,6 +1986,27 @@ final class Repository: ObservableObject {
             for p in (try? await store.metricSeries(deviceId: id, key: key, from: from, to: to)) ?? [] { byDay[p.day] = p.value }
         }
 
+        return byDay.sorted { $0.key < $1.key }.map { (day: $0.key, value: $0.value) }
+    }
+
+    /// Overlay hand-typed weight onto the Apple-Health weight series, manual winning per day.
+    ///
+    /// `weight` is the one Explore metric with NO strap path at all — the band has no scale, so its only
+    /// wired source is Apple Health body mass, and `ManualWeightStore` exists so the page is reachable
+    /// without HealthKit. The two live under different device ids on purpose (a HealthKit sync must never
+    /// clobber a typed value), which means they have to be merged at READ time; this is that merge.
+    ///
+    /// Manual wins the day because it is the more deliberate act: if someone typed a number for a day
+    /// that Apple Health also covers, they were correcting what Health had. Every other (key, source)
+    /// pair returns `base` untouched, so this is a no-op for the rest of Explore.
+    private func mergingManualWeight(into base: [(day: String, value: Double)],
+                                     key: String, source: String,
+                                     days: Int) async -> [(day: String, value: Double)] {
+        guard key == ManualWeightStore.key, source == Self.appleHealthSource else { return base }
+        let manual = await manualWeightSeries(days: days)
+        guard !manual.isEmpty else { return base }
+        var byDay = Dictionary(base.map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
+        for row in manual { byDay[row.day] = row.value }
         return byDay.sorted { $0.key < $1.key }.map { (day: $0.key, value: $0.value) }
     }
 
