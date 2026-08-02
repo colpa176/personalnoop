@@ -10,6 +10,11 @@ import StrandDesign
 // prompt is the once-a-morning sleep sheet — missed on any day you don't open Sleep. This surfaces it on
 // Today where it can't be missed, and doubles as the "direct link to Insights" the report (#627) asked for.
 //
+// The card also carries a direct route to "What Moves You" (`InsightsHubView`) — the read-only
+// stats/correlations view over these same entries. `openJournal()` lands on the Insights TAB, which is the
+// logging surface; the correlations hub is a separate destination that, on iOS, was reachable only from the
+// More tab. So the one card that asks the user to log daily now also links to what the logging buys them.
+//
 // Opt-out via `PuffinExperiment.journalReminderKey` (default ON — the same key also gates the Android
 // morning sleep sheet twin). Read-only: it never writes a journal entry. Twin of Android
 // `JournalReminderCard` (android/.../ui/JournalReminder.kt). Design-Reset compliant — a flat accent-tinted
@@ -111,6 +116,36 @@ struct JournalReminderCard: View {
                     .contentShape(Rectangle())
                     .onTapGesture { router.openJournal() }
                     .accessibilityAddTraits(.isButton)   // it opens the journal — announce it as one
+
+                // Direct route to "What Moves You" — the read-only stats/correlations view built from
+                // these same entries. It is what the logging is FOR, and on iOS it is otherwise reachable
+                // only from the More tab, so the one card that asks you to log every day had no link to
+                // the payoff. Its own non-overlapping tap region, like the header/subtitle/bars above
+                // (nested SwiftUI buttons don't work, hence onTapGesture throughout this card).
+                Rectangle()
+                    .fill(StrandPalette.hairline)
+                    .frame(height: 1)
+                    .accessibilityHidden(true)
+                HStack(spacing: NoopMetrics.space2) {
+                    Image(systemName: "chart.xyaxis.line")
+                        .font(.system(size: 15))
+                        .foregroundStyle(StrandPalette.accent)
+                        .accessibilityHidden(true)
+                    Text(String(localized: "What Moves You"))
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { router.openInsightsHub() }
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityLabel(Text(String(localized: "What Moves You")))
+                .accessibilityHint(Text(String(localized: "See which logged behaviours track with your scores")))
             }
         }
     }
