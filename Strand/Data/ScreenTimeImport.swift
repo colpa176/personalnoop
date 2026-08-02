@@ -90,12 +90,29 @@ enum ScreenTimeImport {
             return .failure(.rejected("Screen time can't exceed \(maxMinutesPerDay) minutes in a day."))
         }
         // An absent day means "today", so the common Shortcut needs no date formatting at all.
-        let day = params[dayParam].flatMap { $0.isEmpty ? nil : $0 } ?? Repository.dayString(Date())
+        let rawDay = params[dayParam]?.trimmingCharacters(in: .whitespaces) ?? ""
+        let day = rawDay.isEmpty ? todayKey() : rawDay
         guard ShortcutHealthImport.isValidDay(day) else {
             return .failure(.rejected("Day must look like 2026-08-01."))
         }
         return .success(Pending(day: day, minutes: minutes))
     }
+
+    /// Today's local `yyyy-MM-dd` key, for the common link that omits `day`.
+    ///
+    /// Deliberately does NOT call `Repository.dayString`: `Repository` is a `@MainActor` class, so its
+    /// statics are main-actor isolated, and `prepare` is a plain nonisolated validator that must stay
+    /// callable (and testable) off the main actor. Same format and locale pinning as the Repository
+    /// formatters — en_US_POSIX so the key shape can never follow the device locale — and the default
+    /// (local) time zone, so "today" means the user's civil day exactly as every other day key does.
+    static func todayKey(_ now: Date = Date()) -> String { dayKeyFormatter.string(from: now) }
+
+    private static let dayKeyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
 
     // MARK: - Pending → store
 

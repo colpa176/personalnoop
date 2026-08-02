@@ -47,7 +47,14 @@ final class ScreenTimeImportTests: XCTestCase {
 
     /// An omitted day means today, so the common Shortcut needs no date formatting at all.
     func testAbsentDayDefaultsToToday() {
-        XCTAssertEqual(pending(url(day: nil))?.day, Repository.dayString(Date()))
+        XCTAssertEqual(pending(url(day: nil))?.day, ScreenTimeImport.todayKey())
+    }
+
+    /// The default key must be the same SHAPE the store keys every other day row by, or a link that
+    /// omits `day` would scatter its row somewhere the detail page never reads.
+    func testTodayKeyIsAValidDayKey() {
+        XCTAssertTrue(ShortcutHealthImport.isValidDay(ScreenTimeImport.todayKey()))
+        XCTAssertEqual(ScreenTimeImport.todayKey(Date(timeIntervalSince1970: 0)).count, 10)
     }
 
     /// The version param is optional; only a MISMATCHED version is refused.
