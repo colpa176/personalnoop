@@ -57,6 +57,9 @@ struct InsightsLoadCache {
 
 struct InsightsView: View {
     @EnvironmentObject var repo: Repository
+    /// The BYOK Coach engine, used only for the optional end-of-experiment written read. Injected at the
+    /// app root on both platforms (StrandApp / StrandiOSApp), so this adds no new wiring.
+    @EnvironmentObject var coach: AICoachEngine
     /// Deep-link into the v5 "What moves you" hub (the n-of-1 ranked-effect + dose-response surface).
     @EnvironmentObject var router: NavRouter
     /// #860 item 4: foreground signal for the day-rollover re-load (see `currentDayKey`).
@@ -94,6 +97,17 @@ struct InsightsView: View {
             case .hrv:      return "HRV"
             case .sleep:    return String(localized: "Rest")
             case .rhr:      return String(localized: "Resting HR")
+            }
+        }
+        /// Bare unit for the AI experiment summary's numbers. NOT localized: it rides in an English
+        /// prompt to the model, never onto the screen — the model reads "58.0 ms", the user reads the
+        /// numeric tiles above, which format through `formatOutcome`. Charge and Rest are 0–100 scores
+        /// carrying a percent sign, which `formatExperimentDelta` already appends, so they pass "%".
+        var summaryUnit: String {
+            switch self {
+            case .recovery, .sleep: return "%"
+            case .hrv:              return "ms"
+            case .rhr:              return "bpm"
             }
         }
         /// Whether a higher value is the "good" direction (drives tint).
@@ -143,6 +157,25 @@ struct InsightsView: View {
     @AppStorage("noop.experiment.startedDay")   private var experimentStartedDay = ""
     @AppStorage("noop.experiment.durationDays") private var experimentDurationDays = ExperimentLength.twoWeeks.rawValue
     @AppStorage("noop.experiment.baselineDays") private var experimentBaselineDays = ExperimentLength.twoWeeks.rawValue
+    /// Set when the running experiment's behaviour is the user's OWN free text rather than one of the
+    /// journal items they already log. It cannot be inferred: `experimentCandidates` only lists
+    /// behaviours with history, and a brand-new custom one has none until the first "Mark done today"
+    /// writes a journal answer for it — so without this flag `resolvedExperimentBehaviour` would reject
+    /// the name on day one and silently fall back to an unrelated behaviour. Keyed alongside the others;
+    /// Android has no twin yet, and an absent key reads false, which is exactly the old behaviour.
+    @AppStorage("noop.experiment.isCustom")     private var experimentIsCustom = false
+
+    /// Draft free-text behaviour, held only while the setup card is on screen (the committed value lives
+    /// in `experimentBehaviour` once the experiment starts).
+    @State private var customExperimentDraft = ""
+    /// Whether the setup card is in free-text mode rather than picking a logged behaviour.
+    @State private var composingCustomExperiment = false
+    /// The end-of-experiment AI read, and whether a request is in flight. Not persisted: it is a summary
+    /// of numbers that are themselves still on screen, so it costs one tap to regenerate and storing it
+    /// would risk showing a stale reading of a window that has since been extended.
+    @State private var experimentSummary: String?
+    @State private var experimentSummaryError: String?
+    @State private var summarizing = false
 
     /// The journal catalog, read for `hiddenQuestions` so a behaviour the user has
     /// hidden never resurfaces as an eligible experiment candidate (triage fix b).
@@ -569,26 +602,42 @@ struct InsightsView: View {
                 StatePill("LOCAL ONLY", tone: .neutral, showsDot: false)
             }
 
-            if candidates.isEmpty {
+            // Free text is offered even with NO logged behaviours: a custom experiment brings its own
+            // name and logs itself from day one, so the "log something first" wall below only applies
+            // to picking an existing behaviour.
+            if candidates.isEmpty && !composingCustomExperiment {
                 Text("Log at least one behaviour above before starting an experiment.")
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                NoopButton("Write your own instead", systemImage: "square.and.pencil",
+                           kind: .secondary) { composingCustomExperiment = true }
             } else {
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 220), spacing: NoopMetrics.gap)],
                     alignment: .leading,
                     spacing: NoopMetrics.gap
                 ) {
-                    experimentField("Behaviour") {
-                        Picker("Behaviour", selection: experimentBehaviourBinding) {
-                            ForEach(candidates, id: \.self) { q in
-                                Text(verbatim: q).tag(q)
+                    experimentField(composingCustomExperiment ? "Your experiment" : "Behaviour") {
+                        if composingCustomExperiment {
+                            // The typed name IS the behaviour key: "Mark done today" writes a journal
+                            // answer under this exact question, so the same baseline-vs-intervention
+                            // machinery reads a custom experiment with no special-casing downstream.
+                            TextField("e.g. No screens after 10pm", text: $customExperimentDraft)
+                                .textFieldStyle(.plain)
+                                .font(StrandFont.body)
+                                .foregroundStyle(StrandPalette.textPrimary)
+                                .accessibilityLabel("Experiment name")
+                        } else {
+                            Picker("Behaviour", selection: experimentBehaviourBinding) {
+                                ForEach(candidates, id: \.self) { q in
+                                    Text(verbatim: q).tag(q)
+                                }
                             }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .accessibilityLabel("Experiment behaviour")
                         }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                        .accessibilityLabel("Experiment behaviour")
                     }
                     experimentField("Outcome") {
                         SegmentedPillControl(Outcome.allCases, selection: experimentOutcomeBinding) { $0.label }
@@ -601,9 +650,23 @@ struct InsightsView: View {
                     }
                 }
 
+                // Toggle between picking a logged behaviour and naming your own. Hidden when there is
+                // nothing to pick — the branch above already offers the way into free text there.
+                if !candidates.isEmpty {
+                    Button {
+                        composingCustomExperiment.toggle()
+                    } label: {
+                        Label(composingCustomExperiment ? "Pick a logged behaviour" : "Write your own instead",
+                              systemImage: composingCustomExperiment ? "list.bullet" : "square.and.pencil")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.accent)
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 NoopButton("Start experiment", systemImage: "flask.fill",
                            kind: .primary, fullWidth: true) { startExperiment() }
-                    .disabled(resolvedExperimentBehaviour == nil)
+                    .disabled(!canStartExperiment)
                     .help("Start a local experiment using today's date as day one.")
             }
         }
@@ -692,6 +755,81 @@ struct InsightsView: View {
                 .buttonStyle(NoopButtonStyle(.destructive))
                 .help("End the experiment plan. Journal and metric history stay untouched.")
             }
+
+            // The window has run its length. Rather than a hard cutoff, offer the two things worth
+            // doing at that point: read the result, or keep going for a bit longer.
+            if snapshot.daysElapsed >= snapshot.durationDays {
+                experimentFinishedSection(snapshot)
+            }
+        }
+    }
+
+    /// What the card offers once the planned window is up: extend it, or ask the configured Coach
+    /// provider to read the comparison in plain English. The numeric tiles above are unchanged and stay
+    /// the primary result — this section only ever adds to them.
+    @ViewBuilder
+    private func experimentFinishedSection(_ snapshot: ExperimentSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+            Divider().overlay(StrandPalette.hairline)
+
+            Text("Your \(snapshot.durationDays)-day window is up. Add more days, or read the result.")
+                .font(StrandFont.subhead)
+                .foregroundStyle(StrandPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: NoopMetrics.rowSpacing) {
+                // Extending moves only the duration — the start day and the baseline window stay put,
+                // so the comparison isn't rebased underneath the user mid-experiment.
+                Button { extendExperiment(byDays: 5) } label: {
+                    Label("Add 5 days", systemImage: "plus.circle")
+                }
+                .buttonStyle(NoopButtonStyle(.secondary))
+                .disabled(snapshot.durationDays >= Self.maxExperimentDays)
+
+                Button { extendExperiment(byDays: 10) } label: {
+                    Label("Add 10 days", systemImage: "plus.circle")
+                }
+                .buttonStyle(NoopButtonStyle(.secondary))
+                .disabled(snapshot.durationDays >= Self.maxExperimentDays)
+
+                Spacer(minLength: 8)
+
+                if summarizing {
+                    ProgressView().controlSize(.small).tint(StrandPalette.accent)
+                } else {
+                    Button { Task { await summarizeExperiment(snapshot) } } label: {
+                        Label(experimentSummary == nil ? "Read the result" : "Read again",
+                              systemImage: "sparkles")
+                    }
+                    .buttonStyle(NoopButtonStyle(.primary))
+                }
+            }
+
+            if let text = experimentSummary {
+                VStack(alignment: .leading, spacing: NoopMetrics.space2) {
+                    Text(verbatim: text)
+                        .font(StrandFont.body)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    // Standing disclaimer, not a one-off: this paragraph is model-written prose about
+                    // an uncontrolled n-of-1 window, and it sits directly under real-looking numbers.
+                    Text("Written by your AI provider from the numbers above. A single-person before-and-after window can't show cause. Not medical advice.")
+                        .font(StrandFont.caption)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(NoopMetrics.space3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            if let err = experimentSummaryError {
+                Text(verbatim: err)
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -761,8 +899,21 @@ struct InsightsView: View {
     private var resolvedExperimentBehaviour: String? {
         let candidates = experimentCandidates
         let saved = experimentBehaviour.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A custom experiment names its own behaviour, so it must NOT be validated against the
+        // candidate list: that list is built from behaviours with logged history, and a custom one has
+        // none until its first "Mark done today". Validating it would drop the user's name on day one.
+        if experimentIsCustom, !saved.isEmpty { return saved }
         if !saved.isEmpty, candidates.contains(saved) { return saved }
         return candidates.first
+    }
+
+    /// Whether "Start experiment" can fire: a custom run needs a typed name, a standard one needs a
+    /// resolvable logged behaviour.
+    private var canStartExperiment: Bool {
+        if composingCustomExperiment {
+            return !customExperimentDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return resolvedExperimentBehaviour != nil
     }
 
     private var experimentBehaviourBinding: Binding<String> {
@@ -837,7 +988,17 @@ struct InsightsView: View {
     }
 
     private func startExperiment() {
-        guard let behavior = resolvedExperimentBehaviour else { return }
+        // A custom experiment takes its name from the draft field; a standard one from the picker.
+        let custom = customExperimentDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let behavior: String
+        if composingCustomExperiment {
+            guard !custom.isEmpty else { return }
+            behavior = custom
+        } else {
+            guard let picked = resolvedExperimentBehaviour else { return }
+            behavior = picked
+        }
+        experimentIsCustom = composingCustomExperiment
         experimentBehaviour = behavior
         if ExperimentLength(rawValue: experimentDurationDays) == nil {
             experimentDurationDays = ExperimentLength.twoWeeks.rawValue
@@ -847,10 +1008,69 @@ struct InsightsView: View {
         }
         experimentBaselineDays = experimentDurationDays
         experimentStartedDay = Repository.localDayKey(Date())
+        clearExperimentSummary()
     }
 
     private func endExperiment() {
         experimentStartedDay = ""
+        experimentIsCustom = false
+        composingCustomExperiment = false
+        customExperimentDraft = ""
+        clearExperimentSummary()
+    }
+
+    /// Add days to a running (or just-finished) experiment instead of it hard-stopping at the window.
+    ///
+    /// Only `durationDays` moves — the start day and `baselineDays` are deliberately left alone, so the
+    /// baseline the result was being read against does not shift underneath the comparison. Any earlier
+    /// AI summary is dropped: it described a shorter window and would be a stale reading of a result the
+    /// user has just changed.
+    private func extendExperiment(byDays days: Int) {
+        guard !experimentStartedDay.isEmpty, days > 0 else { return }
+        experimentDurationDays = min(Self.maxExperimentDays, max(1, experimentDurationDays) + days)
+        clearExperimentSummary()
+    }
+
+    /// Ceiling on an extended window. A self-experiment that has run most of a year is not a window any
+    /// more, and the baseline it is compared against is long stale by then; the honest move at that point
+    /// is to end it and start a fresh one.
+    private static let maxExperimentDays = 365
+
+    private func clearExperimentSummary() {
+        experimentSummary = nil
+        experimentSummaryError = nil
+    }
+
+    /// Ask the configured Coach provider to read the finished result. The numeric read stays on screen
+    /// throughout — this only ever ADDS a paragraph, and every failure resolves to a message rather than
+    /// disturbing what is already there.
+    private func summarizeExperiment(_ snapshot: ExperimentSnapshot) async {
+        guard !summarizing else { return }
+        summarizing = true
+        defer { summarizing = false }
+        let result = ExperimentSummarizer.Result(
+            title: snapshot.behavior,
+            outcomeName: snapshot.outcome.outcomeName,
+            outcomeUnit: snapshot.outcome.summaryUnit,
+            higherIsBetter: snapshot.outcome.higherIsBetter,
+            baselineMean: snapshot.baselineMean,
+            baselineCount: snapshot.baselineCount,
+            interventionMean: snapshot.interventionMean,
+            interventionCount: snapshot.interventionCount,
+            durationDays: snapshot.durationDays,
+            compliancePercent: Int(snapshot.compliance.rounded())
+        )
+        switch await ExperimentSummarizer.summarize(result, coach: coach) {
+        case .summarized(let text):
+            experimentSummary = text
+            experimentSummaryError = nil
+        case .notConfigured:
+            experimentSummary = nil
+            experimentSummaryError = String(localized: "Connect an AI provider in Coach to get a written read of this result.")
+        case .failed(let why):
+            experimentSummary = nil
+            experimentSummaryError = why
+        }
     }
 
     private func markExperimentToday(_ answeredYes: Bool) async {
