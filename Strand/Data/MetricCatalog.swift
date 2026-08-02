@@ -25,6 +25,7 @@ struct MetricDescriptor: Identifiable, Hashable {
         case "nutrition-csv": return String(localized: "Nutrition")
         case "food-log":     return String(localized: "Food Log")
         case "noop-mood":    return String(localized: "Mood")
+        case "noop-weight":  return String(localized: "Manual entry")
         default:             return "Whoop"   // "my-whoop" + on-device computed sources
         }
     }

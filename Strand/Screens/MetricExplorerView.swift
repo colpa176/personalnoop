@@ -508,6 +508,8 @@ struct MetricDetailView: View {
     /// Every OTHER catalog series, loaded once for the correlation scan.
     @State private var others: [(metric: MetricDescriptor, series: [(day: String, value: Double)])] = []
     @State private var loaded = false
+    /// Whether the manual-weight sheet is up. Only ever true on the Weight page — see `supportsManualEntry`.
+    @State private var showManualWeightSheet = false
 
     /// Cached correlation scan, keyed by its inputs (selected range + the metric id),
     /// so the full cross-catalog Pearson sweep runs ONLY when those change — not on
@@ -659,6 +661,27 @@ struct MetricDetailView: View {
         }
     }
 
+    // MARK: Manual entry (Weight only)
+
+    /// Whether this page offers hand-typed entry. Only Weight: it is the single catalog metric with no
+    /// sensor path of ANY kind (no strap sensor, so no export can carry it either), leaving a user
+    /// without Apple Health with a page that can never fill. Everything else has a route to real data,
+    /// and offering a keyboard next to a measured metric would invite typing over it.
+    private var supportsManualEntry: Bool {
+        metric.key == ManualWeightStore.key && metric.source == "apple-health"
+    }
+
+    /// The "Manual override" affordance. Shown BOTH under the empty-state copy (the entry point the
+    /// page's own text is describing) and above the readings table once values exist — otherwise the
+    /// button would disappear the moment the first weight was saved, and a second one could never be
+    /// entered. Same button, so the second reading is logged exactly like the first.
+    @ViewBuilder private var manualWeightButton: some View {
+        NoopButton("Manual override", systemImage: "square.and.pencil", kind: .secondary) {
+            showManualWeightSheet = true
+        }
+        .accessibilityHint("Type your weight by hand")
+    }
+
     // MARK: Body
 
     var body: some View {
@@ -711,6 +734,9 @@ struct MetricDetailView: View {
                         // as the fitness_age branch above: the generic copy names an action that does not
                         // help, which is a dead end rather than an inaccuracy.
                         ComingSoon(what: g.copy, symbol: g.symbol)
+                        // Weight's copy explains that the only wired source is Apple Health — so directly
+                        // under it, the way out for someone who hasn't got it.
+                        if supportsManualEntry { manualWeightButton }
                     } else {
                         ComingSoon(what: "Import your history first. A WHOOP export in Data Sources fills every metric you can explore here in about a minute.")
                     }
@@ -724,6 +750,9 @@ struct MetricDetailView: View {
                     heroHeader(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                     heroChart(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                     statRow(effectiveRange: effRange, windowed: win)
+                    // Keeps hand-typed entry reachable after the first value — the empty state that
+                    // introduced it is gone by then.
+                    if supportsManualEntry { manualWeightButton }
                     readingsTable(windowed: win)
                     correlationCard
                 }
@@ -753,6 +782,24 @@ struct MetricDetailView: View {
         // Range changes the window, hence the correlation inputs — recompute the
         // cached scan rather than letting `correlationCard` run it inside body.
         .onChangeCompat(of: range) { _ in recomputeCorrelations() }
+        // Hand-typed weight (Weight page only). Pre-filled with today's value when there is one, so
+        // re-opening it corrects the day rather than starting from an empty field.
+        .sheet(isPresented: $showManualWeightSheet) {
+            ManualWeightSheet(initialKg: series.last(where: { $0.day == Repository.dayString(Date()) })?.value) { kg in
+                showManualWeightSheet = false
+                Task { await saveManualWeight(kg) }
+            } onCancel: {
+                showManualWeightSheet = false
+            }
+        }
+    }
+
+    /// Persist a hand-typed weight for TODAY, then reload so the chart, stats and readings table all
+    /// pick it up. A rejected value (implausible, or no store) leaves the page untouched — the sheet
+    /// already refuses to submit one, so this is the belt to that braces.
+    private func saveManualWeight(_ kg: Double) async {
+        let saved = await repo.saveManualWeight(day: Repository.dayString(Date()), kg: kg)
+        if saved { await load() }
     }
 
     private func load() async {
