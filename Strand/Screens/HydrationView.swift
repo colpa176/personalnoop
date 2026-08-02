@@ -250,50 +250,44 @@ struct HydrationView: View {
         let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none; return f
     }()
 
-    // MARK: - 7-day mini history (flat bars, today on the right)
+    // MARK: - 7-day mini history (dot/line trend, today on the right)
 
     private var historySection: some View {
         card(padding: 18) {
             VStack(alignment: .leading, spacing: NoopMetrics.gap) {
                 Text("Last 7 days").strandOverline()
-                historyBars
+                historyTrend
             }
         }
     }
 
-    @ViewBuilder private var historyBars: some View {
+    /// The week's day totals as the app's standard dot/line trend — one marker per day that has a
+    /// reading, joined by the value-ramped line, exactly as every other trend on the app reads.
+    /// (Was a hand-rolled bar strip; the plotted series and the goal-aware ceiling are unchanged.)
+    @ViewBuilder private var historyTrend: some View {
         if history.isEmpty {
             Text("No history yet.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textTertiary)
         } else {
-            // Scale the bars to the LARGER of the goal and the biggest day, so an over-goal day doesn't clip.
+            // Scale to the LARGER of the goal and the biggest day, so an over-goal day doesn't clip.
+            // Kept from the bar strip: the goal floor is what makes a light week read as a light week
+            // instead of being rescaled up to fill the card.
             let ceiling = max(Double(max(goalML, 1)), history.map(\.value).max() ?? 0, 1)
-            let lastIndex = history.count - 1
-            HStack(alignment: .bottom, spacing: 10) {
-                ForEach(Array(history.enumerated()), id: \.element.day) { idx, bar in
-                    VStack(spacing: 6) {
-                        ZStack(alignment: .bottom) {
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(StrandPalette.textPrimary.opacity(0.10))
-                                .frame(height: 96)
-                            let frac = min(1.0, max(0.0, bar.value / ceiling))
-                            if frac > 0 {
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(idx == lastIndex ? StrandPalette.accent
-                                                           : StrandPalette.accent.opacity(0.45))
-                                    .frame(height: max(3, 96 * CGFloat(frac)))
-                            }
-                        }
-                        Text(weekdayInitial(bar.day))
-                            .font(StrandFont.overline)
-                            .foregroundStyle(StrandPalette.textTertiary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(weekdayInitial(bar.day)): \(String(format: "%.1f", HydrationGoal.litres(fromML: bar.value))) litres")
-                }
-            }
+            TrendChart(points: historyPoints,
+                       gradient: StrandPalette.restGradient,
+                       valueRange: 0...ceiling,
+                       height: 132,
+                       valueFormat: { "\(String(format: "%.1f", HydrationGoal.litres(fromML: $0))) L" },
+                       accessibilityLabel: String(localized: "Hydration trend"))
+        }
+    }
+
+    /// The 7-day history mapped onto chart points. A day whose `yyyy-MM-dd` key doesn't parse is
+    /// dropped rather than plotted at a bogus date, which would drag the whole x-domain with it.
+    private var historyPoints: [TrendPoint] {
+        history.compactMap { day in
+            Self.dayKeyParser.date(from: day.day).map { TrendPoint(date: $0, value: day.value) }
         }
     }
 
@@ -335,27 +329,16 @@ struct HydrationView: View {
 
     // MARK: - Data
 
-    /// The single-letter weekday for a yyyy-MM-dd key (M T W T F S S), or "·" when unparseable. Mirrors
-    /// the Android `weekdayInitial` (EEE → first letter, US locale).
-    // #perf: fixed-locale formatters, hoisted to static so the history-bar ForEach doesn't allocate two
-    // DateFormatters per bar per render (label + a11y both call this). Locale is pinned (en_US_POSIX /
-    // en_US), so caching is behaviour-identical — no dependence on the device locale.
+    /// Parses the store's `yyyy-MM-dd` day keys into the Dates the trend chart plots on.
+    // #perf: fixed-locale formatter, hoisted to static so mapping the history doesn't allocate a
+    // DateFormatter per day per render. Locale is pinned (en_US_POSIX), so this is behaviour-identical
+    // regardless of the device locale — the key format is a storage detail, never shown to the user.
     private static let dayKeyParser: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
-    private static let weekdayAbbrev: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US")
-        f.dateFormat = "EEE"
-        return f
-    }()
-    private func weekdayInitial(_ dayKey: String) -> String {
-        guard let date = Self.dayKeyParser.date(from: dayKey) else { return "·" }
-        return String(Self.weekdayAbbrev.string(from: date).prefix(1))
-    }
 
     /// Log `ml` (additive day total + a per-entry row, #798) and refresh.
     private func add(ml: Int) async {
