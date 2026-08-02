@@ -26,6 +26,7 @@ struct MetricDescriptor: Identifiable, Hashable {
         case "food-log":     return String(localized: "Food Log")
         case "noop-mood":    return String(localized: "Mood")
         case "noop-weight":  return String(localized: "Manual entry")
+        case "noop-screentime": return String(localized: "Screen Time")
         default:             return "Whoop"   // "my-whoop" + on-device computed sources
         }
     }
@@ -200,6 +201,10 @@ enum MetricCatalog {
 
         // ── Mind (daily mood check-in, 1–5; non-clinical self-tracking)
         d("mood", String(localized: "Mood"), "Mind", "/5", "noop-mood", "face.smiling", 0, true),
+        // Daily screen-time minutes, arriving via the `noop://import-screentime` Shortcut link (there is
+        // no Screen Time API that hands a third-party app a number). `higherIsBetter: false` so a rising
+        // trend tints the way a rising resting HR does, not the way a rising Charge does.
+        d("screen_time", String(localized: "Screen Time"), "Mind", "min", "noop-screentime", "iphone", 0, false),
 
         // ── Mi Band (imported from Mi Fitness). Same metricSeries mechanism as Apple Health /
         //    Nutrition, so these light up Explore, Compare and the correlation scan. Distinct

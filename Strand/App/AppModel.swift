@@ -164,6 +164,12 @@ final class AppModel: ObservableObject {
     @Published var xiaomiImportFailed = false
     /// A decoded Health Shortcut import waiting for explicit user confirmation before it writes rows.
     @Published var pendingShortcutHealthImport: ShortcutHealthImport.PendingImport?
+    /// A validated `noop://import-screentime` link waiting for the same explicit confirmation.
+    @Published var pendingScreenTimeImport: ScreenTimeImport.Pending?
+    /// One-line result of the last screen-time link, shown once and cleared. Kept out of the
+    /// `DataSourceImportKind` status machinery on purpose — screen time is not a data SOURCE the Data
+    /// Sources screen manages, it is a single value arriving from a Shortcut.
+    @Published var screenTimeImportSummary: String?
 
     /// True while any data-source import is writing to the local store.
     var hasActiveImport: Bool { activeImportSource != nil }
@@ -2013,6 +2019,48 @@ final class AppModel: ObservableObject {
 
     func cancelPendingHealthImport() {
         pendingShortcutHealthImport = nil
+    }
+
+    /// Handle a `noop://import-screentime` deep link. Same reasoning as the health import above: a
+    /// custom URL scheme is forgeable by any other app or web page, so this only validates and stages —
+    /// nothing is written until the user confirms in the alert the iOS shell puts up.
+    func handleScreenTimeImportURL(_ url: URL) {
+        switch ScreenTimeImport.prepare(url: url) {
+        case .success(let pending):
+            pendingScreenTimeImport = pending
+        case .failure(let outcome):
+            finishScreenTimeImport(outcome)
+        }
+    }
+
+    func cancelPendingScreenTimeImport() {
+        pendingScreenTimeImport = nil
+    }
+
+    func confirmPendingScreenTimeImport() {
+        guard let pending = pendingScreenTimeImport else { return }
+        pendingScreenTimeImport = nil
+        Task {
+            guard let store = await repo.storeHandle() else {
+                finishScreenTimeImport(.rejected("Couldn't open the local store."))
+                return
+            }
+            let outcome = await ScreenTimeImport.ingest(prepared: pending, into: store)
+            // The value lands in metricSeries, which sits OUTSIDE refresh()'s daily diff, so bump the
+            // refresh sequence explicitly — otherwise an open Screen Time detail keeps its stale series
+            // (the same reason the Shortcuts health import drops the Apple cache above).
+            if case .imported = outcome { await repo.refresh() }
+            finishScreenTimeImport(outcome)
+        }
+    }
+
+    private func finishScreenTimeImport(_ outcome: ScreenTimeImport.Outcome) {
+        switch outcome {
+        case .imported(let day, let minutes):
+            screenTimeImportSummary = String(localized: "Logged \(minutes) minutes of screen time for \(day).")
+        case .rejected(let reason):
+            screenTimeImportSummary = reason
+        }
     }
 
     func confirmPendingHealthImport() {

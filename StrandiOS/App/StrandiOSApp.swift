@@ -158,8 +158,17 @@ struct StrandiOSApp: App {
                 // HealthKit-free payload. Filter on the host so other future schemes don't trip the
                 // importer; macOS never registers the scheme so this stays iOS-only.
                 .onOpenURL { url in
-                    if url.host == "import-health" {
+                    switch url.host {
+                    case "import-health":
                         model.handleHealthImportURL(url)
+                    // Daily screen-time minutes from the user's own Shortcut — which the strap's
+                    // double-tap can fire via Automations → "Run a Shortcut…". Same staged-then-confirmed
+                    // shape as the health import: a custom scheme is forgeable, so nothing writes until
+                    // the alert below is accepted.
+                    case "import-screentime":
+                        model.handleScreenTimeImportURL(url)
+                    default:
+                        break
                     }
                 }
                 .alert("Import Apple Health data?", isPresented: Binding(
@@ -176,6 +185,34 @@ struct StrandiOSApp: App {
                     } else {
                         Text("A Shortcut wants to add data to the Apple Health import source.")
                     }
+                }
+                .alert("Log screen time?", isPresented: Binding(
+                    get: { model.pendingScreenTimeImport != nil },
+                    set: { showing in
+                        if !showing { model.cancelPendingScreenTimeImport() }
+                    }
+                )) {
+                    Button("Log") { model.confirmPendingScreenTimeImport() }
+                    Button("Cancel", role: .cancel) { model.cancelPendingScreenTimeImport() }
+                } message: {
+                    if let pending = model.pendingScreenTimeImport {
+                        Text("A Shortcut wants to log \(pending.minutes) minutes of screen time for \(pending.day).")
+                    } else {
+                        Text("A Shortcut wants to log screen time.")
+                    }
+                }
+                // Result of the last screen-time link (success or the reason it was refused). Shown once,
+                // then cleared — a link that failed silently would be indistinguishable from one that
+                // never arrived, which is the hardest kind of Shortcut to debug.
+                .alert("Screen Time", isPresented: Binding(
+                    get: { model.screenTimeImportSummary != nil },
+                    set: { showing in
+                        if !showing { model.screenTimeImportSummary = nil }
+                    }
+                )) {
+                    Button("OK", role: .cancel) { model.screenTimeImportSummary = nil }
+                } message: {
+                    Text(model.screenTimeImportSummary ?? "")
                 }
                 // Bring the watch link up once at launch (WCSession ignores a redundant activate), then
                 // push the first snapshot so a watch that's already on-wrist gets current scores without
