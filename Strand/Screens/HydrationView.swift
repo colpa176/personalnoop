@@ -7,13 +7,15 @@ import StrandAnalytics
 // Liquid finish: water in a vessel is the literal metaphor, so the hero is the canonical `LiquidVessel`
 // tinted the action blue, filling to today's fraction of goal with the litre figure counting up over it.
 // The day total sits in a filling `LiquidTube` (the same horizontal vessel Today's grid uses), the three
-// quick-log buttons (Sip / Cup / Bottle) stay in the secondary NoopButton style, and the 7-day mini bars
-// remain. Frosted `card {}` surfaces (rounded 22 + resting hairline), the day-of-sky backdrop, and
-// `LiquidPressStyle` on the tappable drink rows line the screen up with the liquid Today + batch-1 tabs.
+// quick-log buttons (Sip / Cup / Bottle) stay in the secondary NoopButton style, and the 7-day history is
+// the app's standard dot/line `TrendChart`. Frosted `card {}` surfaces (rounded 22 + resting hairline), the
+// day-of-sky backdrop, and `LiquidPressStyle` on the tappable drink rows line the screen up with the liquid
+// Today + batch-1 tabs.
 // BYTE-PARITY twin of the Android `HydrationScreen`: the day total + history come from the local-only
 // `HydrationStore` series (additive day total), and the goal is the pure `HydrationGoal` engine (profile
 // sex + today's Effort bump). Per-tap rows aren't separately persisted on either platform — the day total
-// is the source of truth, so the screen shows the honest day figure.
+// is the source of truth, so the screen shows the honest day figure. The parity is on that DATA path; the
+// 7-day history's mark geometry is the one deliberate divergence (Android still draws bars there).
 struct HydrationView: View {
     @EnvironmentObject var repo: Repository
     @EnvironmentObject var profile: ProfileStore
