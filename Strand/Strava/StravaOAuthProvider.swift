@@ -34,7 +34,8 @@ final class StravaOAuthProvider: NSObject, AuthProvider, ASWebAuthenticationPres
     /// rotated) refresh token that Strava returns.
     func refreshedAccessToken() async throws -> String {
         guard let refresh = StravaTokenStore.load()?.refreshToken else { throw StravaError.notConnected }
-        let refreshed = try await exchange(StravaOAuth.refreshRequest(credentials: credentials, refreshToken: refresh))
+        let refreshed = try await exchange(StravaOAuth.refreshRequest(credentials: credentials, refreshToken: refresh),
+                                           fallbackRefreshToken: refresh)
         guard StravaTokenStore.save(refreshed) else { throw StravaError.tokenExchangeFailed("keychain write failed") }
         return refreshed.accessToken
     }
@@ -60,13 +61,21 @@ final class StravaOAuthProvider: NSObject, AuthProvider, ASWebAuthenticationPres
         let q = Dictionary(uniqueKeysWithValues: items.map { ($0.name, $0.value ?? "") })
         guard q["state"] == state else { throw StravaError.authFailed("state mismatch") }
         guard let code = q["code"], !code.isEmpty else { throw StravaError.authFailed(q["error"] ?? "no code") }
+        // Strava lets the athlete UNCHECK individual permissions on the consent screen and still approve.
+        // The granted set comes back as a comma-delimited `scope`; without the activity-read scope every
+        // later API call would 401, so fail here with something actionable instead of storing a dead token.
+        guard StravaOAuth.grantsRequiredScope(q["scope"]) else {
+            throw StravaError.authFailed("NOOP needs the \"View data about your activities\" permission. "
+                                         + "Tap Connect again and leave that box checked.")
+        }
 
         let tokens = try await exchange(StravaOAuth.tokenExchangeRequest(credentials: credentials, code: code))
         guard StravaTokenStore.save(tokens) else { throw StravaError.tokenExchangeFailed("keychain write failed") }
     }
 
-    /// POST a token request and parse the response (shared by exchange + refresh).
-    private func exchange(_ req: URLRequest) async throws -> StravaTokens {
+    /// POST a token request and parse the response (shared by exchange + refresh). `fallbackRefreshToken`
+    /// is non-nil only on refresh, where a response omitting the refresh token must not drop the one we hold.
+    private func exchange(_ req: URLRequest, fallbackRefreshToken: String? = nil) async throws -> StravaTokens {
         let (data, resp): (Data, URLResponse)
         do { (data, resp) = try await session.data(for: req) }
         catch { throw StravaError.network(error.localizedDescription) }
@@ -74,7 +83,7 @@ final class StravaOAuthProvider: NSObject, AuthProvider, ASWebAuthenticationPres
         guard (200..<300).contains(code) else {
             throw StravaError.tokenExchangeFailed("HTTP \(code): \(String(data: data, encoding: .utf8) ?? "")")
         }
-        return try StravaOAuth.parseTokenResponse(data, now: Date())
+        return try StravaOAuth.parseTokenResponse(data, now: Date(), fallbackRefreshToken: fallbackRefreshToken)
     }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {

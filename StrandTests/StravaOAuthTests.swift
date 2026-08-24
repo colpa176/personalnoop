@@ -92,6 +92,42 @@ final class StravaOAuthTests: XCTestCase {
         XCTAssertThrowsError(try StravaOAuth.parseTokenResponse(json, now: Date()))
     }
 
+    // MARK: - Granted-scope verification (the athlete can uncheck a permission and still approve)
+
+    func testGrantedScopeVerification() {
+        XCTAssertTrue(StravaOAuth.grantsRequiredScope("activity:read_all"))
+        XCTAssertTrue(StravaOAuth.grantsRequiredScope("read,activity:read_all"))
+        XCTAssertTrue(StravaOAuth.grantsRequiredScope("read activity:read_all"))
+        XCTAssertTrue(StravaOAuth.grantsRequiredScope("activity:read_all,read"))
+        // Denied / partial grants must NOT pass.
+        XCTAssertFalse(StravaOAuth.grantsRequiredScope("read"))
+        XCTAssertFalse(StravaOAuth.grantsRequiredScope("activity:read"))   // narrower scope is not enough
+        XCTAssertFalse(StravaOAuth.grantsRequiredScope(""))
+        XCTAssertFalse(StravaOAuth.grantsRequiredScope("   "))
+        XCTAssertFalse(StravaOAuth.grantsRequiredScope(nil))
+    }
+
+    // MARK: - Refresh must never discard the refresh token we already hold
+
+    func testRefreshResponseWithoutRefreshTokenKeepsExistingOne() throws {
+        let json = #"{"access_token":"new-acc","expires_at":2000000}"#.data(using: .utf8)!
+        let tokens = try StravaOAuth.parseTokenResponse(json, now: Date(), fallbackRefreshToken: "kept-ref")
+        XCTAssertEqual(tokens.accessToken, "new-acc")
+        XCTAssertEqual(tokens.refreshToken, "kept-ref", "an omitted refresh token must not strand the account")
+    }
+
+    func testRotatedRefreshTokenWinsOverFallback() throws {
+        let json = #"{"access_token":"a","refresh_token":"rotated","expires_at":2000000}"#.data(using: .utf8)!
+        let tokens = try StravaOAuth.parseTokenResponse(json, now: Date(), fallbackRefreshToken: "old")
+        XCTAssertEqual(tokens.refreshToken, "rotated")
+    }
+
+    func testInitialExchangeStillRequiresRefreshToken() {
+        // No fallback on the initial exchange → a response lacking a refresh token is an error.
+        let json = #"{"access_token":"acc","expires_at":1}"#.data(using: .utf8)!
+        XCTAssertThrowsError(try StravaOAuth.parseTokenResponse(json, now: Date()))
+    }
+
     func testTokenExpiryHasSkew() {
         // isExpired trips 60 s early so we refresh before, not during, a request.
         let almost = StravaTokens(accessToken: "a", refreshToken: "r", expiresAt: Date().addingTimeInterval(30))

@@ -13,8 +13,25 @@ import StrandImport
 final class StravaSyncCoordinator {
     static let deviceId = "strava-api"
     /// Cursor name in the shared `cursors` table: the newest imported activity start (unix seconds). A
-    /// later incremental sync requests activities strictly `after` this instant.
+    /// later incremental sync requests activities `after` this instant, minus `incrementalLookback`.
     static let cursorName = "strava:activities:after"
+
+    /// Safety margin subtracted from the cursor on an incremental sync.
+    ///
+    /// Strava documents `after` only as "an epoch timestamp ... activities that have taken place after a
+    /// certain time" — it does NOT say whether the comparison is against `start_date` (true UTC, what we
+    /// store) or `start_date_local` (wall clock). If it is the local one, a cursor taken from the UTC start
+    /// would sit up to a full UTC offset (±14 h) away from what the filter actually compares, and activities
+    /// in that gap would be silently skipped forever. Re-asking for a 48 h overlap costs one page and is
+    /// free correctness-wise, because every write is an idempotent upsert on (deviceId, startTs, sport).
+    static let incrementalLookback = 48 * 3600
+
+    /// The `after` value for a sync: nil for a full backfill; the stored cursor minus the lookback margin
+    /// (floored at 0) for an incremental one.
+    static func afterParameter(mode: Mode, cursor: Int?) -> Int? {
+        guard mode == .incremental, let cursor, cursor > 0 else { return nil }
+        return max(0, cursor - incrementalLookback)
+    }
 
     private let fetcher: StravaActivityFetching
     private let store: WhoopStore
@@ -43,8 +60,9 @@ final class StravaSyncCoordinator {
         try StravaSyncWriter.registerSource(in: store, deviceId: deviceId)
 
         let existing = try await store.cursor(Self.cursorName)
-        // Full backfill ignores the cursor (after=nil → whole history); incremental starts after it.
-        let after: Int? = (mode == .incremental) ? existing : nil
+        // Full backfill ignores the cursor (after=nil → whole history); incremental starts a safe margin
+        // before it (see `incrementalLookback`).
+        let after = Self.afterParameter(mode: mode, cursor: existing)
 
         var summary = StravaSyncSummary()
         var newestSeen: Int? = nil

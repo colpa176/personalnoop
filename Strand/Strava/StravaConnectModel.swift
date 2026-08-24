@@ -25,6 +25,7 @@ final class StravaConnectModel: ObservableObject {
 
     /// Connect via OAuth, then run a one-time full history backfill.
     func connectAndImport(repo: Repository) {
+        guard !busy else { return }   // a second tap mid-run must never start a parallel import
         guard let creds = StravaCredentials.fromBundle else {
             statusText = "Add your Strava app's client_id/secret to StravaSecrets.xcconfig first."; return
         }
@@ -42,6 +43,7 @@ final class StravaConnectModel: ObservableObject {
 
     /// Incremental sync: pull only activities newer than the stored cursor. Requires an existing connection.
     func syncLatest(repo: Repository) {
+        guard !busy else { return }   // a second tap mid-run must never start a parallel sync
         guard let creds = StravaCredentials.fromBundle else { statusText = "Strava isn't configured."; return }
         guard StravaTokenStore.isConnected else { statusText = "Connect your Strava account first."; return }
         setBusy(true); statusText = "Checking Strava for new activities…"
@@ -70,6 +72,7 @@ final class StravaConnectModel: ObservableObject {
     }
 
     func disconnect(repo: Repository) {
+        guard !busy else { return }
         busy = true
         Task {
             StravaOAuthProvider(credentials: StravaCredentials.fromBundle
@@ -77,6 +80,11 @@ final class StravaConnectModel: ObservableObject {
             if let store = await repo.storeHandle() {
                 do {
                     try await store.deleteAllData(deviceId: StravaSyncCoordinator.deviceId)
+                    // The `cursors` table is keyed by NAME, not deviceId, so `deleteAllData` (which is
+                    // deviceId-scoped) does NOT clear the incremental cursor. Reset it to 0 — otherwise a
+                    // later reconnect would resume "after" the old high-water mark and silently skip every
+                    // activity older than it. 0 reads as "no cursor" (the client omits `after`).
+                    try await store.setCursor(StravaSyncCoordinator.cursorName, 0)
                     // Mirror OuraConnectModel: deleteAllData leaves the registry row; archive it so a
                     // data-less "Strava (cloud)" card doesn't linger in DevicesView.
                     try DeviceRegistryStore(dbQueue: store.registryWriter).archive(StravaSyncCoordinator.deviceId)

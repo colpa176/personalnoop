@@ -42,6 +42,21 @@ final class StravaSyncCoordinatorTests: XCTestCase {
         XCTAssertNil(StravaSyncCoordinator.advancedCursor(existing: nil, newestSeen: nil))
     }
 
+    func testAfterParameterAppliesLookbackMargin() {
+        // Full mode ignores the cursor entirely.
+        XCTAssertNil(StravaSyncCoordinator.afterParameter(mode: .full, cursor: 1_700_000_000))
+        XCTAssertNil(StravaSyncCoordinator.afterParameter(mode: .incremental, cursor: nil))
+        XCTAssertNil(StravaSyncCoordinator.afterParameter(mode: .incremental, cursor: 0))
+        // Incremental re-asks from a safe margin BEFORE the cursor (Strava doesn't document whether
+        // `after` compares start_date or start_date_local; the overlap is free because writes are upserts).
+        XCTAssertEqual(StravaSyncCoordinator.afterParameter(mode: .incremental, cursor: 1_700_000_000),
+                       1_700_000_000 - StravaSyncCoordinator.incrementalLookback)
+        // Never negative.
+        XCTAssertEqual(StravaSyncCoordinator.afterParameter(mode: .incremental, cursor: 100), 0)
+        XCTAssertGreaterThanOrEqual(StravaSyncCoordinator.incrementalLookback, 15 * 3600,
+                                    "margin must exceed the largest real UTC offset")
+    }
+
     // MARK: - Full backfill: per-page persist, source registered, cursor advanced to newest
 
     func testFullBackfillPersistsAllPagesAndAdvancesCursor() async throws {
@@ -82,7 +97,9 @@ final class StravaSyncCoordinatorTests: XCTestCase {
         let coord = StravaSyncCoordinator(fetcher: fetcher, store: store)
         _ = try await coord.sync(mode: .incremental)
 
-        XCTAssertEqual(fetcher.capturedAfter, iso("2026-01-04T00:00:00Z"), "incremental fetches after the cursor")
+        XCTAssertEqual(fetcher.capturedAfter,
+                       iso("2026-01-04T00:00:00Z") - StravaSyncCoordinator.incrementalLookback,
+                       "incremental fetches from the cursor minus the safety lookback")
         let cursor = try await store.cursor("strava:activities:after")
         XCTAssertEqual(cursor, iso("2026-01-05T07:00:00Z"), "cursor advances to the newest new activity")
     }

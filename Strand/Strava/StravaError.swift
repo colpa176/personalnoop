@@ -11,7 +11,7 @@ enum StravaError: LocalizedError, Equatable {
     case authFailed(String)
     case tokenExchangeFailed(String)
     case badResponse(Int, String)
-    case rateLimited
+    case rateLimited(String?)
     case network(String)
     case decode
 
@@ -26,8 +26,9 @@ enum StravaError: LocalizedError, Equatable {
         case .badResponse(let code, let detail):
             let extra = detail.isEmpty ? "" : " — \(detail)"
             return "Strava returned an error (\(code))\(extra)."
-        case .rateLimited:
-            return "Strava is rate-limiting requests. Waiting before retrying."
+        case .rateLimited(let detail):
+            let extra = (detail?.isEmpty == false) ? " (\(detail!))" : ""
+            return "Strava is rate-limiting requests\(extra). Wait a few minutes and sync again."
         case .network(let d):
             return "Network problem talking to Strava: \(d)"
         case .decode:

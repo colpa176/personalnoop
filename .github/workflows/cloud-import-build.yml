@@ -1,0 +1,138 @@
+# Build + test the OPT-IN cloud-import lanes (Strava, Oura) that no other job can reach.
+#
+# Why this exists: every other workflow builds the DEFAULT configuration, where neither
+# STRAVA_CLOUD_IMPORT nor OURA_CLOUD_IMPORT is set — so every file under Strand/Strava/,
+# Strand/CloudSync/ and their tests is compiled out entirely. `app-build.yml` therefore proves
+# only that the default (fully offline) build still works; it gives the cloud lanes zero coverage.
+#
+# This job writes THROWAWAY credentials into the gitignored secrets xcconfigs purely to switch the
+# compilation conditions on. Nothing here talks to Strava or Oura: the unit tests drive a
+# URLProtocol stub, and the interactive OAuth consent flow is never invoked. No real secret is
+# stored, referenced, or needed — keeping the repo's no-secrets-in-CI property intact.
+name: Cloud import lanes (Strava / Oura)
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'Strand/Strava/**'
+      - 'Strand/CloudSync/**'
+      - 'Strand/Oura/**'
+      - 'Strand/CloudImportConfig.xcconfig'
+      - 'StrandTests/**'
+      - 'Packages/StrandImport/**'
+      - 'project.yml'
+      - '.github/workflows/cloud-import-build.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Strand/Strava/**'
+      - 'Strand/CloudSync/**'
+      - 'Strand/Oura/**'
+      - 'StrandTests/**'
+      - 'project.yml'
+      - '.github/workflows/cloud-import-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: cloud-import-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Strava alone: the lane under active development — compiled AND unit-tested.
+          - name: strava-only
+            oura: false
+            run_tests: true
+          # Strava + Oura together: proves the two secrets xcconfigs' `$(inherited)` compilation
+          # conditions accumulate and both lanes compile side by side. Build-only; the Strava leg
+          # above already runs the tests.
+          - name: strava-and-oura
+            oura: true
+            run_tests: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # Throwaway values. They only need to be non-blank so StravaCredentials.fromBundle resolves and
+      # the compilation condition is set; no request is ever made with them.
+      - name: Enable the Strava lane (throwaway credentials)
+        run: |
+          cat > Strand/Strava/StravaSecrets.xcconfig <<'EOF'
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) STRAVA_CLOUD_IMPORT
+          STRAVA_CLIENT_ID = 000000
+          STRAVA_CLIENT_SECRET = ci-not-a-real-secret
+          STRAVA_REDIRECT_URI = noop:/$()/localhost
+          EOF
+
+      - name: Enable the Oura lane (throwaway credentials)
+        if: matrix.oura
+        run: |
+          cat > Strand/Oura/OuraSecrets.xcconfig <<'EOF'
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) OURA_CLOUD_IMPORT
+          OURA_CLIENT_ID = ci-client-id
+          OURA_CLIENT_SECRET = ci-not-a-real-secret
+          OURA_REDIRECT_URI = noop:/$()/oura/callback
+          EOF
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # HARD ASSERTION, not a printout. Both secrets files assign
+      # SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) <FLAG>, and CloudImportConfig.xcconfig
+      # #includes both. If `$(inherited)` did NOT chain across the two includes, the second assignment
+      # would clobber the first and one lane would silently vanish from the binary — a build that still
+      # SUCCEEDS while shipping nothing. Assert the resolved value instead of trusting the semantics.
+      - name: Assert the compilation conditions resolved
+        run: |
+          set -euo pipefail
+          CONDS=$(xcodebuild -scheme Strand -configuration Debug -showBuildSettings 2>/dev/null \
+                  | grep -E '^\s*SWIFT_ACTIVE_COMPILATION_CONDITIONS' | head -1)
+          echo "resolved: $CONDS"
+          case "$CONDS" in
+            *STRAVA_CLOUD_IMPORT*) echo "OK: STRAVA_CLOUD_IMPORT set" ;;
+            *) echo "::error::STRAVA_CLOUD_IMPORT missing — the Strava lane would compile to nothing"; exit 1 ;;
+          esac
+          if [ "${{ matrix.oura }}" = "true" ]; then
+            case "$CONDS" in
+              *OURA_CLOUD_IMPORT*) echo "OK: OURA_CLOUD_IMPORT also set (\$(inherited) chained correctly)" ;;
+              *) echo "::error::OURA_CLOUD_IMPORT was clobbered by the Strava include — \$(inherited) did not chain"; exit 1 ;;
+            esac
+          fi
+
+      - name: Build Strand (macOS) — ${{ matrix.name }}
+        run: >-
+          xcodebuild -scheme Strand -configuration Debug
+          -destination 'generic/platform=macOS'
+          ARCHS="x86_64 arm64" ONLY_ACTIVE_ARCH=NO
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          build
+
+      - name: Test Strand (StrandTests, incl. the Strava suites)
+        if: matrix.run_tests
+        run: >-
+          xcodebuild -scheme Strand -configuration Debug
+          -destination 'platform=macOS'
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          test
+
+      # Belt-and-braces: the throwaway xcconfigs are gitignored, but make it impossible for a
+      # future edit to this workflow to commit one from a CI checkout.
+      - name: Assert no secrets file is tracked by git
+        if: always()
+        run: |
+          if git ls-files --error-unmatch Strand/Strava/StravaSecrets.xcconfig 2>/dev/null; then
+            echo "::error::StravaSecrets.xcconfig is tracked by git"; exit 1
+          fi
+          if git ls-files --error-unmatch Strand/Oura/OuraSecrets.xcconfig 2>/dev/null; then
+            echo "::error::OuraSecrets.xcconfig is tracked by git"; exit 1
+          fi
+          echo "OK: no secrets xcconfig is tracked."

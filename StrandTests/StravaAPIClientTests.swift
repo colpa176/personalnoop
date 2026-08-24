@@ -23,21 +23,45 @@ final class StravaAPIClientTests: XCTestCase {
         return .init(status: 200, body: "[\(rows.joined(separator: ","))]".data(using: .utf8)!)
     }
 
-    // MARK: - Pagination (page-number, stop on short page)
+    // MARK: - Pagination (page-number; terminates on an EMPTY page)
 
-    func testPaginationWalksPagesUntilShortPage() async throws {
-        // per_page=2: page1 full (2 rows) → continue; page2 short (1 row) → stop. Page 3 never requested.
-        StravaURLProtocolStub.queue = [page(1, ids: [1, 2]), page(2, ids: [3])]
+    func testPaginationWalksPagesUntilEmptyPage() async throws {
+        // Terminates on the EMPTY page, not the short one: page1 (2 rows), page2 (1 row), page3 empty.
+        StravaURLProtocolStub.queue = [page(1, ids: [1, 2]), page(2, ids: [3]),
+                                       .init(status: 200, body: "[]".data(using: .utf8)!)]
         let client = StravaAPIClient(auth: StubAuth(), session: StravaURLProtocolStub.session(), perPage: 2)
         var collected: [[String: Any]] = []
         var pages = 0
         try await client.forEachActivityPage(after: nil) { rows, _ in collected += rows; pages += 1 }
         XCTAssertEqual(collected.count, 3)
         XCTAssertEqual(pages, 2)
-        XCTAssertEqual(StravaURLProtocolStub.requestedURLs.count, 2)
+        XCTAssertEqual(StravaURLProtocolStub.requestedURLs.count, 3)
         XCTAssertTrue(StravaURLProtocolStub.requestedURLs[0].absoluteString.contains("page=1"))
-        XCTAssertTrue(StravaURLProtocolStub.requestedURLs[1].absoluteString.contains("page=2"))
+        XCTAssertTrue(StravaURLProtocolStub.requestedURLs[2].absoluteString.contains("page=3"))
         XCTAssertTrue(StravaURLProtocolStub.requestedURLs[0].absoluteString.contains("per_page=2"))
+    }
+
+    /// Regression guard: a server-side per_page cap must NOT truncate the import. If Strava caps pages
+    /// below what we request, every page looks "short" — stopping on that would silently lose history.
+    func testShortPageDoesNotStopPagination() async throws {
+        StravaURLProtocolStub.queue = [
+            page(1, ids: [1]),                                        // 1 row while perPage=200
+            page(2, ids: [2]),
+            .init(status: 200, body: "[]".data(using: .utf8)!),
+        ]
+        let client = StravaAPIClient(auth: StubAuth(), session: StravaURLProtocolStub.session(), perPage: 200)
+        var collected: [[String: Any]] = []
+        try await client.forEachActivityPage(after: nil) { rows, _ in collected += rows }
+        XCTAssertEqual(collected.count, 2, "short pages must keep paging until an empty page")
+    }
+
+    func testNonArrayBodyThrowsDecodeRatherThanEndingSilently() async throws {
+        StravaURLProtocolStub.queue = [.init(status: 200, body: #"{"message":"oops"}"#.data(using: .utf8)!)]
+        let client = StravaAPIClient(auth: StubAuth(), session: StravaURLProtocolStub.session())
+        do {
+            try await client.forEachActivityPage(after: nil) { _, _ in }
+            XCTFail("expected a decode error, not a silent stop")
+        } catch { /* expected */ }
     }
 
     func testEmptyFirstPageStopsImmediately() async throws {
@@ -67,7 +91,8 @@ final class StravaAPIClientTests: XCTestCase {
     func test429IsRetriedAfterBackoff() async throws {
         StravaURLProtocolStub.queue = [
             .init(status: 429, body: Data()),
-            page(1, ids: [1]),                       // short page → stops after success
+            page(1, ids: [1]),
+            .init(status: 200, body: "[]".data(using: .utf8)!),   // empty page terminates the loop
         ]
         let client = StravaAPIClient(auth: StubAuth(), session: StravaURLProtocolStub.session(),
                                      backoff: 0, perPage: 200)
@@ -80,6 +105,7 @@ final class StravaAPIClientTests: XCTestCase {
         StravaURLProtocolStub.queue = [
             .init(status: 401, body: Data()),
             page(1, ids: [1]),
+            .init(status: 200, body: "[]".data(using: .utf8)!),   // empty page terminates the loop
         ]
         let stub = StubAuth()
         let client = StravaAPIClient(auth: stub, session: StravaURLProtocolStub.session(), perPage: 200)
@@ -100,14 +126,34 @@ final class StravaAPIClientTests: XCTestCase {
 
     // MARK: - Rate-limit headers
 
-    func testRateLimitHeadersCaptured() async throws {
-        StravaURLProtocolStub.queue = [.init(status: 200, body: "[]".data(using: .utf8)!,
-            headers: ["X-RateLimit-Limit": "200,2000", "X-RateLimit-Usage": "34,512"])]
-        let client = StravaAPIClient(auth: StubAuth(), session: StravaURLProtocolStub.session())
-        try await client.forEachActivityPage(after: nil) { _, _ in }
-        let rl = try XCTUnwrap(client.lastRateLimit)
+    func testRateLimitHeaderParsing() throws {
+        let http = try XCTUnwrap(HTTPURLResponse(url: URL(string: "https://x")!, statusCode: 429,
+            httpVersion: nil, headerFields: ["X-RateLimit-Limit": "200,2000", "X-RateLimit-Usage": "34,512"]))
+        let rl = try XCTUnwrap(StravaRateLimit.from(http))
         XCTAssertEqual(rl.limit15min, 200); XCTAssertEqual(rl.limitDaily, 2000)
         XCTAssertEqual(rl.usage15min, 34); XCTAssertEqual(rl.usageDaily, 512)
+        XCTAssertEqual(rl.summary, "34/200 in 15 min, 512/2000 today")
+
+        let bare = try XCTUnwrap(HTTPURLResponse(url: URL(string: "https://x")!, statusCode: 200,
+            httpVersion: nil, headerFields: [:]))
+        XCTAssertNil(StravaRateLimit.from(bare))
+    }
+
+    /// Exhausting the retries surfaces the rate-limit usage in the user-facing error, and the client keeps
+    /// no cross-request mutable state to do it.
+    func testPersistent429SurfacesRateLimitDetail() async throws {
+        let headers = ["X-RateLimit-Limit": "200,2000", "X-RateLimit-Usage": "200,900"]
+        StravaURLProtocolStub.queue = (0..<3).map { _ in
+            StravaURLProtocolStub.Stubbed(status: 429, body: Data(), headers: headers)
+        }
+        let client = StravaAPIClient(auth: StubAuth(), session: StravaURLProtocolStub.session(), backoff: 0)
+        do {
+            try await client.forEachActivityPage(after: nil) { _, _ in }
+            XCTFail("expected rateLimited")
+        } catch let e as StravaError {
+            guard case .rateLimited(let detail) = e else { return XCTFail("wrong error: \(e)") }
+            XCTAssertEqual(detail, "200/200 in 15 min, 900/2000 today")
+        }
     }
 }
 #endif // STRAVA_CLOUD_IMPORT

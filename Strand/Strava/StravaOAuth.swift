@@ -63,13 +63,22 @@ enum StravaOAuth {
 
     /// Parse a token endpoint response. Strava returns `access_token`, `refresh_token`, and an ABSOLUTE
     /// `expires_at` (unix seconds); we use it directly. `now` is injected only for the `expires_in`
-    /// fallback so expiry stays deterministic in tests. A response missing either token is an error.
-    static func parseTokenResponse(_ data: Data, now: Date) throws -> StravaTokens {
+    /// fallback so expiry stays deterministic in tests.
+    ///
+    /// `fallbackRefreshToken` is the refresh token we already hold: on a REFRESH, Strava documents that it
+    /// returns a refresh token (sometimes rotated, sometimes the same one), but if a response ever omits
+    /// it we must keep the one we have rather than discard it and strand the connection. On the initial
+    /// exchange no fallback is passed, so a response with no refresh token is correctly an error.
+    static func parseTokenResponse(_ data: Data, now: Date,
+                                   fallbackRefreshToken: String? = nil) throws -> StravaTokens {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let access = obj["access_token"] as? String, !access.isEmpty,
-              let refresh = obj["refresh_token"] as? String, !refresh.isEmpty else {
+              let access = obj["access_token"] as? String, !access.isEmpty else {
             let detail = String(data: data, encoding: .utf8) ?? ""
             throw StravaError.tokenExchangeFailed(detail)
+        }
+        let responseRefresh = (obj["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        guard let refresh = responseRefresh ?? fallbackRefreshToken, !refresh.isEmpty else {
+            throw StravaError.tokenExchangeFailed(String(data: data, encoding: .utf8) ?? "")
         }
         let expiresAt: Date
         if let at = num(obj["expires_at"]) {
@@ -79,6 +88,17 @@ enum StravaOAuth {
             expiresAt = now.addingTimeInterval(expiresIn)
         }
         return StravaTokens(accessToken: access, refreshToken: refresh, expiresAt: expiresAt)
+    }
+
+    /// True when the scope string Strava returned on the callback actually contains the activity-read
+    /// scope we asked for. Strava delimits with commas (it also accepts spaces on the way in), so both are
+    /// tolerated here. A nil/blank scope is treated as NOT granted — never assume a permission we can't see.
+    static func grantsRequiredScope(_ granted: String?) -> Bool {
+        guard let granted, !granted.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        let parts = granted
+            .split(whereSeparator: { $0 == "," || $0 == " " })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return parts.contains("activity:read_all")
     }
 
     /// Coerce a JSON number (Double | Int | NSNumber) to a finite Double, or nil.

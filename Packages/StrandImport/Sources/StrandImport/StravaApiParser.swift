@@ -35,11 +35,20 @@ public enum StravaApiParser {
                 name: WearableJSON.str(a, "name"),
                 movingTimeS: moving,
                 distanceM: WearableJSON.posDbl(a, "distance"),          // Strava distance is METERS
-                avgHr: WearableJSON.posInt(a, "average_heartrate"),      // Double in JSON; truncated to Int bpm
-                maxHr: WearableJSON.posInt(a, "max_heartrate"),
+                avgHr: roundedBpm(a, "average_heartrate"),                // Double bpm in JSON → rounded Int
+                maxHr: roundedBpm(a, "max_heartrate"),
                 energyKcal: WearableJSON.posDbl(a, "calories")))         // absent on summaries → nil in v1
         }
         return out
+    }
+
+    /// Strava reports heart rate as a fractional Double (e.g. 154.6 bpm). Round to nearest rather than
+    /// truncating, so a stored bpm is never a full beat below what Strava shows. Non-positive/absent → nil
+    /// ("not measured"), matching WearableJSON.posInt's convention elsewhere in the importers.
+    private static func roundedBpm(_ v: [String: Any], _ k: String) -> Int? {
+        guard let d = WearableJSON.posDbl(v, k) else { return nil }
+        let r = Int(d.rounded())
+        return r > 0 ? r : nil
     }
 
     /// Normalize a Strava activity type to a stable, human-readable, lowercased label for `WorkoutRow.sport`.

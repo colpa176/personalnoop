@@ -30,7 +30,7 @@ final class StravaApiParserTests: XCTestCase {
         XCTAssertEqual(Int(a.end.timeIntervalSince1970), epoch("2026-01-02T07:00:00Z") + 2400)
         XCTAssertEqual(a.movingTimeS, 2100)        // moving time → durationS on write
         XCTAssertEqual(a.distanceM, 6200)          // meters, unchanged
-        XCTAssertEqual(a.avgHr, 154)               // Double bpm truncated to Int
+        XCTAssertEqual(a.avgHr, 155)               // Double bpm ROUNDED to Int (154.6 -> 155)
         XCTAssertEqual(a.maxHr, 178)
         XCTAssertEqual(a.energyKcal, 410)
     }
@@ -93,6 +93,44 @@ final class StravaApiParserTests: XCTestCase {
         XCTAssertNil(a.energyKcal)
         XCTAssertNil(a.movingTimeS)   // moving_time absent
         XCTAssertEqual(a.sport, "walk")
+    }
+
+    func testHeartRateIsRoundedNotTruncated() {
+        let a = StravaApiParser.parseActivities([[
+            "type": "Run", "start_date": "2026-01-01T06:00:00Z", "elapsed_time": 600,
+            "average_heartrate": 154.4, "max_heartrate": 177.5,
+        ]])[0]
+        XCTAssertEqual(a.avgHr, 154)   // rounds down
+        XCTAssertEqual(a.maxHr, 178)   // rounds up (177.5 -> 178)
+    }
+
+    func testSubOneBpmRoundsToNilNotZero() {
+        // A pathological <0.5 bpm must not become a misleading 0; "not measured" is nil.
+        let a = StravaApiParser.parseActivities([[
+            "type": "Run", "start_date": "2026-01-01T06:00:00Z", "elapsed_time": 600,
+            "average_heartrate": 0.2,
+        ]])[0]
+        XCTAssertNil(a.avgHr)
+    }
+
+    func testStartDateIsUTCNotLocal() {
+        // Strava sends BOTH start_date (UTC) and start_date_local (wall clock, also 'Z'-suffixed and
+        // therefore a trap). We must key off start_date so stored timestamps are true instants.
+        let a = StravaApiParser.parseActivities([[
+            "type": "Run", "start_date": "2026-01-02T07:00:00Z",
+            "start_date_local": "2026-01-02T02:00:00Z", "timezone": "(GMT-05:00) America/New_York",
+            "elapsed_time": 600,
+        ]])[0]
+        XCTAssertEqual(Int(a.start.timeIntervalSince1970), epoch("2026-01-02T07:00:00Z"))
+    }
+
+    func testKilojoulesNeverBecomeCalories() {
+        // kilojoules is mechanical work, not metabolic energy — it must never populate energyKcal.
+        let a = StravaApiParser.parseActivities([[
+            "type": "Ride", "start_date": "2026-01-01T06:00:00Z", "elapsed_time": 3600,
+            "kilojoules": 850.0,
+        ]])[0]
+        XCTAssertNil(a.energyKcal)
     }
 
     func testZeroHeartRateTreatedAsNotMeasured() {
