@@ -37,7 +37,7 @@ final class OuraConnectModel: ObservableObject {
         Task {
             do {
                 let provider = OuraOAuthProvider(credentials: creds)
-                try await provider.authorize(presentationAnchor: ouraPresentationAnchor())
+                try await provider.authorize(presentationAnchor: cloudAuthPresentationAnchor())
                 isConnected = true
                 guard let store = await repo.storeHandle() else { fail("No local store."); return }
                 let client = OuraAPIClient(auth: provider, environment: .production)

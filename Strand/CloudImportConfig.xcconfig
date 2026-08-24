@@ -1,0 +1,14 @@
+// Combined cloud-import config, layered as the base configuration beneath the app + test targets (see
+// project.yml configFiles). It optionally includes EACH connector's own tracked wrapper, which in turn
+// optionally includes that connector's untracked, gitignored secrets file:
+//
+//   CloudImportConfig ─┬─ Oura/OuraConfig  ──? Oura/OuraSecrets     (sets OURA_CLOUD_IMPORT   + OURA_*)
+//                      └─ Strava/StravaConfig ──? Strava/StravaSecrets (sets STRAVA_CLOUD_IMPORT + STRAVA_*)
+//
+// Either, both, or neither secrets file may be present. Each secrets file assigns its compilation
+// condition with `$(inherited)`, so the flags accumulate when both are configured. A default checkout
+// has neither secrets file → neither condition is set → zero cloud-import code is compiled and every
+// $(OURA_*)/$(STRAVA_*) Info.plist key resolves to empty. "Fully offline" stays a byte-level property
+// of the default binary.
+#include? "Oura/OuraConfig.xcconfig"
+#include? "Strava/StravaConfig.xcconfig"

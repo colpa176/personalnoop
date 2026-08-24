@@ -1,0 +1,13 @@
+// Tracked wrapper so a clean checkout (no local credentials) still generates and builds.
+//
+// StravaSecrets.xcconfig is gitignored and user-created (template: StravaSecrets.example.xcconfig).
+// It carries BOTH halves of the opt-in:
+//   1. the STRAVA_* OAuth credentials, and
+//   2. SWIFT_ACTIVE_COMPILATION_CONDITIONS += STRAVA_CLOUD_IMPORT, which compiles the Strava import
+//      lane (everything in Strand/Strava/*.swift plus its UI card and tests) into the binary.
+// When the file is absent — every default build — the optional include below is skipped: the
+// STRAVA_CLOUD_IMPORT condition is never set, so NO Strava network code is compiled at all, and the
+// $(STRAVA_*) Info.plist keys resolve to empty strings. "Fully offline" is a property of the bytes
+// in the default binary, not a runtime check. (The shared CloudSync/ seam is compiled only when this
+// OR the Oura lane is enabled — see Strand/CloudSync/CloudAuthProvider.swift.)
+#include? "StravaSecrets.xcconfig"

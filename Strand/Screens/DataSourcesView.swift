@@ -43,6 +43,12 @@ struct DataSourcesView: View {
     // `@StateObject` construction time would either fail to compile or crash at runtime.
     @StateObject private var oura = OuraConnectModel()
     #endif
+    #if STRAVA_CLOUD_IMPORT
+    // Strava activity import (compiled in ONLY with STRAVA_CLOUD_IMPORT): a user-initiated OAuth +
+    // activity backfill / incremental sync over the Strava API. Same call-time `repo` pattern as
+    // `OuraConnectModel` (see that @StateObject's note).
+    @StateObject private var strava = StravaConnectModel()
+    #endif
     // "Remove Apple Health imported data" (ah-delete #616): a destructive escape hatch that purges every
     // row stored under the "apple-health" source via DeviceRegistryStore.deleteAllData. Two-step (a
     // confirmation alert) since it can't be undone. Local to this screen; no live strap data is touched.
@@ -99,6 +105,9 @@ struct DataSourcesView: View {
                 wearableCard.staggeredAppear(index: 6)
                 #if OURA_CLOUD_IMPORT
                 ouraCloudCard.staggeredAppear(index: 7)
+                #endif
+                #if STRAVA_CLOUD_IMPORT
+                stravaCloudCard.staggeredAppear(index: 7)
                 #endif
                 broadcastHrCard.staggeredAppear(index: 8)
                 liveCard.staggeredAppear(index: 9)
@@ -328,6 +337,40 @@ struct DataSourcesView: View {
         }
     }
     #endif // OURA_CLOUD_IMPORT
+
+    #if STRAVA_CLOUD_IMPORT
+    /// Strava activity import: a user-initiated OAuth + backfill of the user's own activities over the
+    /// Strava API, with an incremental "Sync latest" that pulls only activities newer than the stored
+    /// cursor. Read-only (activity:read_all); imported activities land in the shared `workout` table under
+    /// the `strava-api` source and surface in the existing Workouts/Today UI. Strava's own effort scores
+    /// never become NOOP recovery/strain. `repo` is taken at call time (see the `@StateObject` note).
+    private var stravaCloudCard: some View {
+        card(title: String(localized: "Strava import"), icon: "figure.run", tint: StrandPalette.metricAmber,
+             subtitle: String(localized: "Import your own Strava activities over the Strava API. Runs only when you tap it; read-only, and Strava's own effort scores are kept separate from your NOOP recovery and strain.")) {
+            VStack(alignment: .leading, spacing: 8) {
+                if strava.isConnected {
+                    HStack {
+                        Button { strava.syncLatest(repo: repo) } label: { Label("Sync latest", systemImage: "arrow.clockwise") }
+                            .buttonStyle(NoopButtonStyle(.primary))
+                        Button(role: .destructive) { strava.disconnect(repo: repo) } label: { Label("Forget Strava access", systemImage: "xmark.circle") }
+                            .buttonStyle(NoopButtonStyle(.destructive))
+                    }.disabled(strava.busy)
+                } else {
+                    Button { strava.connectAndImport(repo: repo) } label: {
+                        Label(strava.busy ? "Working…" : "Connect Strava & import", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(NoopButtonStyle(.primary))
+                    .disabled(strava.busy || !strava.isConfigured)
+                    if !strava.isConfigured {
+                        Text("Add your Strava app credentials to StravaSecrets.xcconfig to enable this.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if let s = strava.statusText { Text(s).font(.caption).foregroundStyle(.secondary) }
+            }
+        }
+    }
+    #endif // STRAVA_CLOUD_IMPORT
 
     private func presentImporter(_ target: ImportTarget) {
         importTarget = target

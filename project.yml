@@ -87,8 +87,8 @@ targets:
     # OuraSecrets.example.xcconfig) — absent secrets leave the $(OURA_*) references in the
     # info.properties below empty, which disables the Oura Cloud lane at runtime.
     configFiles:
-      Debug: Strand/Oura/OuraConfig.xcconfig
-      Release: Strand/Oura/OuraConfig.xcconfig
+      Debug: Strand/CloudImportConfig.xcconfig
+      Release: Strand/CloudImportConfig.xcconfig
     info:
       path: Strand/Resources/Info.plist
       properties:
@@ -111,8 +111,14 @@ targets:
         OURA_CLIENT_ID: $(OURA_CLIENT_ID)
         OURA_CLIENT_SECRET: $(OURA_CLIENT_SECRET)
         OURA_REDIRECT_URI: $(OURA_REDIRECT_URI)
-        # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect
-        # (noop://oura/callback) reaches OuraOAuthProvider instead of bouncing off the OS.
+        # Strava BYO-app OAuth credentials (values come from configFiles above); read at runtime via
+        # StravaCredentials.fromBundle. Absent/blank values cleanly disable the Connect-Strava lane.
+        STRAVA_CLIENT_ID: $(STRAVA_CLIENT_ID)
+        STRAVA_CLIENT_SECRET: $(STRAVA_CLIENT_SECRET)
+        STRAVA_REDIRECT_URI: $(STRAVA_REDIRECT_URI)
+        # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect reaches the
+        # provider instead of bouncing off the OS. Shared by both cloud lanes (noop://oura/callback and
+        # noop://localhost for Strava — Strava only whitelists a localhost callback host).
         CFBundleURLTypes:
           - CFBundleURLSchemes: [noop]
     entitlements:
@@ -157,8 +163,8 @@ targets:
     # Same wrapper as the app target, so the OURA_CLOUD_IMPORT-gated Oura tests compile exactly
     # when the app's Oura lane does (flag + creds both come from the untracked OuraSecrets.xcconfig).
     configFiles:
-      Debug: Strand/Oura/OuraConfig.xcconfig
-      Release: Strand/Oura/OuraConfig.xcconfig
+      Debug: Strand/CloudImportConfig.xcconfig
+      Release: Strand/CloudImportConfig.xcconfig
     dependencies:
       - target: Strand
       - package: WhoopProtocol
@@ -210,8 +216,8 @@ targets:
       - path: StrandiOSShared
     # Same tracked wrapper as the macOS target (Strand/Oura/ is shared, not per-platform).
     configFiles:
-      Debug: Strand/Oura/OuraConfig.xcconfig
-      Release: Strand/Oura/OuraConfig.xcconfig
+      Debug: Strand/CloudImportConfig.xcconfig
+      Release: Strand/CloudImportConfig.xcconfig
     info:
       path: StrandiOS/Resources/Info.plist
       properties:
@@ -281,8 +287,14 @@ targets:
         OURA_CLIENT_ID: $(OURA_CLIENT_ID)
         OURA_CLIENT_SECRET: $(OURA_CLIENT_SECRET)
         OURA_REDIRECT_URI: $(OURA_REDIRECT_URI)
-        # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect
-        # (noop://oura/callback) reaches OuraOAuthProvider instead of bouncing off the OS.
+        # Strava BYO-app OAuth credentials (values come from configFiles above); read at runtime via
+        # StravaCredentials.fromBundle. Absent/blank values cleanly disable the Connect-Strava lane.
+        STRAVA_CLIENT_ID: $(STRAVA_CLIENT_ID)
+        STRAVA_CLIENT_SECRET: $(STRAVA_CLIENT_SECRET)
+        STRAVA_REDIRECT_URI: $(STRAVA_REDIRECT_URI)
+        # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect reaches the
+        # provider instead of bouncing off the OS. Shared by both cloud lanes (noop://oura/callback and
+        # noop://localhost for Strava — Strava only whitelists a localhost callback host).
         CFBundleURLTypes:
           - CFBundleURLSchemes: [noop]
     entitlements:
