@@ -9,6 +9,15 @@ name: Testing build (fork)
 
 on:
   workflow_dispatch:
+    inputs:
+      enable_strava:
+        description: >-
+          Build a PERSONAL Strava-enabled iOS build. Requires the STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET
+          repository secrets. The .ipa is uploaded as a PRIVATE workflow artifact instead of being
+          attached to the public rolling release (see the iOS job for why).
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: write
@@ -35,6 +44,13 @@ jobs:
           SHA="${GITHUB_SHA:0:7}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          # A PERSONAL Strava build publishes nothing: it only needs $VER for the .ipa filename, and its
+          # artifact goes to the run's private Artifacts. Recreating the rolling release here would DELETE
+          # the current public staging release (--cleanup-tag below) and replace it with a partial one.
+          if [ "${{ inputs.enable_strava }}" = "true" ]; then
+            echo "Personal Strava build — leaving the public rolling release untouched."
+            exit 0
+          fi
           # ROLLING release: recreate the single tag so stale (incl. old-version) assets never linger —
           # one stable URL, always the newest build, zero cleanup. (To KEEP a build, cut a one-off tag.)
           gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
@@ -59,6 +75,7 @@ jobs:
 
   android:
     needs: meta
+    if: ${{ !inputs.enable_strava }}   # personal Strava builds are iOS-only and publish nothing
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -92,6 +109,7 @@ jobs:
 
   macos:
     needs: meta
+    if: ${{ !inputs.enable_strava }}   # personal Strava builds are iOS-only and publish nothing
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -143,8 +161,43 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install XcodeGen
         run: brew install xcodegen
+      # Opt-in only. Writes the gitignored secrets xcconfig from repository secrets so the
+      # STRAVA_CLOUD_IMPORT lane compiles into THIS build. Nothing is committed: the file is created on
+      # the ephemeral runner, is already covered by .gitignore, and the runner is destroyed after the job.
+      # GitHub masks the secret values in the log, and nothing here echoes them.
+      - name: Enable the Strava lane (credentials from repository secrets)
+        if: ${{ inputs.enable_strava }}
+        env:
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STRAVA_CLIENT_ID}" ] || [ -z "${STRAVA_CLIENT_SECRET}" ]; then
+            echo "::error::enable_strava was requested, but the STRAVA_CLIENT_ID and/or STRAVA_CLIENT_SECRET repository secrets are not set. Add them under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          {
+            echo 'SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) STRAVA_CLOUD_IMPORT'
+            echo "STRAVA_CLIENT_ID = ${STRAVA_CLIENT_ID}"
+            echo "STRAVA_CLIENT_SECRET = ${STRAVA_CLIENT_SECRET}"
+            echo 'STRAVA_REDIRECT_URI = noop:/$()/localhost'
+          } > Strand/Strava/StravaSecrets.xcconfig
+          echo "Strava lane enabled for this build."
       - name: Generate Xcode project
         run: xcodegen generate
+      # Fail loudly rather than silently shipping an .ipa with no Strava in it: a typo'd secret name or a
+      # broken xcconfig include would otherwise produce a normal-looking build with the lane compiled out.
+      - name: Assert the Strava lane is actually compiled in
+        if: ${{ inputs.enable_strava }}
+        run: |
+          set -euo pipefail
+          test -f Strand/Strava/StravaSecrets.xcconfig || { echo "::error::secrets xcconfig missing"; exit 1; }
+          CONDS=$(xcodebuild -scheme NOOPiOS -configuration Release -showBuildSettings 2>/dev/null \
+                  | grep -E '^\s*SWIFT_ACTIVE_COMPILATION_CONDITIONS' | head -1)
+          case "$CONDS" in
+            *STRAVA_CLOUD_IMPORT*) echo "OK: STRAVA_CLOUD_IMPORT is set for NOOPiOS" ;;
+            *) echo "::error::STRAVA_CLOUD_IMPORT did not resolve — the build would contain no Strava code"; exit 1 ;;
+          esac
       - name: Build NOOPiOS for device (unsigned, Release)
         # #53: build RELEASE, not Debug. A Debug build carries get-task-allow + debug artifacts that make a
         # re-signed sideload fail "integrity could not be verified" on modern iOS; Release (the correct config
@@ -154,9 +207,8 @@ jobs:
           -derivedDataPath build/dd
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
           build
-      - name: Package unsigned .ipa (strip embedded watch app, retain widget extension) + attach
+      - name: Package unsigned .ipa (strip embedded watch app, retain widget extension)
         env:
-          GH_TOKEN: ${{ github.token }}
           VER: ${{ needs.meta.outputs.ver }}
         run: |
           APP=$(find build/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)
@@ -170,7 +222,39 @@ jobs:
           }
           rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
           zip -qr "NOOP-ios-unsigned-v${VER}.ipa" Payload
+
+      # PUBLIC path (unchanged): the normal staging .ipa contains no cloud credentials.
+      - name: Attach .ipa to the rolling release
+        if: ${{ !inputs.enable_strava }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ needs.meta.outputs.ver }}
+        run: |
           gh release upload "${{ needs.meta.outputs.tag }}" "NOOP-ios-unsigned-v${VER}.ipa" --repo "$GITHUB_REPOSITORY" --clobber
+
+      # PRIVATE path: a Strava-enabled build embeds YOUR client_secret in the app's Info.plist (inherent
+      # to Strava's BYO-app flow — it has no PKCE, so the exchange must carry the secret). The rolling
+      # release above is a public download URL, so publishing this build there would hand your Strava
+      # client_secret to anyone who fetched it. A workflow artifact is scoped to people who can access
+      # the repository's Actions, so it stays with you.
+      - name: Upload the Strava-enabled .ipa as a private artifact
+        if: ${{ inputs.enable_strava }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOOP-ios-strava-v${{ needs.meta.outputs.ver }}
+          path: NOOP-ios-unsigned-v${{ needs.meta.outputs.ver }}.ipa
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Note where the build went
+        if: ${{ inputs.enable_strava }}
+        run: |
+          echo "### Strava-enabled iOS build" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Downloaded from the **Artifacts** section of this run, not the public release —" >> "$GITHUB_STEP_SUMMARY"
+          echo "the .ipa embeds your Strava client secret. Do not share the file." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Strava app setup: Authorization Callback Domain must be \`localhost\`." >> "$GITHUB_STEP_SUMMARY"
 
   # Fork-only housekeeping: the disposable `noop-staging` branch exists ONLY to feed this build. Once every
   # platform job has finished (pass OR fail — always()), delete it so GitHub's "Compare & pull request"
