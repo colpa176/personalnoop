@@ -20,6 +20,15 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "12.1.2",
+          "buildVersion": "438",
+          "date": "2026-10-12",
+          "localizedDescription": "NOOP 12.1.2. See the release notes for what changed.",
+          "downloadURL": "https://github.com/colpa176/personalnoop/releases/download/v12.1.2/NOOP-ios-unsigned-v12.1.2.ipa",
+          "size": 22149327,
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "12.1.1",
           "buildVersion": "437",
           "date": "2026-10-12",
@@ -44,12 +53,12 @@
         }
       },
       "minOSVersion": "17.0",
-      "version": "12.1.1",
-      "buildVersion": "437",
+      "version": "12.1.2",
+      "buildVersion": "438",
       "versionDate": "2026-10-12",
-      "versionDescription": "NOOP 12.1.1. See the release notes for what changed.",
-      "downloadURL": "https://github.com/colpa176/personalnoop/releases/download/v12.1.1/NOOP-ios-unsigned-v12.1.1.ipa",
-      "size": 22119281
+      "versionDescription": "NOOP 12.1.2. See the release notes for what changed.",
+      "downloadURL": "https://github.com/colpa176/personalnoop/releases/download/v12.1.2/NOOP-ios-unsigned-v12.1.2.ipa",
+      "size": 22149327
     }
   ],
   "news": []
