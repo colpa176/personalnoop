@@ -82,6 +82,40 @@ struct BuzzStrapIntent: AppIntent {
     }
 }
 
+/// Fork (personalnoop): the wrist buzz for an incoming text. Meant for a Shortcuts personal automation
+/// (Message → Run Immediately → Buzz for Text), so it runs WITHOUT opening NOOP, inside NOOP's own
+/// process the way `SyncStrapIntent` does, where the strap link lives under the bluetooth-central
+/// background mode. Gated by `PhoneAlertPrefs`: wrist-alerts master, the Texts switch, quiet hours and the
+/// hourly cap. Returns no dialog, so a run from an automation is silent.
+struct BuzzForTextIntent: AppIntent {
+    static var title: LocalizedStringResource = "Buzz for Text"
+    static var description = IntentDescription("Buzz your WHOOP strap for an incoming text, following NOOP's wrist-alert quiet hours and hourly limit. Use it in a Message automation.")
+    static var openAppWhenRun = false
+
+    /// How long to wait for the strap link when iOS has just woken or launched NOOP for this run.
+    static let linkWaitSeconds = 8
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        let decision = PhoneAlertPrefs.evaluate(.text)
+        guard decision == .buzz else {
+            AppModel.shared?.live.append(log: AppModel.stamped("Text alert: not buzzed (\(decision))"))
+            return .result()
+        }
+        for _ in 0..<Self.linkWaitSeconds {
+            if let model = AppModel.shared, model.live.encryptedBond { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        guard let model = AppModel.shared, model.live.encryptedBond else {
+            AppModel.shared?.live.append(log: AppModel.stamped("Text alert: strap not connected, so no buzz"))
+            return .result()
+        }
+        model.buzzStrapOnce()
+        model.live.append(log: AppModel.stamped("Text alert: buzzed"))
+        return .result()
+    }
+}
+
 /// Pull the strap's stored history now: the Shortcuts twin of the "Sync now" button, run WITHOUT opening NOOP.
 /// iOS runs an in-app intent inside NOOP's own process (launching or resuming it in the background), where the
 /// strap link lives under the bluetooth-central background mode, so the offload carries on after this returns.

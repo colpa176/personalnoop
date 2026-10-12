@@ -96,6 +96,9 @@ struct StrandiOSApp: App {
         // The strap-sync Live Activity (Lock Screen + Dynamic Island). Same placement, same reason — and
         // it must also run in a process the Sync Strap shortcut launched with no scene.
         SyncLiveActivityController.shared.attach(to: model.live)
+        // Fork (personalnoop): buzz the strap while an incoming call rings (Automations → Wrist alerts →
+        // Incoming calls). Passive: iOS calls the delegate only when a call changes state.
+        CallAlertObserver.shared.start()
         // iOS's own daily report of NOOP's CPU, memory, disk writes, hangs and exits, and its crash/hang reports,
         // one strap-log line each. Registering is the whole cost; iOS gathers and delivers them (MetricKitLog).
         MetricKitLog.shared.attach(to: model.live)

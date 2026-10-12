@@ -4,6 +4,22 @@ What this fork (`colpa176/personalnoop`) adds on top of upstream [`ryanbr/noop`]
 Upstream's own history is in [CHANGELOG.md](CHANGELOG.md) and [docs/releases/](docs/releases/); this file
 only tracks the personal changes and each upstream sync.
 
+## 12.1.2: Wrist alerts for texts and calls (iPhone)
+
+Under **More → Automations → Wrist alerts**, with the master switch on:
+
+- **Incoming calls:** the strap buzzes while a call rings, up to three times, and stops once it's
+  answered or ends. Uses CallKit's call observer, which is passive (no polling), so it works whenever NOOP
+  is running in the background, as it normally is with the strap connected. Off by default.
+- **Texts:** a new Shortcuts action, **Buzz for Text**, runs in the background without opening NOOP. Set up
+  once: Shortcuts → Automation → New → Message → Run Immediately → add **Buzz for Text**. iOS doesn't let
+  apps read other apps' notifications, so this is the only way to cover texts. On by default, but it does
+  nothing until the automation exists.
+- **Text buzzes per hour:** a rolling cap (default 10, range 1–30). Calls aren't capped.
+- **Quiet hours:** a shared window with no wrist alerts, covering calls, texts and the inactivity
+  reminder. These are the same `notif.quietHours*` settings the inactivity reminder already read, which
+  had no iPhone controls until now.
+
 ## 2026-10-12: Synced with upstream 12.1.0
 
 Merged 1,594 upstream commits (9.2.3 → 12.1.0). Every personal feature below was kept, except where

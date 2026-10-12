@@ -1,5 +1,6 @@
 import SwiftUI
 import StrandDesign
+import StrandAnalytics
 
 /// Automations — turn the strap's physical inputs (double-tap, wrist on/off) and live biometrics
 /// into actions (Shortcuts, and Mac-only screen lock) and haptic coaching. All on-device.
@@ -36,6 +37,14 @@ struct AutomationsView: View {
     /// posting read — has no UI to flip and is stuck at its default OFF. Bind the SAME raw key here so
     /// iPhone users can actually turn wrist alerts on. Default OFF, matching the store's default.
     @AppStorage("notif.masterEnabled") private var wristAlertsMaster = false
+    // Fork (personalnoop): phone texts + calls on the wrist, gated by `PhoneAlertPrefs`. Quiet hours bind
+    // the shared `notif.quietHours*` keys, so the window also silences the inactivity reminder.
+    @AppStorage(PhoneAlertPrefs.callsKey) private var callAlerts = false
+    @AppStorage(PhoneAlertPrefs.textsKey) private var textAlerts = true
+    @AppStorage(PhoneAlertPrefs.maxTextsPerHourKey) private var maxTextsPerHour = PhoneAlertPrefs.defaultMaxTextsPerHour
+    @AppStorage(PhoneAlertPrefs.quietKey) private var quietHours = false
+    @AppStorage(PhoneAlertPrefs.quietStartKey) private var quietStartMinutes = SedentaryDetector.defaultQuietStartMin
+    @AppStorage(PhoneAlertPrefs.quietEndKey) private var quietEndMinutes = SedentaryDetector.defaultQuietEndMin
     #endif
 
     // #haptics (#1115): per-event toggles for NOOP's IN-SESSION strap buzzes. Default ON (opt-out) — these
@@ -87,8 +96,53 @@ struct AutomationsView: View {
                 ToggleRow(label: String(localized: "Enable wrist alerts"),
                           help: String(localized: "The master switch for every wrist buzz (inactivity, stress, alerts). Off keeps the strap quiet no matter what else is on."),
                           isOn: $wristAlertsMaster)
+                if wristAlertsMaster {
+                    rowDivider
+                    ToggleRow(label: String(localized: "Incoming calls"),
+                              help: String(localized: "Buzz while a call is ringing, up to three times. Works while NOOP is running in the background, which it normally is when your strap is connected."),
+                              isOn: $callAlerts)
+                    rowDivider
+                    ToggleRow(label: String(localized: "Texts"),
+                              help: String(localized: "Buzz when a text arrives. Needs a one-time Shortcuts automation: Automation → New → Message → Run Immediately, then add NOOP's \u{201C}Buzz for Text\u{201D} action."),
+                              isOn: $textAlerts)
+                    if textAlerts {
+                        rowDivider
+                        stepperRow(label: String(localized: "Text buzzes per hour"),
+                                   help: String(localized: "After this many in an hour, further texts don't buzz until the hour rolls on."),
+                                   value: $maxTextsPerHour, suffix: String(localized: "max"),
+                                   range: PhoneAlertPrefs.maxTextsPerHourRange, step: 1)
+                    }
+                    rowDivider
+                    ToggleRow(label: String(localized: "Quiet hours"),
+                              help: String(localized: "No wrist alerts between these times, including calls, texts and the inactivity reminder."),
+                              isOn: $quietHours)
+                    if quietHours {
+                        rowDivider
+                        HStack(spacing: 12) {
+                            Text("From").font(StrandFont.body).foregroundStyle(StrandPalette.textPrimary)
+                            DatePicker("", selection: quietStartBinding, displayedComponents: .hourAndMinute)
+                                .labelsHidden().datePickerStyle(.compact)
+                                .accessibilityLabel("Quiet hours start")
+                            Text("to").font(StrandFont.body).foregroundStyle(StrandPalette.textSecondary)
+                            DatePicker("", selection: quietEndBinding, displayedComponents: .hourAndMinute)
+                                .labelsHidden().datePickerStyle(.compact)
+                                .accessibilityLabel("Quiet hours end")
+                            Spacer(minLength: 0)
+                        }
+                        .frame(minHeight: 42).padding(.vertical, 4)
+                    }
+                }
             }
         }
+    }
+
+    private var quietStartBinding: Binding<Date> {
+        Binding(get: { Self.date(fromMinutes: quietStartMinutes) },
+                set: { quietStartMinutes = Self.minutes(from: $0) })
+    }
+    private var quietEndBinding: Binding<Date> {
+        Binding(get: { Self.date(fromMinutes: quietEndMinutes) },
+                set: { quietEndMinutes = Self.minutes(from: $0) })
     }
     #endif
 
