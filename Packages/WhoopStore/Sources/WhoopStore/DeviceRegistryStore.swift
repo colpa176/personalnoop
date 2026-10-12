@@ -167,7 +167,7 @@ public struct DeviceRegistryStore: Sendable {
         // privacy defect this list exists to close, and one the deviceId-column guard test could not
         // catch for a child table keyed only by its parent.
         "liftExercise", "liftProgram", "liftProgramItem", "liftSession", "liftSet",
-        // v33-food-log (fork): deviceId-keyed, but its rows live under the stable `WhoopStore.foodDeviceId`
+        // v48-food-log (fork): deviceId-keyed, but its rows live under the stable `WhoopStore.foodDeviceId`
         // namespace rather than a strap id, so forgetting a strap never matches one. Listed anyway so the
         // column is covered rather than trusted.
         "foodLogEntry",

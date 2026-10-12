@@ -1104,10 +1104,11 @@ extension WhoopStore {
             try db.execute(sql: WhoopStore.whoop5RrFillMigrationSQL)
         }
 
-        // Fork (personalnoop): registered AFTER every upstream migration, under its ORIGINAL identifier.
-        // GRDB tracks applied migrations by name, so a DB that already ran "v33-food-log" (before the
-        // upstream sync) skips it, and a fresh DB creates the table last. Never rename this id: a
-        // renamed migration would re-run `create(table:)` on an existing DB and fail.
+        // Fork (personalnoop): registered AFTER every upstream migration. It first shipped as
+        // "v33-food-log", but upstream has since used v33...v47 and `SchemaOracleTests` requires vN to
+        // equal the registration position, so it is renumbered to v48. A DB that already ran the old
+        // "v33-food-log" still has the table, so both creates are `ifNotExists`: re-running this body
+        // there is a no-op rather than a "table already exists" failure.
         //
         // v33: manually logged food entries. The nutrition model NOOP already has is DAILY TOTALS in the
         // long-format `metricSeries` table (`NutritionCsvImporter` → source "nutrition-csv", keys
@@ -1134,8 +1135,8 @@ extension WhoopStore {
         //
         // Additive, a NEW table, no existing row touched. No Android Room twin: there is no Kotlin
         // food-log writer, so there is no schema for the two platforms to disagree about.
-        migrator.registerMigration("v33-food-log") { db in
-            try db.create(table: "foodLogEntry") { t in
+        migrator.registerMigration("v48-food-log") { db in
+            try db.create(table: "foodLogEntry", options: [.ifNotExists]) { t in
                 t.column("id", .text).primaryKey()          // the entry's UUID
                 t.column("deviceId", .text).notNull()
                 t.column("day", .text).notNull()            // local day, YYYY-MM-DD
@@ -1149,7 +1150,7 @@ extension WhoopStore {
             }
             // The card reads one device's entries for one day, in time order.
             try db.create(index: "idx_foodLogEntry_device_day_ts",
-                          on: "foodLogEntry", columns: ["deviceId", "day", "ts"])
+                          on: "foodLogEntry", columns: ["deviceId", "day", "ts"], ifNotExists: true)
         }
         return migrator
     }

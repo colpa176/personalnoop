@@ -28,8 +28,10 @@ upstream shipped the same thing itself.
   bar, which fits five tabs, and made Coach the fourth (Today / Trends / Sleep / Coach / More).
 - **Asleep-duration trend:** still drawn as a dot/line chart. Upstream moved that card into
   `AsleepDurationCard.swift`, so the change was re-applied there.
-- **Food-log database migration:** `v33-food-log` now runs after all upstream migrations, under its
-  original name, so a database that already has the table skips it.
+- **Food-log database migration:** renamed `v33-food-log` → `v48-food-log` and moved after all upstream
+  migrations. Upstream's schema test requires each migration's number to match its position. The table
+  and index are created only if missing, so a database that already has them from the old build is
+  unaffected. When a later upstream sync adds its own v48, renumber this one to come last again.
 - **Translations:** added Polish for all fork strings (upstream added Polish), and translated nine food-log
   status messages that had been English-only.
 - **CI:** kept the fork's "build every branch" push trigger on `app-build.yml` and `swift-packages.yml`.
