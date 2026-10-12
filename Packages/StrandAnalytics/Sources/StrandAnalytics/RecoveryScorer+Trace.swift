@@ -11,6 +11,19 @@ import Foundation
 
 extension RecoveryScorer {
 
+    /// The trace's two-decimal rounding contract, shared by both platforms: round `x * 100` to the
+    /// nearest integer with half-ties AWAY FROM ZERO, divide by 100, and keep the IEEE sign bit — so a
+    /// driver term that rounds to zero from below still renders `-0.0`, as it does on Android (#1437).
+    ///
+    /// The rounding stays in the DOUBLE domain on purpose. Kotlin's `Math.round` returns a `Long`, which
+    /// saturates at 2^63-1, so `1e20` came back as `9.223372036854776e16` there while this side kept
+    /// `1e20` (#47). Nothing here is clamped: any finite input round-trips, and a non-finite one (or a
+    /// finite one whose `x * 100` overflows) passes through as the matching infinity or NaN. The Kotlin
+    /// twin is `RecoveryScorerTrace.r2`.
+    static func traceRound2(_ x: Double) -> Double {
+        (x * 100.0).rounded(.toNearestOrAwayFromZero) / 100.0
+    }
+
     /// Side-effect-free diagnostic twin of `recovery(...)`: returns the SAME score recovery(...) would,
     /// plus the per-term Charge breakdown trace. The four inputs (hrv / rhr / resp / sleepPerf) plus the
     /// skin-temp deviation each get a baseline line (mean / spread / nValid / status), a term line
@@ -20,7 +33,8 @@ extension RecoveryScorer {
     ///
     /// Every number is computed with the EXACT same expressions as `recovery(...)` (the same zScore call,
     /// the same skin-temp penalty, the same weights), and the returned score IS `recovery(...)` verbatim,
-    /// so the trace and the headline can never diverge. The Kotlin twin is RecoveryScorer.recoveryTrace.
+    /// so the trace and the headline can never diverge. The Kotlin twin is
+    /// RecoveryScorerTrace.recoveryTrace.
     ///
     /// - Parameters mirror `recovery(...)` exactly, taking BaselineState so the trace can read each
     ///   driver's nValid / status; the `usable` cold-start gate is enforced through `recovery(...)`.
@@ -34,15 +48,24 @@ extension RecoveryScorer {
                                      skinTempDev: Double? = nil)
         -> (score: Double?, trace: [String]) {
 
-        func r2(_ x: Double) -> Double { (x * 100.0).rounded() / 100.0 }
+        // Trace numbers use nearest rounding with half-ties away from zero on both platforms.
+        func r2(_ x: Double) -> Double { traceRound2(x) }
 
         var lines: [String] = []
         var nilTerms: [String] = []
 
+        // #1988: the trace reads this baseline DIRECTLY for its own `charge baseline rhr` line, its
+        // rhrZ and the saturation guard, not only through recovery(). recovery() now drops an
+        // unusable one, so without the same gate here the trace would list an rhr term the score
+        // did not use, which is precisely the divergence the line below promises cannot happen.
+        let rhrB = rhrBaseline.flatMap { $0.usable ? $0 : nil }
+        // Only eligible personal baselines may appear in respiration rows or diagnostic terms.
+        let respB = respBaseline.flatMap { $0.usable ? $0 : nil }
+
         // The score the dashboard reads, verbatim, so the trace cannot diverge from it.
         let score = recovery(hrv: hrv, rhr: rhr, resp: resp,
-                             hrvBaseline: hrvBaseline, rhrBaseline: rhrBaseline,
-                             respBaseline: respBaseline, sleepPerf: sleepPerf,
+                             hrvBaseline: hrvBaseline, rhrBaseline: rhrB,
+                             respBaseline: respB, sleepPerf: sleepPerf,
                              skinTempDev: skinTempDev)
 
         // Cold-start gate: HRV baseline not usable -> recovery() returns nil before any term is built.
@@ -58,11 +81,11 @@ extension RecoveryScorer {
         // baseline arg here (skinTempDev is already a deviation), so it has no baseline line.
         lines.append("charge baseline hrv mean=\(r2(hrvBaseline.baseline)) spread=\(r2(hrvBaseline.spread)) "
             + "nValid=\(hrvBaseline.nValid) status=\(hrvBaseline.status.rawValue)")
-        if let b = rhrBaseline {
+        if let b = rhrB {
             lines.append("charge baseline rhr mean=\(r2(b.baseline)) spread=\(r2(b.spread)) "
                 + "nValid=\(b.nValid) status=\(b.status.rawValue)")
         }
-        if let b = respBaseline {
+        if let b = respB {
             lines.append("charge baseline resp mean=\(r2(b.baseline)) spread=\(r2(b.spread)) "
                 + "nValid=\(b.nValid) status=\(b.status.rawValue)")
         }
@@ -71,17 +94,24 @@ extension RecoveryScorer {
         // pairs in the SAME order recovery(...) appends them so the renormalization below matches.
         var terms: [(name: String, z: Double, w: Double)] = []
 
+        // Resting-HR z, computed up front so the saturation guard can read the HRV<->RHR coupling
+        // before the HRV term is built. nil when there is no RHR baseline. Numerically identical to
+        // the z recovery() builds for the RHR term (same expression, same inputs).
+        let rhrZForGuard: Double? = rhrB.map { zScore($0.baseline, mean: rhr, spread: $0.spread) }
+
         // HRV term: higher is better. (Always present once usable; the cold-start guard above returned.)
+        // This is the RAW z, exactly as recovery() scores it: the parasympathetic-saturation easing is
+        // detected and reported below but NOT applied, so the trace's HRV term matches the scored one.
         // L9: every WEIGHT / SCALE / centre constant goes through r2() too (not just the z-scores), so a
         // future non-round weight (e.g. 0.333) renders identically on Swift and Kotlin and the parity
         // fixture cannot silently desync. The values render the same as before today.
-        let hrvZ = zScore(hrv, mean: hrvBaseline.baseline, spread: hrvBaseline.spread)
-        terms.append(("hrv", hrvZ, wHRV))
-        lines.append("charge term hrv z=\(r2(hrvZ)) w=\(r2(wHRV)) (higher HRV is better)")
+        let hrvZRaw = zScore(hrv, mean: hrvBaseline.baseline, spread: hrvBaseline.spread)
+        let sat = parasympatheticSaturation(hrvZ: hrvZRaw, rhrZ: rhrZForGuard)
+        terms.append(("hrv", hrvZRaw, wHRV))
+        lines.append("charge term hrv z=\(r2(hrvZRaw)) w=\(r2(wHRV)) (higher HRV is better)")
 
-        // RHR term: lower is better -> (mu - x) / sigma.
-        if let b = rhrBaseline {
-            let z = zScore(b.baseline, mean: rhr, spread: b.spread)
+        // RHR term: lower is better -> (mu - x) / sigma. (Reuses the z computed for the guard.)
+        if let z = rhrZForGuard {
             terms.append(("rhr", z, wRHR))
             lines.append("charge term rhr z=\(r2(z)) w=\(r2(wRHR)) (lower RHR is better)")
         } else {
@@ -89,7 +119,7 @@ extension RecoveryScorer {
         }
 
         // Resp term: lower is better, optional (needs BOTH the value and a baseline).
-        if let r = resp, let b = respBaseline {
+        if let r = resp, let b = respB {
             let z = zScore(b.baseline, mean: r, spread: b.spread)
             terms.append(("resp", z, wResp))
             lines.append("charge term resp z=\(r2(z)) w=\(r2(wResp)) (lower resp is better)")
@@ -136,6 +166,26 @@ extension RecoveryScorer {
                 + "(logistic k=\(r2(logisticK)) z0=\(r2(logisticZ0)))")
         } else {
             lines.append("charge nilScore reason=noValidTerms (no driver produced a usable term)")
+        }
+
+        // ── Parasympathetic-saturation guard: DETECTED, NOT APPLIED ──────────────────────────────
+        //
+        // Emitted ONLY when the signature fires. The score above is the UNGUARDED number; this line
+        // reports the counterfactual the guard WOULD have produced, so real low-HRV + low-RHR nights
+        // can be counted and checked against ground truth before the easing is ever allowed to move
+        // Charge. See the MARK header in RecoveryScorer.swift for the validation gap and the contested
+        // benign-saturation / non-functional-overreaching ambiguity that keep it switched off.
+        //
+        // wouldRaiseCharge recomputes the composite with the eased HRV z swapped in and runs it through
+        // logisticScore(...) -- the SAME curve recovery() uses -- so the delta is exact, not estimated.
+        if sat.active, let s = score, totalWeight > 0 {
+            let easedZ = terms.reduce(0) { $0 + ($1.name == "hrv" ? sat.easedHrvZ : $1.z) * $1.w } / totalWeight
+            let wouldBe = logisticScore(compositeZ: easedZ)
+            lines.append("charge saturation active hrvZraw=\(r2(hrvZRaw)) rhrZ=\(r2(rhrZForGuard ?? 0)) "
+                + "damp=\(r2(sat.dampFraction)) wouldEaseHrvZTo=\(r2(sat.easedHrvZ)) "
+                + "wouldRaiseCharge=\(r2(wouldBe - s)) wouldBand=\(band(wouldBe)) "
+                + "(low HRV + low resting HR: candidate parasympathetic saturation. "
+                + "Easing DETECTED ONLY, not applied: the score above is unchanged)")
         }
 
         return (score, lines)

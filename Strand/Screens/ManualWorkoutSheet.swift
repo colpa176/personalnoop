@@ -11,8 +11,8 @@ private struct SuggestionsHeightKey: PreferenceKey {
 
 // MARK: - Manual workout sheet
 //
-// Add a workout you tracked elsewhere, or edit one you already logged. Five inputs — sport,
-// start, duration, average HR, calories — validated by WorkoutSource.buildManualRow (the same
+// Add a workout you tracked elsewhere, or edit one you already logged. Six inputs — sport,
+// start, duration, distance, average HR, calories — validated by WorkoutSource.buildManualRow (the same
 // honest-row rules the engine uses). On save the caller persists it under the strap source via
 // Repository.saveManualWorkout. Captured-but-unexposed fields (maxHr / strain / zones) on an edited
 // row are carried over by WorkoutSource.preservingCaptured so editing a live-tracked session's
@@ -31,13 +31,28 @@ struct ManualWorkoutSheet: View {
 
     @State private var sport: String
     @State private var start: Date
-    @State private var durationMin: Int
+    /// #2034: the span is `start` + `end`. Duration is DERIVED (`durationBinding`), never a second stored
+    /// copy, so the two cannot drift; the row has always been stored as `startTs`/`endTs` anyway, and
+    /// routing the save through whole minutes was what silently reshaped an edited session's end.
+    @State private var end: Date
     @State private var avgHrText: String
     @State private var kcalText: String
+    /// Distance as ENTERED, in the user's unit (km or mi) — converted to stored metres on save (#1195).
+    @State private var distanceText: String
 
-    /// Focus for the numeric (Avg HR / Calories) fields so the keyboard Done button can resign them —
-    /// the decimal pad has no return key. iOS-only effect; the enum keeps both platforms compiling.
-    private enum NumberField: Hashable { case avgHr, calories }
+    /// Exercise-distance choice. Unset follows the original combined setting for existing installs.
+    @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.distanceSystemKey) private var distanceSystemRaw = ""
+    private var distanceUnitSystem: UnitSystem {
+        UnitPrefs.resolveDistance(
+            system: UnitSystem(rawValue: unitSystemRaw) ?? .metric,
+            override: distanceSystemRaw)
+    }
+    private var distanceUnit: String { UnitFormatter.distanceUnit(distanceUnitSystem) }
+
+    /// Focus for the numeric (Avg HR / Calories / Distance) fields so the keyboard Done button can resign
+    /// them — the decimal pad has no return key. iOS-only effect; the enum keeps both platforms compiling.
+    private enum NumberField: Hashable { case avgHr, calories, distance }
     @FocusState private var focusedField: NumberField?
 
     /// Whether the Sport text field is being edited — drives whether the catalogue suggestions show
@@ -58,13 +73,81 @@ struct ManualWorkoutSheet: View {
         // Seeds the LOCALE-STABLE editable form, not the localized display: the field's content is
         // persisted verbatim on save, and a translated word would split cross-source dedup per language.
         _sport = State(initialValue: e.map { WorkoutSource.editableSport($0.sport) } ?? "")
-        _start = State(initialValue: e.map { Date(timeIntervalSince1970: TimeInterval($0.startTs)) } ?? Date())
-        _durationMin = State(initialValue: e.map { max(1, Int((($0.durationS ?? Double($0.endTs - $0.startTs)) / 60).rounded())) } ?? 45)
+        // A fresh add opens on a VALID 45 minute session ending now, keeping the long-standing 45 minute
+        // default length. It used to start at `Date()` with a 45 minute duration, so the implied end was
+        // always 45 minutes in the future and `buildManualRow` rejected it: the sheet opened with Save
+        // already disabled. That was invisible while the only complaint was the catch-all "Check the
+        // values and try again."; now that an end in the future says so by name, it would greet every
+        // fresh add with a red line. Anchoring to the end is also the truer default for the retroactive
+        // entry this sheet is for.
+        let defaultEnd = Date()
+        _start = State(initialValue: e.map { Date(timeIntervalSince1970: TimeInterval($0.startTs)) }
+                       ?? defaultEnd.addingTimeInterval(-45 * 60))
+        _end = State(initialValue: e.map { Date(timeIntervalSince1970: TimeInterval($0.endTs)) }
+                     ?? defaultEnd)
         _avgHrText = State(initialValue: e?.avgHr.map(String.init) ?? "")
         _kcalText = State(initialValue: e?.energyKcal.map { String(Int($0.rounded())) } ?? "")
+        // Pre-fill the distance in the user's unit so an untouched edit round-trips the stored metres
+        // (buildManualRow then re-stores exactly what's shown). @AppStorage isn't usable pre-init, so read
+        // the same key directly.
+        let bodySystem = UnitSystem(
+            rawValue: UserDefaults.standard.string(forKey: UnitPrefs.systemKey) ?? "") ?? .metric
+        let sys = UnitPrefs.resolveDistance(
+            system: bodySystem,
+            override: UserDefaults.standard.string(forKey: UnitPrefs.distanceSystemKey) ?? "")
+        _distanceText = State(initialValue: e?.distanceM.map { Self.distanceEntryString($0, system: sys) } ?? "")
+    }
+
+    /// The stored metres shown as a clean editable number in `system`'s unit (km/mi) — trailing zeros and a
+    /// dangling decimal trimmed so the field reads "5.2", not "5.20". Two decimals (~10 m) is plenty for a
+    /// hand-entered distance; the field's purpose is manual entry, not preserving GPS's metre precision.
+    private static func distanceEntryString(_ meters: Double, system: UnitSystem) -> String {
+        let km = meters / 1000.0
+        let value = system == .imperial ? km * UnitFormatter.milesPerKilometer : km
+        var s = String(format: "%.2f", value)
+        while s.hasSuffix("0") { s.removeLast() }
+        if s.hasSuffix(".") { s.removeLast() }
+        return s
     }
 
     var body: some View {
+        #if os(macOS)
+        formContent
+            .padding(NoopMetrics.space6)
+            .frame(width: 420)
+            .background(NoopChromeSurface())
+            // Lets the user dismiss the decimal pad (which has no return key) and reach Cancel/Add.
+            .keyboardDoneToolbar($focusedField)
+        #else
+        // #450 raised the sheet to .large so the keyboard had room, but the body was still a bare
+        // fixed-height VStack — with no ScrollView to absorb the squeeze, iOS's own keyboard-avoidance
+        // had no choice but to rigidly shift the WHOLE block up to keep the focused Sport field clear
+        // of the keyboard. That shift could push the header + Sport field (and the top of its floating
+        // suggestion overlay) off the top of the screen entirely — "recents still clip" — and could also
+        // carry the footer's Add/Cancel row up into the same band where the system's own keyboard
+        // "Done" accessory renders, producing the floating Fertig/Hinzufügen overlap. Wrapping in a
+        // ScrollView gives keyboard-avoidance somewhere to scroll INSTEAD of rigidly displacing fixed
+        // content, so nothing needs to leave its own bounds to stay clear of the keyboard.
+        ScrollView {
+            formContent
+                .padding(NoopMetrics.space6)
+        }
+        // #697/#horizontal-swipe parity, see ScreenScaffold.
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .scrollDismissesKeyboard(.interactively)
+        // A fixed 420pt is right for the free-floating macOS sheet, but on iPhone it's wider than
+        // the screen, so the Avg HR/Calories row, the Start DatePicker and the footer ran off the
+        // right edge (#185, same fix as WhatsNewView/ScoringGuideView). iOS fills the presented
+        // sheet's width and sizes to content height instead.
+        .frame(maxWidth: .infinity)
+        .noopSheetPresentation(largeFirst: true)
+        .background(NoopChromeSurface())
+        // Lets the user dismiss the decimal pad (which has no return key) and reach Cancel/Add.
+        .keyboardDoneToolbar($focusedField)
+        #endif
+    }
+
+    private var formContent: some View {
         VStack(alignment: .leading, spacing: NoopMetrics.space5) {
             header
             VStack(alignment: .leading, spacing: NoopMetrics.space4) {
@@ -72,23 +155,33 @@ struct ManualWorkoutSheet: View {
                     sportPicker
                 }
                 // Raise the Sport field above the following rows so its floating suggestion dropdown
-                // (an overlay, see `sportPicker`) draws ON TOP of Start / Duration instead of behind them.
+                // (an overlay, see `sportPicker`) draws ON TOP of Start / End / Duration, not behind them.
                 .zIndex(1)
                 field(String(localized: "Start")) {
-                    DatePicker("", selection: $start, in: ...Date(),
+                    DatePicker("", selection: startBinding, in: ...Date(),
                                displayedComponents: [.date, .hourAndMinute])
                         .labelsHidden()
                         .accessibilityLabel("Start date and time")
                 }
+                field(String(localized: "End")) {
+                    DatePicker("", selection: $end, in: ...Date(),
+                               displayedComponents: [.date, .hourAndMinute])
+                        .labelsHidden()
+                        .accessibilityLabel("End date and time")
+                }
                 field(String(localized: "Duration")) {
                     HStack(spacing: 12) {
-                        Stepper(value: $durationMin, in: 1...(24 * 60), step: 5) {
+                        Stepper(value: durationBinding, in: 1...(24 * 60), step: 5) {
                             Text(durationLabel)
                                 .font(StrandFont.number(16))
                                 .foregroundStyle(StrandPalette.effortBright)
                         }
                         .accessibilityLabel("Duration in minutes")
                     }
+                }
+                field(String(localized: "Distance")) {
+                    numberInput(String(localized: "optional"), text: $distanceText, unit: distanceUnit, field: .distance)
+                        .accessibilityLabel("Distance, optional")
                 }
                 HStack(spacing: 14) {
                     field(String(localized: "Avg HR")) {
@@ -105,25 +198,6 @@ struct ManualWorkoutSheet: View {
             if avgHrEditedNote { noteRow(String(localized: "Avg HR is shown as typed. The HR graph, zones and Effort stay from the recorded session.")) }
             footer
         }
-        .padding(NoopMetrics.space6)
-        // A fixed 420pt is right for the free-floating macOS sheet, but on iPhone it's wider than
-        // the screen, so the Avg HR/Calories row, the Start DatePicker and the footer ran off the
-        // right edge (#185, same fix as WhatsNewView/ScoringGuideView). iOS fills the presented
-        // sheet's width and sizes to content height instead.
-        #if os(macOS)
-        .frame(width: 420)
-        #else
-        .frame(maxWidth: .infinity)
-        // Full height, not .medium: the Sportart field's floating Recent/catalogue overlay (see
-        // sportPicker below) needs headroom below the field once the keyboard is up. At .medium the
-        // fixed-height VStack has no ScrollView to absorb the squeeze, so the keyboard pushed the
-        // header, the Sportart field and the overlay anchored to it off the top of the sheet —
-        // "recents vanish" was really the panel being clipped along with its off-screen anchor.
-        .noopSheetPresentation(largeFirst: true)
-        #endif
-        .background(StrandPalette.surfaceOverlay)
-        // Lets the user dismiss the decimal pad (which has no return key) and reach Cancel/Add. No-op on macOS.
-        .keyboardDoneToolbar($focusedField)
     }
 
     // MARK: - Sport picker
@@ -204,6 +278,14 @@ struct ManualWorkoutSheet: View {
                 Color.clear.preference(key: SuggestionsHeightKey.self, value: geo.size.height)
             })
         }
+        // #697 parity: this screen builds its OWN ScrollView rather than going through
+        // ScreenScaffold, so it never inherited the scaffold's horizontal-bounce suppression and
+        // could still rubber-band left-right on a purely vertical scroll. Same modifier, same
+        // guard. `.basedOnSize` permits horizontal bounce only when content genuinely overflows
+        // the width, so nothing that is meant to scroll sideways is affected. (#1532 follow-up)
+        #if os(iOS)
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        #endif
         .frame(height: min(max(suggestionsHeight, 1), 168))
         .onPreferenceChange(SuggestionsHeightKey.self) { suggestionsHeight = $0 }
         .background(StrandPalette.surfaceInset, in: inputShape)
@@ -311,7 +393,32 @@ struct ManualWorkoutSheet: View {
 
     private var inputShape: RoundedRectangle { RoundedRectangle(cornerRadius: 10, style: .continuous) }
 
+    /// Moving the START keeps the workout's LENGTH and carries the end with it, which is what correcting
+    /// "this began an hour earlier" means. Computed from the old start before it is reassigned.
+    ///
+    /// Clamped so the carried end cannot land in the future: dragging the start forward would otherwise
+    /// push the end past now and invalidate the sheet on a move that looks entirely reasonable. Clamping
+    /// the START keeps the length the user set, where clamping the end would silently shorten the session.
+    private var startBinding: Binding<Date> {
+        Binding(get: { start },
+                set: { picked in
+                    let span = end.timeIntervalSince(start)
+                    let newStart = min(picked, Date().addingTimeInterval(-span))
+                    end = WorkoutSource.endAfterStartMove(oldStart: start, oldEnd: end, newStart: newStart)
+                    start = newStart
+                })
+    }
+
+    /// Duration is a VIEW of the span, not a stored copy. Reading clamps into the Stepper's own range so
+    /// an end that is currently before the start cannot hand it an out-of-range value; the honest verdict
+    /// on that state comes from `validationNote`, not from this label. Writing moves the end.
+    private var durationBinding: Binding<Int> {
+        Binding(get: { min(24 * 60, max(1, WorkoutSource.spanDurationMin(start: start, end: end))) },
+                set: { end = WorkoutSource.endForDuration(start: start, durationMin: $0) })
+    }
+
     private var durationLabel: String {
+        let durationMin = durationBinding.wrappedValue
         let h = durationMin / 60, m = durationMin % 60
         if h > 0 && m > 0 { return "\(h)h \(m)m" }
         if h > 0 { return "\(h)h" }
@@ -322,14 +429,25 @@ struct ManualWorkoutSheet: View {
     private var avgHr: Int? { Int(avgHrText.trimmingCharacters(in: .whitespaces)) }
     private var kcal: Double? { Double(kcalText.trimmingCharacters(in: .whitespaces)) }
 
+    /// Parsed distance in stored METRES — nil for blank (no distance), or when the typed value can't be a
+    /// non-negative number. The user enters km/mi; convert to metres for the row. (#1195)
+    private var distanceMeters: Double? {
+        let t = distanceText.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, let v = Double(t), v >= 0 else { return nil }
+        let km = distanceUnitSystem == .imperial ? v / UnitFormatter.milesPerKilometer : v
+        return km * 1000.0
+    }
+
     /// The validated row, or nil when the inputs can't make an honest one (drives the disabled Save +
     /// the inline note). Built through the same WorkoutSource.buildManualRow the engine trusts.
     private var builtRow: WorkoutRow? {
         // A typed-but-unparseable number is invalid (e.g. "abc" in Avg HR) — guard before building.
         if !avgHrText.trimmingCharacters(in: .whitespaces).isEmpty && avgHr == nil { return nil }
         if !kcalText.trimmingCharacters(in: .whitespaces).isEmpty && kcal == nil { return nil }
-        guard let base = WorkoutSource.buildManualRow(start: start, durationMin: durationMin,
-                                                      sport: sport, avgHr: avgHr, energyKcal: kcal)
+        if !distanceText.trimmingCharacters(in: .whitespaces).isEmpty && distanceMeters == nil { return nil }
+        guard let base = WorkoutSource.buildManualRowFromSpan(start: start, end: end,
+                                                              sport: sport, avgHr: avgHr, energyKcal: kcal,
+                                                              distanceM: distanceMeters)
         else { return nil }
         // Carry over captured-but-unexposed fields when editing an existing strap session.
         return WorkoutSource.preservingCaptured(base, from: editing)
@@ -350,11 +468,26 @@ struct ManualWorkoutSheet: View {
         guard builtRow == nil else { return nil }
         if sport.trimmingCharacters(in: .whitespaces).isEmpty { return String(localized: "Enter a sport.") }
         if start > Date() { return String(localized: "Start can't be in the future.") }
+        // The failure this feature introduces, so it gets its own line rather than the catch-all below.
+        if end <= start { return String(localized: "End must be after the start.") }
+        if end > Date() { return String(localized: "End can't be in the future.") }
+        // Its own line rather than the catch-all below: "Check the values and try again." gives a wearer
+        // no way to know a 30-second entry is the thing being refused. Matches the live-session floor, so
+        // the same session is treated the same whether it was tracked or typed in.
+        if Int(end.timeIntervalSince1970) - Int(start.timeIntervalSince1970) < WorkoutSource.minManualSpanSeconds {
+            return String(localized: "A workout must be at least 1 minute.")
+        }
         if !avgHrText.trimmingCharacters(in: .whitespaces).isEmpty, avgHr == nil || !(25...250).contains(avgHr ?? -1) {
             return String(localized: "Average HR must be 25-250 bpm.")
         }
         if !kcalText.trimmingCharacters(in: .whitespaces).isEmpty, kcal == nil || (kcal ?? -1) < 0 || (kcal ?? 0) > 20_000 {
             return String(localized: "Calories must be 0-20,000.")
+        }
+        if !distanceText.trimmingCharacters(in: .whitespaces).isEmpty,
+           distanceMeters == nil || (distanceMeters ?? -1) < 0 || (distanceMeters ?? 0) > 1_000_000 {
+            return distanceUnitSystem == .imperial
+                ? String(localized: "Distance must be 0–621 mi.")
+                : String(localized: "Distance must be 0–1,000 km.")
         }
         return String(localized: "Check the values and try again.")
     }
@@ -368,154 +501,6 @@ struct ManualWorkoutSheet: View {
     }
 }
 
-// MARK: - Live workout start picker
-//
-// The Apple-side entry point for LIVE tracking, mirroring Android's StartWorkoutSheet (WorkoutStart.kt):
-// pick a named sport from the shared WorkoutCatalog, then begin the session. Brings the iOS/macOS live
-// tracker to parity with Android, which has had a named-sport picker on Start since #115 — previously
-// the Apple "Start workout" buttons called `startWorkout()` with no sport and every live session saved
-// as the generic "Workout". A host presents this and forwards the chosen name to
-// `AppModel.startWorkout(sport:)`. Free-text isn't offered here (a live start is a quick tap from a
-// fixed list); an unusual sport can still be set afterwards via the manual edit sheet's free-text field.
-
-struct StartWorkoutSheet: View {
-    /// Called with the chosen sport name once the user taps the action button. The host wires this to
-    /// `model.startWorkout(sport:)` (and presents the live workout view) by default, or (#64) to name a
-    /// merged session when the title/action are overridden.
-    let onStart: (_ sport: String) -> Void
-
-    /// #64: heading + explainer + action-verb overrides so this picker doubles as the "name the merged
-    /// session" prompt. Defaults keep the "Start a workout" behaviour byte-identical.
-    private let heading: String
-    private let explainer: String
-    private let actionVerb: String
-
-    init(title: String? = nil, subtitle: String? = nil, actionVerb: String? = nil,
-         onStart: @escaping (_ sport: String) -> Void) {
-        self.onStart = onStart
-        self.heading = title ?? String(localized: "Start a workout")
-        self.explainer = subtitle
-            ?? String(localized: "Pick a sport. NOOP records HR, peak, average and effort from the live feed.")
-        self.actionVerb = actionVerb ?? String(localized: "Start")
-    }
-
-    @Environment(\.dismiss) private var dismiss
-    @State private var query = ""
-    @State private var selected = WorkoutCatalog.defaultSportName
-
-    private var filtered: [WorkoutCatalog.Sport] { WorkoutCatalog.matching(query) }
-    private var inputShape: RoundedRectangle { RoundedRectangle(cornerRadius: 10, style: .continuous) }
-
-    /// #297: the user's last selections, one tap away above the full catalogue. Only catalogue-resolvable
-    /// recents show here — a live start is catalogue-only by design (no free text), and the shared store
-    /// can hold free-typed names from the manual sheet. Hidden once the user starts searching.
-    private var recentSports: [WorkoutCatalog.Sport] {
-        RecentSportsPrefs.recent().compactMap { WorkoutCatalog.sport(named: $0) }
-    }
-
-    private var showRecentSports: Bool {
-        query.trimmingCharacters(in: .whitespaces).isEmpty && !recentSports.isEmpty
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: NoopMetrics.space4) {
-            HStack(alignment: .top, spacing: NoopMetrics.space3) {
-                Image(systemName: "figure.run")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(StrandPalette.effortColor)
-                    .frame(width: 30, height: 30)
-                    .background(StrandPalette.effortColor.opacity(0.14),
-                                in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(heading)
-                        .font(StrandFont.title2)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                    Text(explainer)
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-            }
-
-            TextField("Search sport", text: $query)
-                .textFieldStyle(.plain)
-                .font(StrandFont.body)
-                .foregroundStyle(StrandPalette.textPrimary)
-                .padding(.horizontal, 12).padding(.vertical, 9)
-                .background(StrandPalette.surfaceInset, in: inputShape)
-                .overlay(inputShape.strokeBorder(StrandPalette.hairline, lineWidth: 1))
-                .accessibilityLabel("Search sport")
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    if showRecentSports {
-                        Text("Recent").strandOverline()
-                            .padding(.horizontal, 12).padding(.top, 8)
-                        ForEach(recentSports) { sp in
-                            sportRow(sp)
-                        }
-                        Text("All activities").strandOverline()
-                            .padding(.horizontal, 12).padding(.top, 8)
-                    }
-                    ForEach(filtered) { sp in
-                        sportRow(sp)
-                    }
-                }
-            }
-            .frame(maxHeight: 240)
-            .background(StrandPalette.surfaceInset, in: inputShape)
-            .overlay(inputShape.strokeBorder(StrandPalette.hairline, lineWidth: 1))
-
-            HStack(spacing: NoopMetrics.space3) {
-                NoopButton("Cancel", kind: .tertiary) { dismiss() }
-                Spacer()
-                NoopButton("\(actionVerb) \(selected)", systemImage: "figure.run", kind: .primary) {
-                    // #297: a confirmed start (or merge-name) is a real selection — fold it into the recents.
-                    RecentSportsPrefs.recordSelection(selected)
-                    onStart(selected)
-                    dismiss()
-                }
-                .accessibilityLabel("\(actionVerb) \(selected)")
-            }
-        }
-        .padding(NoopMetrics.space6)
-        #if os(macOS)
-        .frame(width: 420)
-        #else
-        .frame(maxWidth: .infinity)
-        .noopSheetPresentation(largeFirst: false)
-        #endif
-        .background(StrandPalette.surfaceOverlay)
-    }
-
-    /// One tappable sport row — shared by the #297 Recent block and the full catalogue list.
-    private func sportRow(_ sp: WorkoutCatalog.Sport) -> some View {
-        Button {
-            selected = sp.name
-        } label: {
-            HStack(spacing: 6) {
-                Text(sp.name)
-                    .font(StrandFont.body)
-                    .foregroundStyle(sp.name == selected
-                                     ? StrandPalette.accent : StrandPalette.textPrimary)
-                if sp.isDistanceSport {
-                    Text("· GPS")
-                        .font(StrandFont.footnote)
-                        .foregroundStyle(StrandPalette.textTertiary)
-                }
-                Spacer(minLength: 0)
-            }
-            .contentShape(Rectangle())
-            .padding(.horizontal, 12).padding(.vertical, 9)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Pick \(sp.name)")
-        .accessibilityAddTraits(sp.name == selected ? [.isSelected] : [])
-    }
-}
-
 #if DEBUG
 #Preview("Add") {
     ManualWorkoutSheet { _, _ in }
@@ -526,12 +511,7 @@ struct StartWorkoutSheet: View {
     ManualWorkoutSheet(editing: WorkoutRow(
         startTs: Int(Date().timeIntervalSince1970) - 3600, endTs: Int(Date().timeIntervalSince1970),
         sport: "Running", source: "manual", durationS: 3600, energyKcal: 540,
-        avgHr: 148, maxHr: 172, strain: 12.4, distanceM: nil, zonesJSON: nil, notes: nil)) { _, _ in }
-        .preferredColorScheme(.dark)
-}
-
-#Preview("Start") {
-    StartWorkoutSheet { _ in }
+        avgHr: 148, maxHr: 172, strain: 12.4, distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)) { _, _ in }
         .preferredColorScheme(.dark)
 }
 #endif

@@ -46,6 +46,27 @@ object ExerciseTypes {
         // Snow sports have a route, so they default GPS on (see DISTANCE_TYPES). (#768)
         EX.EXERCISE_TYPE_SKIING to "Skiing",
         EX.EXERCISE_TYPE_SNOWBOARDING to "Snowboarding",
+        // Batch of common sports HC enumerates natively, so they round-trip on export (#222 follow-up).
+        EX.EXERCISE_TYPE_FOOTBALL_AMERICAN to "American football",
+        EX.EXERCISE_TYPE_FOOTBALL_AUSTRALIAN to "Australian football",
+        EX.EXERCISE_TYPE_RUGBY to "Rugby",
+        EX.EXERCISE_TYPE_CRICKET to "Cricket",
+        EX.EXERCISE_TYPE_SOFTBALL to "Softball",
+        EX.EXERCISE_TYPE_HANDBALL to "Handball",
+        EX.EXERCISE_TYPE_WATER_POLO to "Water polo",
+        EX.EXERCISE_TYPE_FRISBEE_DISC to "Frisbee",
+        EX.EXERCISE_TYPE_SURFING to "Surfing",
+        EX.EXERCISE_TYPE_PADDLING to "Kayaking",
+        EX.EXERCISE_TYPE_SAILING to "Sailing",
+        EX.EXERCISE_TYPE_SCUBA_DIVING to "Scuba diving",
+        EX.EXERCISE_TYPE_ICE_SKATING to "Ice skating",
+        EX.EXERCISE_TYPE_SKATING to "Inline skating",
+        EX.EXERCISE_TYPE_SNOWSHOEING to "Snowshoeing",
+        EX.EXERCISE_TYPE_GYMNASTICS to "Gymnastics",
+        EX.EXERCISE_TYPE_FENCING to "Fencing",
+        EX.EXERCISE_TYPE_CALISTHENICS to "Calisthenics",
+        EX.EXERCISE_TYPE_STAIR_CLIMBING_MACHINE to "Stair climber",
+        EX.EXERCISE_TYPE_BOOT_CAMP to "Boot camp",
         EX.EXERCISE_TYPE_OTHER_WORKOUT to "Other",
     )
 
@@ -72,6 +93,65 @@ object ExerciseTypes {
         // #714 bodybuilding. No dedicated HC type, so it rides on STRENGTH_TRAINING for writeback and
         // keeps "Bodybuilding" on our own rows. No route → GPS off.
         "Bodybuilding" to EX.EXERCISE_TYPE_STRENGTH_TRAINING,
+        // #222 follow-up: sports HC has no dedicated type for → ride a nearby type for writeback while
+        // keeping their own NOOP label. GPS off (EXTRA is kept out of DISTANCE_TYPES).
+        "Lacrosse" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Field hockey" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "CrossFit" to EX.EXERCISE_TYPE_HIGH_INTENSITY_INTERVAL_TRAINING,
+        "Kickboxing" to EX.EXERCISE_TYPE_MARTIAL_ARTS,
+        "Mountain biking" to EX.EXERCISE_TYPE_BIKING,
+        "Skateboarding" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Stand-up paddleboard" to EX.EXERCISE_TYPE_PADDLING,
+        "Spinning" to EX.EXERCISE_TYPE_BIKING_STATIONARY,
+        "Jump rope" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Powerlifting" to EX.EXERCISE_TYPE_WEIGHTLIFTING,
+        // Long-tail batch: HC has no type → ride a nearby one for writeback, keep the label.
+        "Rucking" to EX.EXERCISE_TYPE_WALKING,
+        "Sand volleyball" to EX.EXERCISE_TYPE_VOLLEYBALL,
+        "Archery" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Fishing" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Hunting" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Curling" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Netball" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Gaelic football" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Spikeball" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        // WHOOP-parity batch: activities in WHOOP's catalogue NOOP lacked. HC has no dedicated type, so
+        // they ride a nearby one for writeback and keep their own label. GPS off (EXTRA convention).
+        "Meditation" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Horseback riding" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Wheelchair" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Gaming" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Motor racing" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        // Asked for by a user. Rides WALKING for writeback, as Rucking and Treadmill walk do: Health
+        // Connect has no pole-walking type, and WALKING is what it actually is. Keeps its own label
+        // because the strain is not a plain walk.
+        "Nordic walking" to EX.EXERCISE_TYPE_WALKING,
+        // WHOOP-parity batch 2: the rest of the sports in WHOOP's activity list that NOOP had no
+        // entry for. A specific HC type only where the activity genuinely belongs to it; everything
+        // else rides OTHER_WORKOUT rather than overstating the match. All keep their own label.
+        // Ballet: dance, so it writes back as dance.
+        "Ballet" to EX.EXERCISE_TYPE_DANCING,
+        "Billiards" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Breakdancing" to EX.EXERCISE_TYPE_DANCING,
+        // Cheerleading: tumbling and stunts are the gymnastic half of it.
+        "Cheerleading" to EX.EXERCISE_TYPE_GYMNASTICS,
+        "Darts" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        // Disc golf: a disc sport, and HC has the type.
+        "Disc golf" to EX.EXERCISE_TYPE_FRISBEE_DISC,
+        // Hurling/Camogie: one entry for both codes, as WHOOP lists them.
+        "Hurling/Camogie" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Jiu jitsu" to EX.EXERCISE_TYPE_MARTIAL_ARTS,
+        "Judo" to EX.EXERCISE_TYPE_MARTIAL_ARTS,
+        // Kiteboarding: board on water; the nearest HC has.
+        "Kiteboarding" to EX.EXERCISE_TYPE_SURFING,
+        "Motocross" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Muay Thai" to EX.EXERCISE_TYPE_MARTIAL_ARTS,
+        "Paintball" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        // Parkour: no close HC type; calisthenics would overstate it.
+        "Parkour" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        // Polo: as Horseback riding already does.
+        "Polo" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
+        "Skydiving" to EX.EXERCISE_TYPE_OTHER_WORKOUT,
     )
 
     /** Types where a route makes sense -> GPS defaults on. */
@@ -85,6 +165,11 @@ object ExerciseTypes {
         // Snow sports cover ground → a route makes sense, GPS defaults on. (#768)
         EX.EXERCISE_TYPE_SKIING,
         EX.EXERCISE_TYPE_SNOWBOARDING,
+        // New distance sports (#222 follow-up): paddling/sailing/skating/snowshoeing cover ground.
+        EX.EXERCISE_TYPE_PADDLING,
+        EX.EXERCISE_TYPE_SAILING,
+        EX.EXERCISE_TYPE_SKATING,
+        EX.EXERCISE_TYPE_SNOWSHOEING,
     )
 
     fun nameFor(type: Int): String = NAMES[type] ?: "Workout"

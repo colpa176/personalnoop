@@ -102,20 +102,9 @@ struct MarkerEditorView: View {
     }
 
     private var searchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 13))
-                .foregroundStyle(StrandPalette.textTertiary)
-                .accessibilityHidden(true)
-            TextField("Search markers (e.g. LDL, ferritin)", text: $search)
-                .textFieldStyle(.plain)
-                .font(StrandFont.body)
-                .foregroundStyle(StrandPalette.textPrimary)
-                .accessibilityLabel("Search markers")
-        }
-        .padding(.horizontal, 12).padding(.vertical, 9)
-        .background(StrandPalette.surfaceInset, in: inputShape)
-        .overlay(inputShape.strokeBorder(StrandPalette.hairline, lineWidth: 1))
+        NoopLiquidGlassSearchField(text: $search,
+                                   prompt: String(localized: "Search markers (e.g. LDL, ferritin)"),
+                                   accessibilityLabel: String(localized: "Search markers"))
     }
 
     private var filteredCatalog: [MarkerDefinition] {
@@ -167,6 +156,9 @@ struct MarkerEditorView: View {
                 }
             }
         }
+        #if os(iOS)
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        #endif
         .frame(maxHeight: 280)
     }
 
@@ -522,14 +514,11 @@ enum MarkerUnits {
     /// A short label for the conversion factor (4 sig figs), e.g. "0.02586".
     static func factorLabel(_ f: Double) -> String { String(format: "%.5g", f) }
 
-    /// A lower-cased, underscored slug for a custom marker name → its stable key.
+    /// A lower-cased, underscored slug for a custom marker name → its stable key. Delegates to the CSV
+    /// importer's `customKey` so a hand-added custom marker and an imported one always share one key.
     static func slug(_ name: String) -> String {
-        let lowered = name.trimmingCharacters(in: .whitespaces).lowercased()
-        let mapped = lowered.map { ch -> Character in
-            (ch.isLetter || ch.isNumber) ? ch : "_"
-        }
-        let collapsed = String(mapped).replacingOccurrences(of: "__", with: "_")
-        return "custom_" + collapsed.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        let key = LabMarkerCsvImport.customKey(name)
+        return key.isEmpty ? "custom_" : key
     }
 }
 

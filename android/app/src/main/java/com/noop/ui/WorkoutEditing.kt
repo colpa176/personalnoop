@@ -38,6 +38,18 @@ object WorkoutEditing {
     }
 
     /**
+     * The pre-fill row behind "Duplicate as manual" on a READ-ONLY session (strap, Apple, lifting, file).
+     *
+     * Re-seeds `deviceId` to the manual namespace as well as `source`. deviceId is part of the workout
+     * primary key, so a copy that kept the original's id would hand [WhoopRepository.saveManualWorkout] a
+     * `replacing` key pointing INTO the source being copied from, and the save would retire the very row
+     * the menu promises not to touch — a strap session lives under the active strap id, which the delete
+     * path can reach. Re-seeding keeps every delete that save can issue inside "my-whoop". (#1488)
+     */
+    fun asManualCopy(row: WorkoutRow): WorkoutRow =
+        row.copy(source = "manual", deviceId = "my-whoop", sport = displaySport(row.sport))
+
+    /**
      * Sport-cell text. "detected" reads as a neutral "Activity". WHOOP sport names arrive as
      * concatenated camelCase (e.g. "TraditionalStrengthTraining"), which reads as one long
      * unbreakable word and truncates badly — split it into words on the lower→Upper boundary so it
@@ -57,18 +69,33 @@ object WorkoutEditing {
         return out.toString()
     }
 
-    // MARK: - Dismissed detected bouts (durable across re-detection)
+    // MARK: - Dismissed detected bouts (legacy rows + suggestion suppression)
 
     /**
      * Read-time filter: a DETECTED row is hidden when it OVERLAPS any dismissed marker's
-     * [startTs, endTs] span. Span-overlap (not an exact-key match) survives the small startTs drift a
-     * bout's boundary can take as more HR arrives, matching the macOS dismissed-span semantics exactly.
+     * [startTs, endTs] span. Span-overlap is retained for legacy rows and the separate suggestion path,
+     * matching the macOS dismissed-span semantics exactly.
      * Imported / manual rows are never auto-hidden (the user deletes those outright). Half-open overlap
      * test: `row.start < span.end && span.start < row.end`. (#107)
      */
     fun isDismissed(row: WorkoutRow, markers: List<DismissedWorkout>): Boolean =
         classify(row.source) == WorkoutSource.DETECTED &&
             markers.any { row.startTs < it.endTs && it.startTs < row.endTs }
+
+    /**
+     * What the edit dialog should hand [WhoopRepository.saveManualWorkout] as `replacing`.
+     *
+     * Only a stored MANUAL or DETECTED row is genuinely being replaced. [isCopy] marks "Duplicate as
+     * manual", where the form pre-fills FROM a read-only session but the save is a pure ADD — and it has to
+     * be passed in, because the copy is built with source "manual" so the form treats it as editable, and
+     * so classifies as MANUAL. Testing the source alone silently let every duplicate through carrying the
+     * ORIGINAL's startTs. (#1488)
+     */
+    fun replacingRowFor(editing: WorkoutRow?, isCopy: Boolean): WorkoutRow? =
+        if (isCopy) null else editing?.takeIf {
+            val c = classify(it.source)
+            c == WorkoutSource.MANUAL || c == WorkoutSource.DETECTED
+        }
 
     /** The durable marker for a detected [row] (caller inserts it into `dismissedWorkout`). */
     fun dismissedMarker(row: WorkoutRow): DismissedWorkout =
@@ -177,12 +204,10 @@ object WorkoutEditing {
 
     // MARK: - Detected-vs-real overlap collapse (#975)
     //
-    // The engine derives a "detected" bout from raw HR and DROPS it when it overlaps a real logged session,
-    // but only on the next analyze pass. Between a live/manual session ending and that pass, BOTH the manual
-    // row AND the detected shadow of the same bout show, and the detected shadow (a wider, sport-agnostic HR
-    // window) reads an implausibly high interpolated Effort/HR next to the real one. sameActivity cannot
-    // collapse them because their SPORTS differ ("detected" vs the user's sport). This read-time guard mirrors
-    // the engine's rule so the list never shows the transient duplicate. Runs before the same-sport dedup.
+    // Grandfathered generic detections can overlap a real workout logged later. sameActivity cannot collapse
+    // that pair because their SPORTS differ ("detected" vs the user's sport), so the wider generic row would
+    // otherwise remain beside the real one indefinitely. This read-time guard hides that redundant legacy
+    // row and runs before the same-sport dedup.
 
     /**
      * True when [detected] (a detected bout) is a redundant shadow of [real] (a non-detected logged session):
@@ -311,20 +336,27 @@ object WorkoutEditing {
     // MARK: - Building / preserving rows
 
     /**
-     * Carry the captured fields the add/edit sheet does NOT expose (maxHr, strain, distanceM,
-     * zonesJSON, notes, routePolyline) over from the row being edited. A live-tracked session has real
-     * captured strain/maxHr/route; rebuilding from the sheet's inputs alone would wipe them on an edit.
-     * No-op for a fresh add (old == null).
+     * Carry the captured fields the add/edit sheet does NOT expose (maxHr, strain, zonesJSON, notes,
+     * routePolyline) over from the row being edited. A live-tracked session has real captured
+     * strain/maxHr/route; rebuilding from the sheet's inputs alone would wipe them on an edit. No-op for a
+     * fresh add (old == null). distanceM is NOW a sheet field (#1195), so it comes from the freshly built
+     * row (the sheet pre-fills it from the edited row, so an untouched field preserves the captured GPS
+     * distance and a cleared one clears it); routePolyline still carries the captured map verbatim.
      */
     fun preservingCaptured(row: WorkoutRow, old: WorkoutRow?): WorkoutRow {
         if (old == null) return row
         return row.copy(
             maxHr = old.maxHr,
             strain = old.strain,
-            distanceM = old.distanceM,
+            distanceM = row.distanceM,
             zonesJSON = old.zonesJSON,
             notes = old.notes,
             routePolyline = old.routePolyline,
+            // #1444: `row` here is the sheet-built row, NOT the stored one, so copy() alone does not
+            // carry this — buildManualRow has no steps input and leaves it null. Per-session steps
+            // (#1058) is a captured field the sheet never exposes, so it is restored from `old` like
+            // the rest. Twin of Swift WorkoutSource.preservingCaptured.
+            steps = old.steps,
         )
     }
 
@@ -342,11 +374,107 @@ object WorkoutEditing {
         return captured && built.avgHr != old.avgHr
     }
 
+    /** The span cap a manual workout may cover, shared by both builders and the sheet's binding. */
+    const val MAX_MANUAL_SPAN_SECONDS: Long = 24L * 60L * 60L
+
+    /**
+     * Shortest manual session worth keeping, the twin of Swift `WorkoutSource.minManualSpanSeconds`.
+     *
+     * The duration-shaped front door already enforced this by accident, counting whole minutes and
+     * rejecting zero. The SPAN-shaped door did not, and that is the one the Add/Edit sheet uses, so a
+     * start and end thirty seconds apart made a row the live path discards.
+     */
+    const val MIN_MANUAL_SPAN_SECONDS: Long = 60L
+
+    /**
+     * The end a given duration implies. The sheet uses this when the user types a duration, so a typed
+     * duration and a picked end produce byte-identical rows.
+     */
+    fun endForDuration(startSeconds: Long, durationMin: Int): Long =
+        startSeconds + durationMin.toLong() * 60L
+
+    /**
+     * Whole minutes in a span, for the duration field's DISPLAY.
+     *
+     * Rounds, so a stored 45m17s bout reads as "45". That rounding is display-only now: the sheet keeps
+     * the exact end as its state of record and saves that, where it previously round-tripped the span
+     * through this number and wrote the rounded end back. Editing a detected workout's sport therefore
+     * no longer shortens it by up to 30 seconds.
+     */
+    fun spanDurationMin(startSeconds: Long, endSeconds: Long): Int =
+        Math.round((endSeconds - startSeconds) / 60.0).toInt()
+
+    /**
+     * Where the end lands when the START moves.
+     *
+     * Moving the start keeps the workout the same LENGTH rather than pinning the end, which is what a
+     * user correcting "this began an hour earlier than I said" means. Pinning the end instead would
+     * silently restretch the duration on every start correction.
+     */
+    fun endAfterStartMove(oldStartSeconds: Long, oldEndSeconds: Long, newStartSeconds: Long): Long =
+        newStartSeconds + (oldEndSeconds - oldStartSeconds)
+
+    /**
+     * Build a retroactive manual workout from an explicit SPAN.
+     *
+     * The row has always been stored as `startTs`/`endTs`, so this is the shape the storage already
+     * speaks; [buildManualRow] is the duration-shaped front door that delegates here (#2034). Split out
+     * so the sheet can offer an end time without the value making a lossy round trip through whole
+     * minutes.
+     *
+     * Validation is the duration form's, re-expressed: a span must be positive, at most
+     * [MAX_MANUAL_SPAN_SECONDS], and must not end in the future.
+     *
+     * @param nowSeconds wall-clock now (unix seconds); injectable for tests.
+     */
+    fun buildManualRowFromSpan(
+        deviceId: String,
+        startSeconds: Long,
+        endSeconds: Long,
+        sport: String,
+        avgHr: Int?,
+        energyKcal: Double?,
+        nowSeconds: Long = System.currentTimeMillis() / 1000L,
+        distanceM: Double? = null,
+    ): WorkoutRow? {
+        val trimmed = sport.trim()
+        if (trimmed.isEmpty() || startSeconds <= 0 || startSeconds > nowSeconds) return null
+        if (endSeconds <= startSeconds) return null
+        val spanSeconds = endSeconds - startSeconds
+        if (spanSeconds < MIN_MANUAL_SPAN_SECONDS) return null
+        if (spanSeconds > MAX_MANUAL_SPAN_SECONDS) return null
+        if (endSeconds > nowSeconds) return null
+        if (avgHr != null && avgHr !in 25..250) return null
+        if (energyKcal != null && (energyKcal < 0 || energyKcal > 20_000)) return null
+        // Distance 0-1000 km (#1195): rejects a negative or absurd manual entry. 1000 km comfortably
+        // covers any single session (an Ironman bike is 180 km, an ultra 160 km).
+        if (distanceM != null && (distanceM < 0 || distanceM > 1_000_000)) return null
+        return WorkoutRow(
+            deviceId = deviceId,
+            startTs = startSeconds,
+            endTs = endSeconds,
+            sport = trimmed,
+            source = "manual",
+            durationS = spanSeconds.toDouble(),
+            energyKcal = energyKcal,
+            avgHr = avgHr,
+            maxHr = null,
+            strain = null,
+            distanceM = distanceM,
+            zonesJSON = null,
+            notes = null,
+            routePolyline = null,
+        )
+    }
+
     /**
      * Build a retroactive manual workout (source "manual", written under the strap [deviceId] by the
      * caller — where live sessions land). Returns null when the input can't make an honest row.
      * strain/zones stay null: with no captured HR window an APPROXIMATE strain is never fabricated.
      * Mirrors macOS WorkoutSource.buildManualRow validation bound-for-bound.
+     *
+     * The duration-shaped front door. Delegates to [buildManualRowFromSpan] so the two entry points
+     * cannot drift; it keeps the whole-minute bounds and the overflow guard, which only this shape needs.
      *
      * @param startSeconds workout start, unix seconds.
      * @param nowSeconds wall-clock now (unix seconds); injectable for tests.
@@ -358,28 +486,26 @@ object WorkoutEditing {
         sport: String,
         avgHr: Int?,
         energyKcal: Double?,
+        // Trailing so the existing positional callers (which pass `nowSeconds` last) are unaffected; the
+        // one caller that sets a distance (the manual sheet) passes it by name. (#1195)
         nowSeconds: Long = System.currentTimeMillis() / 1000L,
+        distanceM: Double? = null,
     ): WorkoutRow? {
         if (durationMin <= 0 || durationMin > 24 * 60) return null
-        val trimmed = sport.trim()
-        if (trimmed.isEmpty() || startSeconds > nowSeconds || startSeconds <= 0) return null
-        if (avgHr != null && avgHr !in 25..250) return null
-        if (energyKcal != null && (energyKcal < 0 || energyKcal > 20_000)) return null
-        return WorkoutRow(
+        val durationSeconds = durationMin.toLong() * 60L
+        // Keep both the addition and the future-end check overflow-safe. A valid start can be close to
+        // Long.MAX_VALUE in a boundary test even though production timestamps are much smaller. Checked
+        // HERE rather than in the span form, which takes an end that has already been computed.
+        if (durationSeconds > Long.MAX_VALUE - startSeconds) return null
+        return buildManualRowFromSpan(
             deviceId = deviceId,
-            startTs = startSeconds,
-            endTs = startSeconds + durationMin * 60L,
-            sport = trimmed,
-            source = "manual",
-            durationS = durationMin * 60.0,
-            energyKcal = energyKcal,
+            startSeconds = startSeconds,
+            endSeconds = startSeconds + durationSeconds,
+            sport = sport,
             avgHr = avgHr,
-            maxHr = null,
-            strain = null,
-            distanceM = null,
-            zonesJSON = null,
-            notes = null,
-            routePolyline = null,
+            energyKcal = energyKcal,
+            nowSeconds = nowSeconds,
+            distanceM = distanceM,
         )
     }
 
@@ -483,6 +609,11 @@ object WorkoutMerge {
         val energyKcal = if (kcals.isEmpty()) null else kcals.sum()
         val dists = rows.mapNotNull { it.distanceM }
         val distanceM = if (dists.isEmpty()) null else dists.sum()
+        // #1444: steps is cumulative per session exactly like distance, so a merge sums it too. It was
+        // silently dropped here (copy() does not help: this builds a NEW row), which the Swift twin's
+        // explicit-field audit surfaced.
+        val stepCounts = rows.mapNotNull { it.steps }
+        val mergedSteps = if (stepCounts.isEmpty()) null else stepCounts.sum()
 
         var hrWeight = 0.0
         var hrSum = 0.0
@@ -515,6 +646,7 @@ object WorkoutMerge {
             zonesJSON = null,
             notes = mergedNotes,
             routePolyline = null,
+            steps = mergedSteps,
         )
     }
 }

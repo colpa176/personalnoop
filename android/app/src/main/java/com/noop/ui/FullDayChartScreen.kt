@@ -23,19 +23,23 @@ import androidx.compose.ui.Alignment
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.noop.R
 import com.noop.analytics.HrvAnalyzer
+import com.noop.data.OuraRespScale
 import com.noop.protocol.DeviceFamily
 import com.noop.protocol.skinTempCelsius
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.time.ZoneId
 import java.util.Calendar
 import java.util.Locale
+import kotlin.math.roundToInt
 
 // MARK: - Deep Timeline (Android twin of FullDayChartView) — #575
 //
@@ -106,10 +110,19 @@ fun FullDayChartScreen(vm: AppViewModel, onBack: () -> Unit) {
     var isWhoop5 by remember { mutableStateOf(false) }
     var everSpo2 by remember { mutableStateOf(true) }
     var everResp by remember { mutableStateOf(true) }
+    // What the source pill calls the owned source: the active device's registry display name (nickname,
+    // else "Brand Model"), so an active Oura ring reads "Oura …" over the ring's own series instead of the
+    // strap label this row shipped with. null (no registry row) keeps the legacy "My WHOOP". Mirrors iOS
+    // FullDayChartView.sourceName.
+    var sourceName by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(deviceId) {
-        val model = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
-            .firstOrNull { it.id == deviceId }?.model
-        val whoop5 = DeviceFamily.forRegistryModel(model) == DeviceFamily.WHOOP5
+        val d = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
+            .firstOrNull { it.id == deviceId }
+        sourceName = d?.let(::displayName)
+        // A positive "is it a 5/MG", never a coalesced one (#1086): the respiration copy tells the reader
+        // their estimate is on the Health screen, which is true for a WHOOP 5 (the R-R RSA estimate runs)
+        // and false for a non-WHOOP device whose banked stream that estimate refuses.
+        val whoop5 = DeviceFamily.isWhoop5Registry(d?.model, d?.brand)
         isWhoop5 = whoop5
         val now = System.currentTimeMillis() / 1000
         everSpo2 = !whoop5 || runCatching { vm.repo.spo2Samples(deviceId, 0, now, 1) }.getOrDefault(emptyList()).isNotEmpty()
@@ -169,6 +182,13 @@ fun FullDayChartScreen(vm: AppViewModel, onBack: () -> Unit) {
         points
     }
 
+    // Round wall-clock ticks for the RENDERED extent, shared by the gridlines (drawn inside TimelineChart)
+    // and the axis-label strip below so they align. Mirrors the Today HR chart's timeTicks convention.
+    val timeTicks = remember(visible.first, visible.last) {
+        // deepZoom: this is the surface that pinches, so sub-hour tiers are wanted here and only here.
+        chartTimeTicks(visible.first, visible.last, ZoneId.systemDefault(), deepZoom = true)
+    }
+
     // Re-read on metric / source / settled-window / fresh-data change. The DB read picks raw vs buckets.
     LaunchedEffect(metric, ownedOnly, visible.first, visible.last, recentDays) {
         // PERF (#scroll-jank): a pinch/pan reports a NEW window on every gesture frame, each of which
@@ -205,9 +225,9 @@ fun FullDayChartScreen(vm: AppViewModel, onBack: () -> Unit) {
             )
         }
 
-        // SOURCE PILL — the owned strap, with the #574 owned/all scope toggle.
+        // SOURCE PILL — the owned (active) device, with the #574 owned/all scope toggle.
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(stringResource(R.string.timeline_my_whoop), style = NoopType.footnote, color = Palette.textSecondary)
+            Text(sourceName ?: stringResource(R.string.timeline_my_whoop), style = NoopType.footnote, color = Palette.textSecondary)
             Spacer(Modifier.weight(1f))
             val ownedLabel = stringResource(R.string.timeline_owned)
             val allLabel = stringResource(R.string.timeline_all)
@@ -256,28 +276,43 @@ fun FullDayChartScreen(vm: AppViewModel, onBack: () -> Unit) {
                     }
                 }
 
-                Box(modifier = Modifier.fillMaxWidth().height(280.dp), contentAlignment = Alignment.Center) {
-                    when {
-                        loading && points.isEmpty() ->
-                            Text(stringResource(R.string.timeline_loading_day), style = NoopType.footnote, color = Palette.textTertiary)
-                        points.isEmpty() -> {
-                            // #623: the metric is genuinely UNSUPPORTED on this strap only when it's a
-                            // 5.0-family strap that has never produced it — not merely an empty window.
-                            val metricUnsupported = ownedOnly && isWhoop5 && when (metric) {
-                                TimelineMetric.Spo2 -> !everSpo2
-                                TimelineMetric.Respiration -> !everResp
-                                else -> false
+                // Chart + X-axis label strip: the chart and its axis-label strip share this Column
+                // so both span exactly the plot width. The chart receives the same timeTicks so its
+                // gridlines align with the labels below.
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Box(modifier = Modifier.fillMaxWidth().height(280.dp), contentAlignment = Alignment.Center) {
+                        when {
+                            loading && points.isEmpty() ->
+                                Text(stringResource(R.string.timeline_loading_day), style = NoopType.footnote, color = Palette.textTertiary)
+                            points.isEmpty() -> {
+                                // #623: the metric is genuinely UNSUPPORTED on this strap only when it's a
+                                // 5.0-family strap that has never produced it — not merely an empty window.
+                                val metricUnsupported = ownedOnly && isWhoop5 && when (metric) {
+                                    TimelineMetric.Spo2 -> !everSpo2
+                                    TimelineMetric.Respiration -> !everResp
+                                    else -> false
+                                }
+                                EmptyTimelineState(metric, ownedOnly, metricUnsupported)
                             }
-                            EmptyTimelineState(metric, ownedOnly, metricUnsupported)
+                            else -> TimelineChart(
+                                points = displayPoints,
+                                windowStart = visible.first,
+                                windowEnd = visible.last,
+                                bounds = panBounds,   // #986: pan clamp is the rolling 3-day window, not one day
+                                color = metricColor(metric),
+                                modifier = Modifier.fillMaxWidth().height(280.dp),
+                                onWindowChange = { window = it },
+                                timeTicks = timeTicks,
+                            )
                         }
-                        else -> TimelineChart(
-                            points = displayPoints,
+                    }
+                    // X-axis: HH:mm labels aligned to their gridlines via the same wall-clock mapping.
+                    // Hidden when the chart is empty (loading / unsupported) so no labels float alone.
+                    if (displayPoints.isNotEmpty()) {
+                        TimelineTimeAxisLabels(
+                            ticks = timeTicks,
                             windowStart = visible.first,
                             windowEnd = visible.last,
-                            bounds = panBounds,   // #986: pan clamp is the rolling 3-day window, not one day
-                            color = metricColor(metric),
-                            modifier = Modifier.fillMaxWidth().height(280.dp),
-                            onWindowChange = { window = it },
                         )
                     }
                 }
@@ -388,7 +423,9 @@ private suspend fun readTimeline(
             // the chart at day scale (the #575 point-count risk downsampleTimeline handles for the others).
             // #1036 (ryanbr): stepSec closes this Android-only day-scale flood gap.
             val hrvWindow = HrvAnalyzer.DEFAULT_ROLLING_WINDOW_SEC
-            return@withContext runCatching { repo.rrIntervals(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
+            return@withContext runCatching {
+                repo.rrIntervalsUnion(deviceId, from, to, 200_000)
+            }.getOrDefault(emptyList())
                 .let { HrvAnalyzer.rollingRmssd(it, windowSec = hrvWindow, stepSec = maxOf(1, hrvWindow / 8)) }
                 .map { (ts, v) -> TimelinePoint(ts, v) }
         }
@@ -397,19 +434,25 @@ private suspend fun readTimeline(
                 .mapNotNull { if (it.ir > 0) TimelinePoint(it.ts, it.red.toDouble() / it.ir) else null }
         TimelineMetric.SkinTemp -> {
             // #938: family-aware raw→°C — 5/MG centidegrees (raw/100, #156), a WHOOP 4.0 v24 raw ADC map.
-            // The registry-model-label → family mapping lives in DeviceFamily.forRegistryModel (#171).
+            // The registry-model-label → family mapping lives in DeviceFamily.forRegistryDevice (#171).
+            // A non-WHOOP device (null) shares the non-4.0 scale, so coalesce to WHOOP5 — same conversion
+            // as before; brand-awareness just stops it claiming to be a WHOOP (#1086).
             // Mirrors Swift Repository.timelineRawMetric.
-            val model = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
-                .firstOrNull { it.id == deviceId }?.model
-            val family = DeviceFamily.forRegistryModel(model)
+            val d = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
+                .firstOrNull { it.id == deviceId }
+            val family = DeviceFamily.forRegistryDevice(d?.model, d?.brand) ?: DeviceFamily.WHOOP5
             runCatching { repo.skinTempSamples(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
                 .map { TimelinePoint(it.ts, skinTempCelsius(it.raw, family)) }
         }
         TimelineMetric.Respiration ->
+            // Two quantities share this table: a WHOOP's raw respiration ADC waveform (plotted verbatim,
+            // as before) and an Oura ring's own per-window RATE in milli-bpm (0x6A instrumentation), which
+            // is scaled back to breaths/min so the track reads as ~14-16 instead of ~14,375.
+            // `OuraRespScale` is the single place that mapping lives. Mirrors Swift.
             runCatching { repo.respSamples(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
-                .map { TimelinePoint(it.ts, it.raw.toDouble()) }
+                .map { TimelinePoint(it.ts, OuraRespScale.displayValue(it.raw, deviceId)) }
         TimelineMetric.Motion ->
-            runCatching { repo.gravitySamples(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
+            runCatching { repo.gravitySamplesUnion(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
                 .map { TimelinePoint(it.ts, kotlin.math.sqrt(it.x * it.x + it.y * it.y + it.z * it.z)) }
         TimelineMetric.BandSleepState ->
             // #175: the strap's OWN band sleep_state (0 wake/1 still/2 asleep/3 up) as a stepped track. Read
@@ -540,4 +583,48 @@ private fun dayLabel(dayStartSec: Long, todayStart: Long): String = when (daySta
     todayStart -> "Today"
     todayStart - 86_400 -> "Yesterday"
     else -> java.text.SimpleDateFormat("EEE d MMM", Locale.US).format(java.util.Date(dayStartSec * 1000))
+}
+
+// MARK: - X-axis time labels
+
+/**
+ * The Deep Timeline x-axis label strip: one Text per round-time tick, positioned under its gridline
+ * via the SAME time→x mapping the chart uses (wall-clock seconds across the visible window). A tick
+ * label that would collide with its neighbour is skipped rather than overlapped. Mirrors the Today
+ * HR chart's HrTimeAxisLabels (TodayScreen.kt), adapted to the Timeline's wall-clock x mapping.
+ */
+@Composable
+private fun TimelineTimeAxisLabels(
+    ticks: List<Pair<Long, String>>,
+    windowStart: Long,
+    windowEnd: Long,
+) {
+    if (ticks.isEmpty()) return
+    Layout(
+        modifier = Modifier.fillMaxWidth(),
+        content = {
+            ticks.forEach { (_, label) ->
+                Text(label, style = NoopType.footnote, color = Palette.textTertiary, maxLines = 1)
+            }
+        },
+    ) { measurables, constraints ->
+        val loose = constraints.copy(minWidth = 0, minHeight = 0)
+        val placeables = measurables.map { it.measure(loose) }
+        val width = constraints.maxWidth
+        val height = placeables.maxOfOrNull { it.height } ?: 0
+        val span = (windowEnd - windowStart).coerceAtLeast(1L)
+        layout(width, height) {
+            var lastRight = Int.MIN_VALUE
+            ticks.forEachIndexed { i, (ts, _) ->
+                val p = placeables[i]
+                val frac = ((ts - windowStart).toDouble() / span).coerceIn(0.0, 1.0)
+                val x = (frac * width - p.width / 2f).roundToInt().coerceIn(0, (width - p.width).coerceAtLeast(0))
+                // Skip a label that would overlap its neighbour.
+                if (x > lastRight) {
+                    p.place(x, 0)
+                    lastRight = x + p.width + 8
+                }
+            }
+        }
+    }
 }

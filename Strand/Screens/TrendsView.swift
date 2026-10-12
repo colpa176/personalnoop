@@ -14,6 +14,7 @@ import Foundation
 
 struct TrendsView: View {
     @EnvironmentObject var repo: Repository
+    @Environment(\.locale) private var locale
     // NOTE: deliberately does NOT observe LiveState — Trends shows historical data only, and
     // observing it forced a full re-render of this subtree on every ~1 Hz live-HR tick.
 
@@ -48,6 +49,8 @@ struct TrendsView: View {
     // #436 — shareable offline trends report (PDF over a date range). The sheet owns its
     // own range picker; this just presents it with the loaded history.
     @State private var showingReport = false
+    /// Current appearance, passed into the off-screen recap render so the shared PNG matches the app.
+    @Environment(\.colorScheme) private var colorScheme
 
     /// Rest's per-day series, keyed by "yyyy-MM-dd". Rest is the sleep_performance COMPOSITE (the same
     /// number the Today Rest score + the Sleep Rest-detail plot, #614 follow-up) — NOT raw efficiency,
@@ -55,6 +58,8 @@ struct TrendsView: View {
     /// the Today Rest score (#732). sleep_performance is a metricSeries, not a DailyMetric field, so load
     /// it once (mirroring TodayView's restScore source) and key by day for `resolve` below.
     @State private var sleepPerfByDay: [String: Double] = [:]
+    @State private var sleepPerfRevision = 0
+    @State private var resolvedCache = ResolvedCache()
 
     // #710 — browse previous weeks in the Week-in-review digest. 0 = the week containing today; each step
     // back is one Mon–Sun week earlier. Clamped so it never runs past the earliest day we hold (see
@@ -81,33 +86,11 @@ struct TrendsView: View {
 
     // MARK: Window selection (relative to the LATEST day, with auto-expand)
 
-    /// The latest recorded day across all history (anchors every window).
-    private var latestDay: Date? {
-        guard let d = repo.days.last?.day else { return nil }
-        return date(d)
-    }
-
     /// Days for a given range, taken RELATIVE TO TODAY (the phone's local date) — not the latest
     /// recorded day, which on a stale import anchored W/M/3M to months-old data so it looked current
     /// (issue #23). Empty short windows auto-widen (see `resolve`), so old imports surface under a
     /// wider range / All history instead of masquerading as recent. `.all` returns everything.
     /// ISO yyyy-MM-dd compares chronologically.
-    private func days(for r: Range) -> [DailyMetric] {
-        guard let n = r.days else { return repo.days }
-        let cutoffKey = Repository.localDayKey(Calendar.current.date(byAdding: .day, value: -(n - 1), to: Date()) ?? Date())
-        return repo.days.filter { $0.day >= cutoffKey }
-    }
-
-    /// Build trend points from a metric accessor over a day slice.
-    private func points(_ days: ArraySlice<DailyMetric>, _ value: (DailyMetric) -> Double?) -> [TrendPoint] {
-        days.compactMap { d in
-            guard let v = value(d), let dt = date(d.day) else { return nil }
-            return TrendPoint(date: dt, value: v)
-        }
-    }
-    private func points(_ days: [DailyMetric], _ value: (DailyMetric) -> Double?) -> [TrendPoint] {
-        points(days[...], value)
-    }
 
     // MARK: Resolved metric (memoized per body)
     //
@@ -127,20 +110,64 @@ struct TrendsView: View {
         var caption: String
     }
 
+    private struct ResolvedMetrics {
+        let recovery: ResolvedMetric
+        let hrv: ResolvedMetric
+        let rhr: ResolvedMetric
+        let strain: ResolvedMetric
+        let rest: ResolvedMetric
+    }
+
+    /// Repository status publications can redraw Trends without changing its historical data.
+    /// Retain the five resolved windows across those redraws; invalidate on the data generation,
+    /// range, Rest-series revision, local day, or locale so readings and captions remain current.
+    /// This reference does not publish changes of its own, avoiding a body-to-state update loop.
+    @MainActor private final class ResolvedCache {
+        private struct Key: Equatable {
+            let repo: ObjectIdentifier
+            let refreshSeq: Int
+            let range: Range
+            let restRevision: Int
+            let day: String
+            let locale: String
+        }
+
+        private var key: Key?
+        private var value: ResolvedMetrics?
+
+        func get(repo: Repository, range: Range, restRevision: Int, day: String, locale: String,
+                 build: () -> ResolvedMetrics) -> ResolvedMetrics {
+            let next = Key(repo: ObjectIdentifier(repo), refreshSeq: repo.refreshSeq,
+                           range: range, restRevision: restRevision, day: day, locale: locale)
+            if key == next, let value { return value }
+            let result = build()
+            key = next
+            value = result
+            return result
+        }
+    }
+
+    private var resolvedMetrics: ResolvedMetrics {
+        resolvedCache.get(repo: repo, range: range, restRevision: sleepPerfRevision,
+                          day: Repository.localDayKey(Date()), locale: locale.identifier) {
+            ResolvedMetrics(recovery: resolve { $0.recovery },
+                            hrv: resolve { $0.avgHrv },
+                            rhr: resolve { $0.restingHr.map(Double.init) },
+                            strain: resolve { $0.strain },
+                            rest: resolve { sleepPerfByDay[$0.day] })
+        }
+    }
+
     private func resolve(_ value: (DailyMetric) -> Double?) -> ResolvedMetric {
         // Find the smallest range ≥ selected whose window has ≥1 point, keeping
         // that window's points so we don't re-filter to read them back.
-        for r in range.widening {
-            let pts = points(days(for: r), value)
-            if !pts.isEmpty {
-                return ResolvedMetric(points: pts, effective: r,
-                                      widened: r != range, caption: caption(count: pts.count, eff: r))
-            }
-        }
-        // No range held data: fall back to ALL (matches effectiveRange()).
-        let pts = points(days(for: .all), value)
-        return ResolvedMetric(points: pts, effective: .all,
-                              widened: .all != range, caption: caption(count: pts.count, eff: .all))
+        // The windowing lives in `HostedTrendData` so the Today host cards resolve EXACTLY as this tab
+        // does. Shared rather than copied: the widening fallback is what a wearer with two weeks of
+        // history depends on, and a second implementation would drift the moment either side was tuned.
+        let r = HostedTrendData.resolve(days: repo.days, selected: range, value: value)
+        return ResolvedMetric(points: r.points, effective: r.effective,
+                              widened: r.effective != range,
+                              caption: caption(count: r.points.count, eff: r.effective))
     }
 
     /// Caption text from an already-resolved count + effective range. Mirrors
@@ -158,11 +185,7 @@ struct TrendsView: View {
 
     /// A padded value range for a series so the line isn't flat against the axis.
     private func valueRange(_ pts: [TrendPoint], fallback: ClosedRange<Double>, pad: Double = 0.12) -> ClosedRange<Double> {
-        let vals = pts.map(\.value)
-        guard let lo = vals.min(), let hi = vals.max() else { return fallback }
-        if hi <= lo { return (lo - 1)...(hi + 1) }
-        let span = hi - lo
-        return (lo - span * pad)...(hi + span * pad)
+        HostedTrendData.valueRange(pts, fallback: fallback, pad: pad)
     }
 
     private func mean(_ pts: [TrendPoint]) -> Double? {
@@ -190,11 +213,22 @@ struct TrendsView: View {
     private func changeChip(_ pts: [TrendPoint], higherIsBetter: Bool?, fmt: @escaping (Double) -> String) -> some View {
         if let d = periodChange(pts), abs(d) > 0.0001 {
             let sign = d >= 0 ? "+" : "−"
+            let deltaText = "\(sign)\(fmt(abs(d)))"
             let color: Color = {
                 guard let better = higherIsBetter else { return StrandPalette.textTertiary }
                 return (d > 0) == better ? StrandPalette.statusPositive : StrandPalette.metricRose
             }()
-            TrendChip(text: "\(sign)\(fmt(abs(d)))", color: color)
+            VStack(alignment: .leading, spacing: NoopMetrics.spaceHalf) {
+                // Match the neighbouring ChartFooter columns so the delta is self-describing instead
+                // of appearing as an unlabeled pill at the edge of the statistics row.
+                Text("Trend")
+                    .textCase(.uppercase)
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                TrendChip(text: deltaText, color: color)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: "\(String(localized: "Trend")): \(deltaText)"))
         }
     }
 
@@ -202,6 +236,31 @@ struct TrendsView: View {
     private var rangeSubtitle: String {
         guard let n = range.days else { return String(localized: "All history") }
         return String(localized: "Trailing \(n) days")
+    }
+
+    /// The compact selector caption is intentionally split into two intrinsic-width lines.
+    /// Its leading edges line up while the surrounding spacer pins the widest line to the
+    /// screen's shared trailing content edge.
+    @ViewBuilder
+    private var rangeCaption: some View {
+        if let days = range.days {
+            VStack(alignment: .leading, spacing: .zero) {
+                Text("Trailing")
+                    .strandOverline()
+                    .lineLimit(1)
+                Text("\(days) days")
+                    .strandOverline()
+                    .lineLimit(1)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(rangeSubtitle)
+        } else {
+            Text(rangeSubtitle)
+                .strandOverline()
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
     }
 
     private func name(for r: Range) -> String {
@@ -243,17 +302,9 @@ struct TrendsView: View {
                     ? "Trends need history to draw. Import your WHOOP export in Data Sources to see weeks, months and years instantly."
                     : "Loading your history…")
             } else {
-                // Resolve each metric's window ONCE per body and pass the results
-                // down — rangeBar/heroRecovery/smallMultiples all reuse these
-                // instead of re-filtering repo.days through caption/widened/
-                // windowPoints on every render (hover, animation, 1 Hz HR tick).
-                let recovery = resolve { $0.recovery }
-                let hrv = resolve { $0.avgHrv }
-                let rhr = resolve { $0.restingHr.map(Double.init) }
-                let strain = resolve { $0.strain }
-                // Rest = the sleep_performance composite — the same number the Today Rest score shows
-                // (#732); see sleepPerfByDay. resolve() still does the windowing/widening.
-                let rest = resolve { sleepPerfByDay[$0.day] }
+                // Reuse the resolved windows until the data, range, or loaded Rest series changes.
+                // An unrelated Repository publication must not re-filter five years of history.
+                let metrics = resolvedMetrics
                 VStack(alignment: .leading, spacing: NoopMetrics.sectionSpacing) {
                     // The main card list ripples in once on appear (Reduce-Motion safe).
                     Group {
@@ -262,18 +313,23 @@ struct TrendsView: View {
                         weeklyDigestNav
                             .staggeredAppear(index: 0)
                         // The Charge / Effort / Rest trio, presented in NOOP's pip language.
-                        weekInReview(charge: recovery, effort: strain, rest: rest)
+                        weekInReview(charge: metrics.recovery, effort: metrics.strain, rest: metrics.rest)
                             .staggeredAppear(index: 1)
-                        rangeBar(recovery: recovery)
+                        rangeBar(recovery: metrics.recovery)
                             .staggeredAppear(index: 2)
-                        heroRecovery(recovery: recovery)
+                        heroRecovery(recovery: metrics.recovery)
                             .staggeredAppear(index: 3)
-                        smallMultiples(hrv: hrv, rhr: rhr, strain: strain)
+                        smallMultiples(hrv: metrics.hrv, rhr: metrics.rhr, strain: metrics.strain)
                             .staggeredAppear(index: 4)
-                        yearStrip
+                        // Long-horizon training load (CTL/ATL/TSB). Uses the FULL history, not the
+                        // range window — chronic load is inherently a 42-day horizon. Self-hides its
+                        // chart behind an honest "needs N more days" state until enough history exists.
+                        TrainingLoadCard(days: repo.days)
                             .staggeredAppear(index: 5)
-                        exportReportRow
+                        yearStrip
                             .staggeredAppear(index: 6)
+                        exportReportRow
+                            .staggeredAppear(index: 7)
                     }
                 }
             }
@@ -289,6 +345,7 @@ struct TrendsView: View {
         .task(id: repo.days.count) {
             let s = await repo.exploreSeries(key: "sleep_performance", source: "my-whoop")
             sleepPerfByDay = Dictionary(s.map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
+            sleepPerfRevision += 1
         }
     }
 
@@ -343,14 +400,26 @@ struct TrendsView: View {
             EmptyView()
         } else {
             VStack(alignment: .leading, spacing: NoopMetrics.cardInnerSpacing) {
-                weekNavBar
+                weekNavBar(digest: digest)
                 if digest.isEmpty {
                     // This particular week had no readings — keep the chevrons above so the user can move on.
                     DataPendingNote(
                         title: "No readings this week",
                         message: "Step to another week with the arrows above to see its review.")
                 } else {
-                    WeeklyDigestContent(digest: digest, compact: true)
+                    WeeklyDigestContent(digest: digest, compact: true, showsHeader: false)
+                        .padding(.top, NoopMetrics.space1)
+                    // Share this week's recap as an image. Renders the digest card (with its header) to a
+                    // PNG off-screen and hands it to the share sheet / Save panel — reuses TrendsReport's
+                    // ImageRenderer path. Only offered when the week actually holds data.
+                    NoopButton("Share recap", systemImage: "square.and.arrow.up", kind: .secondary) {
+                        let page = WeeklyDigestContent(digest: digest, compact: true, showsHeader: true)
+                            .frame(width: 380)
+                            .padding(24)
+                            .background(StrandPalette.surfaceBase)
+                            .environment(\.colorScheme, colorScheme)
+                        TrendsReportRenderer.exportPNG(page: page, suggestedName: "noop-recap-\(weekAnchorDay).png")
+                    }
                 }
             }
         }
@@ -358,9 +427,11 @@ struct TrendsView: View {
 
     /// Prev/next week stepper. Back is clamped at the earliest week we hold; forward is clamped at this
     /// week (no future weeks). Mirrors the FullDayChartView day stepper's flat accent chevrons (#597).
-    private var weekNavBar: some View {
+    private func weekNavBar(digest: WeeklyDigest) -> some View {
         let atOldest = weekOffset <= minWeekOffset
         let atNewest = weekOffset >= 0
+        let daysSummary = String(localized: "\(digest.daysWithData)/7 days")
+        let daysAccessibility = String(localized: "\(digest.daysWithData) of 7 days had data")
         return HStack(spacing: NoopMetrics.cardInnerSpacing) {
             Button { stepWeek(-1) } label: {
                 Image(systemName: "chevron.left").font(StrandFont.headline.weight(.semibold))
@@ -375,9 +446,15 @@ struct TrendsView: View {
                 Text(weekOffset == 0 ? String(localized: "This week") : weekOffsetLabel)
                     .font(StrandFont.headline)
                     .foregroundStyle(StrandPalette.textPrimary)
-                Text("Week in review")
-                    .strandOverline()
+                Text("\(weeklyDigestRangeLabel(digest)) · \(daysSummary)")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .accessibilityLabel("\(weeklyDigestRangeLabel(digest)), \(daysAccessibility)")
             }
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
             Spacer()
 
             Button { stepWeek(1) } label: {
@@ -412,7 +489,7 @@ struct TrendsView: View {
         let effortAvg = mean(effort.points)   // stored 0–100 internal Effort scale
         let restAvg = mean(rest.points)
         if chargeAvg != nil || effortAvg != nil || restAvg != nil {
-            NoopCard(tint: StrandPalette.chargeColor) {
+            NoopCard {
                 VStack(alignment: .leading, spacing: NoopMetrics.cardInnerSpacing) {
                     SectionHeader("Week in review", overline: "Charge · Effort · Rest")
                     if let v = chargeAvg {
@@ -513,10 +590,16 @@ struct TrendsView: View {
         let cap = recovery.caption
         let isWide = recovery.widened
         return VStack(alignment: .leading, spacing: NoopMetrics.space2) {
-            HStack {
-                SegmentedPillControl(Range.allCases, selection: $range) { $0.label }
-                Spacer()
-                Text(rangeSubtitle).strandOverline()
+            HStack(spacing: NoopMetrics.space2) {
+                // Six ranges plus the trailing-window caption need to share a compact iPhone row.
+                // Let the segmented control collapse to equal-width cells instead of squeezing the
+                // caption narrower than one word (which wrapped the final G in TRAILING by itself).
+                SegmentedPillControl(Range.allCases, selection: $range,
+                                     adaptsToAvailableWidth: true) { $0.label }
+                // Keep the caption's two lines internally leading-aligned, but anchor the whole
+                // caption column to the page's trailing edge.
+                Spacer(minLength: NoopMetrics.space2)
+                rangeCaption
             }
             Text(cap)
                 .font(StrandFont.footnote)
@@ -540,7 +623,6 @@ struct TrendsView: View {
             subtitle: rangeSubtitle,
             trailing: avg.map { "\(Int($0.rounded()))" },
             height: NoopMetrics.chartHeight,
-            tint: StrandPalette.chargeColor,
             chart: {
                 if pts.count >= 2 {
                     glowChart(points: pts,
@@ -599,7 +681,7 @@ struct TrendsView: View {
                     points: hrvPts,
                     gradient: gradient(StrandPalette.metricPurple),
                     tip: StrandPalette.metricPurple,
-                    tint: StrandPalette.chargeColor,
+                    tint: nil,
                     higherIsBetter: true,
                     range: valueRange(hrvPts, fallback: 20...120),
                     fmt: { "\(Int($0.rounded()))" }
@@ -611,7 +693,7 @@ struct TrendsView: View {
                     points: rhrPts,
                     gradient: gradient(StrandPalette.metricRose),
                     tip: StrandPalette.metricRose,
-                    tint: StrandPalette.chargeColor,
+                    tint: nil,
                     higherIsBetter: false,
                     range: valueRange(rhrPts, fallback: 40...80),
                     fmt: { "\(Int($0.rounded()))" }
@@ -647,7 +729,7 @@ struct TrendsView: View {
         subtitle: String? = nil,
         gradient: Gradient,
         tip: Color,
-        tint: Color,
+        tint: Color?,
         higherIsBetter: Bool?,
         range: ClosedRange<Double>,
         fmt: @escaping (Double) -> String
@@ -699,7 +781,7 @@ struct TrendsView: View {
             return RecoveryDay(date: dt, score: d.recovery)
         }
         let title = (range == .all && repo.days.count > 365) ? String(localized: "Charge (all history)") : String(localized: "Charge (past year)")
-        return NoopCard(tint: StrandPalette.chargeColor) {
+        return NoopCard {
             VStack(alignment: .leading, spacing: NoopMetrics.cardInnerSpacing) {
                 SectionHeader("\(title)", overline: "Calendar", trailing: String(localized: "\(recoveryDays.filter { $0.score != nil }.count) days"))
                 if recoveryDays.isEmpty {
@@ -717,13 +799,23 @@ struct TrendsView: View {
 
     private var legend: some View {
         HStack(spacing: NoopMetrics.space2) {
-            Text("Depleted").font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+            Text("Depleted")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .fixedSize()
             LinearGradient(gradient: StrandPalette.recoveryGradient, startPoint: .leading, endPoint: .trailing)
-                .frame(width: 120, height: 8)
+                .frame(maxWidth: .infinity)
+                .frame(height: NoopMetrics.indicatorTrackHeight)
                 .clipShape(Capsule())
-            Text("Peaked").font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
-            Spacer()
+                .accessibilityHidden(true)
+            Text("Peaked")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .fixedSize()
         }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Charge scale, depleted to peaked")
     }
 
     // MARK: Shared bits
@@ -760,7 +852,7 @@ struct TrendsView: View {
             .font(StrandFont.subhead)
             .foregroundStyle(StrandPalette.textTertiary)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(NoopPanelSurface(cornerRadius: 12))
     }
 }
 

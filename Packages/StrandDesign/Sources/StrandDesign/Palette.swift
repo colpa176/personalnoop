@@ -31,23 +31,42 @@ public extension Color {
     /// at every one of its call sites when the colour scheme flips — no per-view environment plumbing.
     /// This is the whole light-theme strategy: only the token definitions change, never the call sites.
     init(light: String, dark: String) {
+        // #2393: parse BOTH hexes ONCE, here, and let the provider pick between two ready tuples.
+        //
+        // The provider closure is not called once per token — it is called once per RESOLUTION, and the
+        // liquid layer resolves on every frame: `Color.liquidComponents()` asks for
+        // `NSColor(self).usingColorSpace(.sRGB)` (`LiquidCore.swift`), which re-invokes this closure,
+        // which used to run `trimmingCharacters` + `Scanner.scanHexInt64` over a string. A reporter
+        // profiling NOOP at a third to half a CPU core on macOS found `Color.sRGBComponents(hex:)` and
+        // `closure #1 in Color.init(light:dark:)` among the hot leaves (#2393).
+        //
+        // A cache would also have removed the cost, and a cache is the wrong shape for it: it needs a
+        // key, a lock (a dynamic provider can resolve off the main thread) and an eviction story, to
+        // re-derive per frame a value that cannot change after this line. The tokens are `static let`
+        // (`NoopVisualStyle`, `StrandPalette`), so this runs once per token for the life of the process.
+        // One declaration rather than two `let`s: watchOS resolves straight to the dark hex, so a separate
+        // `lightComponents` would be unused on that platform and warn. A pair that is always read as a
+        // whole has no such half.
+        let components = (light: Color.sRGBComponents(hex: light), dark: Color.sRGBComponents(hex: dark))
         #if os(watchOS)
         // watchOS has no UITraitCollection / dynamic-provider UIColor, and our watch app is effectively
         // always dark, so a token resolves straight to its dark hex. No per-scheme plumbing on the wrist.
-        self.init(hex: dark)
+        self.init(.sRGB, red: components.dark.r, green: components.dark.g,
+                  blue: components.dark.b, opacity: components.dark.a)
         #elseif canImport(UIKit)
         self.init(UIColor { trait in
-            let c = Color.sRGBComponents(hex: trait.userInterfaceStyle == .dark ? dark : light)
+            let c = trait.userInterfaceStyle == .dark ? components.dark : components.light
             return UIColor(red: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: CGFloat(c.a))
         })
         #elseif canImport(AppKit)
         self.init(nsColor: NSColor(name: nil) { appearance in
             let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            let c = Color.sRGBComponents(hex: isDark ? dark : light)
+            let c = isDark ? components.dark : components.light
             return NSColor(srgbRed: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: CGFloat(c.a))
         })
         #else
-        self.init(hex: dark)
+        self.init(.sRGB, red: components.dark.r, green: components.dark.g,
+                  blue: components.dark.b, opacity: components.dark.a)
         #endif
     }
 }
@@ -68,41 +87,58 @@ public enum StrandPalette {
 
     // MARK: Surfaces — deep navy canvas, tinted frosted cards
     // Background is a near-black navy (NOT pure black); cards float just above it.
-    public static let surfaceBase    = Color(light: "#F2F2F7", dark: "#121518") // WHOOP dark blue-grey canvas (sampled)
-    public static let surfaceRaised  = Color(light: "#FFFFFF", dark: "#25292C") // WHOOP grey list-card fill (sampled)
-    public static let surfaceOverlay = Color(light: "#FFFFFF", dark: "#1C1F26") // popovers / sheets / tooltips
-    public static let surfaceInset   = Color(light: "#E9E9EE", dark: "#1F2229") // wells / chart insets / segmented track
-    public static let hairline       = Color(light: "#D8D0BD", dark: "#21304A") // soft 1px border (stronger on light for card edges)
-    public static let hairlineStrong = Color(light: "#C7BCA4", dark: "#2E3C57") // hover / emphasis border
+    public static let surfaceBase    = NoopVisualStyle.canvas
+    public static let surfaceRaised  = NoopVisualStyle.surface
+    public static let surfaceOverlay = NoopVisualStyle.surfaceTop
+    public static let surfaceInset   = NoopVisualStyle.inset
+    public static let hairline       = NoopVisualStyle.border
+    public static let hairlineStrong = NoopVisualStyle.borderHighlight
 
     // MARK: Text — deep navy-ink on paper / cool off-white on navy
-    public static let textPrimary    = Color(light: "#1A2230", dark: "#F4F6F8")
-    public static let textSecondary  = Color(light: "#4C5564", dark: "#C8CFD8")
-    public static let textTertiary   = Color(light: "#7C8696", dark: "#8A94A4")
+    public static let textPrimary    = NoopVisualStyle.primaryText
+    public static let textSecondary  = NoopVisualStyle.secondaryText
+    public static let textTertiary   = NoopVisualStyle.tertiaryText
 
     // MARK: Text ON a permanently-dark surface (scheme-invariant)
     // Use these — NOT textPrimary/Secondary/Tertiary — for labels/pills drawn over a fill that is pinned
-    // dark in BOTH themes (e.g. the Liquid Today hero score card + session-start row, whose `heroFill` is
-    // a fixed near-black). The regular text tokens FLIP to dark ink in Light mode, so on a fixed-dark card
-    // they render dark-on-near-black and vanish (#1013). These hold the light-on-dark values in BOTH
-    // schemes, so a label always reads on the card. (Same hex as the *.dark side of the text tokens.)
+    // dark in BOTH themes (e.g. the over-sky ScreenScaffold title, on the time-of-day sky backdrop). The
+    // regular text tokens FLIP to dark ink in Light mode, so on a fixed-dark surface they render
+    // dark-on-near-black and vanish (#1013). These hold the light-on-dark values in BOTH schemes, so a
+    // label always reads. (The Liquid hero card USED to need these, but its `heroFill` is theme-aware as of
+    // #1160, so the hero now uses the normal text* tokens.)
     public static let onDarkPrimary   = Color(hex: "#F4F6F8")
     public static let onDarkSecondary = Color(hex: "#C8CFD8")
     public static let onDarkTertiary  = Color(hex: "#8A94A4")
 
-    // MARK: Glow — ambient bloom behind heroes / charts (additive on dark; faint warm on light)
-    public static let glowAmbient    = Color(light: "#F0E4C0", dark: "#3A2D0A")
+    // MARK: Liquid hero card surface (#1160/#1161)
+    // Was pinned near-black in BOTH themes, which read as a broken dark block in Light mode (#1160) and
+    // never honoured card transparency (#1161). Now THEME-AWARE: near-black in Dark, frosted white in
+    // Light, so the hero fits in with the other cards. Its own text uses the regular text*/tint tokens
+    // (which flip) — NOT onDark*, which stays fixed for the genuinely-always-dark SKY backdrop
+    // (ScreenScaffold's over-sky title). 8-digit hex = RRGGBBAA (alpha last).
+    public static let heroFill   = Color(light: "FFFFFFD9", dark: "0D0E14CC")
+    public static let heroBorder = Color(light: "0000001A", dark: "FFFFFF1C")
 
-    // MARK: Accent — chrome anchor (links, selection, focus, generic accent). On DARK this is the brand
-    // GOLD; on LIGHT it shifts to the deep brand BLUE so gold is reserved for the recovery/Charge world
-    // and the gold FAB — keeping the light theme from reading as wall-to-wall gold (the maintainer 2026-06-16).
-    public static let accent         = Color(light: "#234F9E", dark: "#60A0E0") // WHOOP link/action blue (gold killed 2026-06-22)
-    public static let accentHover    = Color(light: "#1C3F80", dark: "#8FBEEC")
-    public static let accentMuted    = Color(light: "#E4ECF6", dark: "#16233A") // selected-row tint (pale blue / dark blue)
-    /// Focus ring color (blue on both schemes — WHOOP has no gold).
-    public static let focusRing      = Color(light: "#2F6FCB", dark: "#60A0E0")
+    // MARK: Glow — ambient bloom behind heroes / charts (additive on dark; faint warm on light)
+    public static let glowAmbient    = NoopVisualStyle.mintGlow.opacity(0.28)
+
+    // MARK: Accent — chrome anchor (links, selection, focus, generic accent). USER-SELECTABLE (mint /
+    // WHOOP blue / custom) via `accentChoice` below, default mint (#1068). Only the chrome accent is
+    // user-themed — the recovery/strain/sleep DATA worlds follow `chartStyle`, never this.
+    /// The user's chrome-accent choice. Set from `@AppStorage(AccentColor.storageKey)` at the app root
+    /// via `.noopAccent(...)`; the four accessors below branch on it. Default mint.
+    public static var accentChoice: AccentColor = .mint
+    /// The custom accent's hex, used only when `accentChoice == .custom`. Set alongside `accentChoice`.
+    public static var customAccentHex: String = AccentColor.defaultCustomHex
+    public static var accent: Color { accentChoice.accent }
+    public static var accentHover: Color { accentChoice.accentHover }
+    public static var accentMuted: Color { accentChoice.accentMuted }
+    /// Focus ring color — the same accent, on both schemes.
+    public static var focusRing: Color { accentChoice.focusRing }
     /// Opacity for dimmed/disabled sections (shared so screens don't invent their own value).
     public static let disabledOpacity: Double = 0.45
+    /// Liquid-scene activity tint shared by heart-rate feedback and transient sync chrome.
+    public static let liquidHeart = Color(light: "#D94C64", dark: "#FF6B81")
 
     // MARK: - Chart style (data-viz colour mode) — Titanium (brand) or Classic (throwback)
     //
@@ -259,6 +295,16 @@ public enum StrandPalette {
     public static var restDeep: Color      { isClassic ? Color(light: "#203E73", dark: "#2A4C8F") : Color(light: "#234F9E", dark: "#2F6FCB") }
     public static var restBright: Color    { isClassic ? Color(light: "#6A4FC0", dark: "#8E6FD6") : Color(light: "#5790DA", dark: "#6FA8E8") }
     public static var restGlow: Color      { isClassic ? Color(light: "#3A80D6", dark: "#6FA8E8") : Color(light: "#3A80D6", dark: "#4A90E2") }
+    /// The Rest family's most legible LINE colour — for strokes that must read on a busy or translucent
+    /// surface, such as the body-clock dial's arcs over a custom background image.
+    ///
+    /// Introduces no new value: it selects the existing token that is the bright blue in each palette.
+    /// The families are not parallel — classic's `restBright` is a PURPLE accent while modern's is the
+    /// blue, and classic's `restColor` is the blue where modern's is a muted steel — so a card naming
+    /// either token directly gets the right colour in one palette and the wrong one in the other. Both
+    /// resolve to #6FA8E8 in dark.
+    public static var restLine: Color { isClassic ? restColor : restBright }
+
     public static var restGradient: Gradient { Gradient(colors: [restDeep, restBright]) }
 
     /// Stress — blue→gold→orange world / Classic green→amber→red.
@@ -358,6 +404,76 @@ public enum StrandPalette {
         case .light: return sleepLight
         case .deep:  return sleepDeep
         case .rem:   return sleepREM
+        }
+    }
+
+    // Brand sleep ramps for the two stepped-hypnogram styles, so the chart reads like the app it's modelled
+    // on. Ribbon = Oura's ramp (cream awake + blues, sampled from the ring's app); Filled = Garmin's
+    // (blue light/deep + magenta REM). Opt-in only (Sleep-tab stepped chart) — every other Hypnogram caller
+    // keeps `sleepStageColor`. (#sleep-chart-style)
+    //
+    // WHY THERE IS A LIGHT VARIANT. Both source apps are dark-tuned, so the ramps shipped flat — the same
+    // hex in both schemes. On the light card those bands are drawn on near-white (`NoopVisualStyle.surface`
+    // = #FFFFFF; a real Sleep-screen capture samples #FEFEFF), and measured there the Oura ramp collapses:
+    // three of its four bands fall under the 3:1 non-text minimum and `awake` #EAE3D3 sits at **1.28:1**,
+    // i.e. not drawn. That is not a rare band — on one real ring night awake was 64% of the chart.
+    //
+    // HOW THE LIGHT VALUES WERE DERIVED (not eyeballed, and not invented hues). Clamping each band on its
+    // own to 3:1 is the obvious fix and it BREAKS THE RAMP: Oura `rem` → #1E9EDD and `light` → #239FD5 land
+    // 1.00:1 apart, two adjacent stages the same colour. Instead ONE uniform HLS-lightness scale is applied
+    // per ramp, pinned so the ramp's lightest band reaches 3:1 on white — Oura ×0.575, Garmin ×0.912. Hue
+    // and saturation are untouched, so it is still recognisably the brand ramp; stage ORDERING survives;
+    // and the intra-ramp separation is no worse than the shipped dark ramp's (pinned in
+    // `BrandSleepRampTests`, twin `BrandSleepRampTest` on Android).
+    static let oSleepAwake = Color(light: BrandSleepRamp.ouraAwake.light, dark: BrandSleepRamp.ouraAwake.dark)
+    static let oSleepREM   = Color(light: BrandSleepRamp.ouraREM.light,   dark: BrandSleepRamp.ouraREM.dark)
+    static let oSleepLight = Color(light: BrandSleepRamp.ouraLight.light, dark: BrandSleepRamp.ouraLight.dark)
+    static let oSleepDeep  = Color(light: BrandSleepRamp.ouraDeep.light,  dark: BrandSleepRamp.ouraDeep.dark)
+    static let gSleepAwake = Color(light: BrandSleepRamp.garminAwake.light, dark: BrandSleepRamp.garminAwake.dark)
+    static let gSleepREM   = Color(light: BrandSleepRamp.garminREM.light,   dark: BrandSleepRamp.garminREM.dark)
+    static let gSleepLight = Color(light: BrandSleepRamp.garminLight.light, dark: BrandSleepRamp.garminLight.dark)
+    static let gSleepDeep  = Color(light: BrandSleepRamp.garminDeep.light,  dark: BrandSleepRamp.garminDeep.dark)
+
+    /// The brand ramps as hex PAIRS, so the properties above can be asserted in a test — a `SwiftUI.Color`
+    /// built from a dynamic provider cannot be read back, and these are also the values the Kotlin twin
+    /// must match byte for byte (`stageColorForBrand` in `SleepStageBreakdownUi.kt`). `.dark` is the
+    /// shipped ramp, unchanged.
+    enum BrandSleepRamp {
+        static let ouraAwake   = (light: "#AD9153", dark: "#EAE3D3")
+        static let ouraREM     = (light: "#1A8AC2", dark: "#90D0F0")
+        static let ouraLight   = (light: "#176B8E", dark: "#40B0E0")
+        static let ouraDeep    = (light: "#12374A", dark: "#206080")
+        static let garminAwake = (light: "#EF52E3", dark: "#F26FE8")
+        static let garminREM   = (light: "#D91EC7", dark: "#E22DD0")
+        static let garminLight = (light: "#3099F0", dark: "#4AA6F2")
+        static let garminDeep  = (light: "#2168C5", dark: "#2472D8")
+
+        /// Oura's ramp in STAGE order (awake → rem → light → deep), which is not the same as luminance
+        /// order — Garmin's `light` is lighter than its `rem`. What the light pass must preserve is each
+        /// ramp's OWN luminance order, whatever it is; that is what the tests assert.
+        static let oura   = [ouraAwake, ouraREM, ouraLight, ouraDeep]
+        /// Garmin's ramp in stage order.
+        static let garmin = [garminAwake, garminREM, garminLight, garminDeep]
+    }
+
+    /// A sleep-stage colour in a chosen ramp: NOOP's own tokens, Oura's (Ribbon), or Garmin's (Garmin Fill).
+    public static func sleepStageColor(_ stage: SleepStage, palette: SleepStagePalette) -> Color {
+        switch palette {
+        case .noop: return sleepStageColor(stage)
+        case .oura:
+            switch stage {
+            case .awake: return oSleepAwake
+            case .light: return oSleepLight
+            case .deep:  return oSleepDeep
+            case .rem:   return oSleepREM
+            }
+        case .garmin:
+            switch stage {
+            case .awake: return gSleepAwake
+            case .light: return gSleepLight
+            case .deep:  return gSleepDeep
+            case .rem:   return gSleepREM
+            }
         }
     }
 

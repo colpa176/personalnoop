@@ -52,7 +52,17 @@ data class UserProfile(
      * (the body term cancels out of the age formula). Default param so existing call-sites compile.
      */
     val waistCm: Double = 0.0,
-)
+) {
+    /**
+     * Every stored field, for a cache key that must change when the profile does (the per-cycle load cache,
+     * `IntelligenceEngine.loadCacheKey`). Named explicitly rather than read from the generated `toString`,
+     * which is not a contract. A new field belongs here too. Doubles by bit pattern, so the key is exact.
+     * Twin of Swift `UserProfile.cacheKey`.
+     */
+    val cacheKey: String
+        get() = "w=${weightKg.toRawBits()},h=${heightCm.toRawBits()},a=${age.toRawBits()},s=$sex," +
+            "t=${stepTicksPerStep.toRawBits()},waist=${waistCm.toRawBits()}"
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sleep staging output shapes (SleepStager.swift)
@@ -87,6 +97,16 @@ data class DetectedSleep(
     val restingHR: Int?,
     /** Mean RMSSD over 5-min windows across the session (ms), or null. */
     val avgHRV: Double?,
+    /**
+     * Staged WITHOUT a motion spine, from heart rate alone (#1801).
+     *
+     * True only for a strap that streams HR but banks no motion, where Stage 0's gravity-stillness spine
+     * has nothing to work with. Such a night is weaker by construction, not by tuning: with motion gone a
+     * quiet evening at rest can sit in the sleep band. It is allowed to describe itself — duration,
+     * stages, Rest — and must NOT reach anything it cannot be unwound from, which is why
+     * [restingHR] and [avgHRV] are left null on one rather than filtered out downstream.
+     */
+    val hrOnly: Boolean = false,
 )
 
 /**
@@ -144,6 +164,11 @@ data class ExerciseSession(
     val hrmaxSource: String,
     val caloriesKcal: Double?,
     val caloriesKJ: Double?,
+    /** #1545: how much of the bout the HR sensor actually saw, as a percentage of 60-second buckets that
+     *  contain at least one reading. null when not measured. A WHOOP 4.0's optical sensor is weak under
+     *  gripping — exactly what lifting is — so a low Effort has two very different causes: the metric not
+     *  rating the work, or the strap not having seen it. Those deserve opposite advice. */
+    val hrCoveragePct: Double? = null,
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,7 +279,7 @@ data class DayResult(
     /** Effort (strain) score [0,100] or null (insufficient HR samples / invalid HRR). */
     val strain: Double?,
     /**
-     * Rest (sleep_performance) composite [0,100] or null (no in-bed session). The persistence /
+     * Rest (sleep_performance) composite [0,100] or null (no asleep time). The persistence /
      * series layer stores this under the `sleep_performance` key. Replaces the bare efficiency
      * proxy (duration-vs-need 0.50 + efficiency 0.20 + restorative 0.20 + consistency 0.10).
      */
@@ -289,4 +314,25 @@ data class DayResult(
      * hypnogram. Empty on a WHOOP 4.0. Mirrors Swift `DayResult.sessionSleepStateByStart`. (#175)
      */
     val sessionSleepStateByStart: Map<Long, List<Int>> = emptyMap(),
+    /**
+     * Whether this day's on-device sleep staging ran on SPARSE motion coverage
+     * ([SleepStager.isGravitySparse], #345) — the same signal that downgrades Rest confidence. The caller
+     * stamps it onto each persisted `SleepSession.stagingSparse` so the Sleep tab can caption a possibly
+     * under-detected night ("slept 8h, shows 1h"). Transient (not persisted on DayResult itself). Mirrors
+     * the value Swift's `analyzeDay` writes directly onto its `CachedSleepSession.stagingSparse`.
+     */
+    val gravitySparse: Boolean = false,
+    /**
+     * #1545: where the detector lost every candidate workout on this day. null only when detection did not
+     * run. Always populated otherwise — including (especially) when [workouts] is empty, which is the case
+     * the counts exist to explain. Trailing + defaulted so every existing construction site is unchanged.
+     */
+    val detectionFunnel: WorkoutDetector.DetectionFunnel? = null,
+    /**
+     * The bounds of the day's MAIN-night group, the SAME `mainGroup` the sleep aggregates and the
+     * refused-main-night HRV rule use; empty when the day has no main night. Exposed so the `hrv diag` line
+     * can describe the night the #1118 gate actually judged instead of re-deriving it (#2425). Trailing +
+     * defaulted so every existing construction site is unchanged. Mirrors Swift `DayResult.mainNightBlocks`.
+     */
+    val mainNightBlocks: List<SleepStageTotals.NightBlock> = emptyList(),
 )

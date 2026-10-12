@@ -98,4 +98,47 @@ final class RawHistoryArchiveReplayTests: XCTestCase {
             // expected — bootstrapStore's catch leaves the gate un-advanced.
         }
     }
+
+    /// #649: locked/background BLE must be able to write rejects before acknowledging the strap trim, so the
+    /// archive directory + file carry after-first-unlock protection (matching the primary SQLite store),
+    /// not iOS's default complete protection which would fail a locked write.
+    ///
+    /// The chain this guards, as @tigercraft4 set it out in the original report: the reject archive lives
+    /// outside the `OpenWhoop` App Support tree, so it never inherited the `StorePaths` downgrade from #222;
+    /// `archiveRejectedFrames` has to succeed BEFORE the backfiller acks a historical-data trim; a write that
+    /// throws because the phone is locked holds the ack, so the strap re-sends the same chunk indefinitely.
+    /// There is no user-visible symptom beyond an offload that never seems to finish, which is why the
+    /// assertion is worth keeping rather than trusting the attribute to stay set.
+    ///
+    /// The iOS Simulator does not enforce data protection and may not report `.protectionKey` at all; when
+    /// it doesn't, the write-succeeded check above is all we can assert here, so skip rather than fail on a
+    /// platform that can't answer. On a real device (or a sim that does report it) the attribute is checked.
+    ///
+    /// The iOS gate is INSIDE the test rather than around it. `StrandTests` runs on the macOS scheme, so an
+    /// `#if os(iOS)` wrapper deleted this from the macOS report entirely and the missing iOS coverage looked
+    /// like no coverage at all. Skipping with a reason leaves a visible row instead. (@tigercraft4, #956)
+    func testArchiveAndDirectoryUseBackgroundReadableProtection() throws {
+        #if os(iOS)
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("noop-protection-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let archive = RawHistoryArchive(directory: dir)
+        let frame: [UInt8] = [0xAA, 0x01, 0x00, 0x00, 47, 25, 0x01]
+        guard case .written(count: 1) = archive.archive([frame], trim: 1, family: .whoop4) else {
+            return XCTFail("archive write should succeed")
+        }
+
+        let fm = FileManager.default
+        let expected = FileProtectionType.completeUntilFirstUserAuthentication
+        let directoryProtection = try fm.attributesOfItem(atPath: dir.path)[.protectionKey] as? FileProtectionType
+        let fileProtection = try fm.attributesOfItem(atPath: archive.fileURL.path)[.protectionKey] as? FileProtectionType
+        try XCTSkipIf(directoryProtection == nil && fileProtection == nil,
+                      "Data protection attributes are not reported on this platform (iOS Simulator).")
+        XCTAssertEqual(directoryProtection, expected)
+        XCTAssertEqual(fileProtection, expected)
+        #else
+        throw XCTSkip("File Data Protection is iOS-only; StrandTests runs on the macOS scheme.")
+        #endif
+    }
 }

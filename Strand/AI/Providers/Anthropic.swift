@@ -1,4 +1,5 @@
 import Foundation
+import StrandAnalytics
 
 struct AnthropicClient: AIProviderClient {
 
@@ -15,7 +16,9 @@ struct AnthropicClient: AIProviderClient {
         // Anthropic: system prompt is a top-level field, not a message role.
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 900,
+            // #1074: 900 truncated detailed coaching replies mid-sentence; 4096 lets a full multi-section
+            // reply complete (a cap, not a target — the system prompt keeps it short). Matches the others.
+            "max_tokens": 4096,
             "system": systemPrompt,
             "messages": wire
         ]
@@ -30,10 +33,47 @@ struct AnthropicClient: AIProviderClient {
         let json = try await performRequest(req, session: session)
         guard let content = json["content"] as? [[String: Any]],
               let first = content.first,
-              let text = first["text"] as? String else {
-            throw AICoachError.decode
+              let text = (first["text"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            throw emptyReplyError(json)   // #1074: surface the provider's real error if the 200 body has one
         }
         return text
+    }
+
+    /// K1: Stream via `stream: true`. Anthropic SSE uses typed events; we extract `content_block_delta`
+    /// with `text_delta` via `SseDeltas.anthropicDelta`. Byte-parity pin in
+    /// `SseDeltasTests.anthropicReassembleMatchesFullReply`.
+    func stream(
+        key: String,
+        model: String,
+        systemPrompt: String,
+        messages: [(role: ChatMessage.Role, content: String)],
+        session: URLSession,
+        onDelta: (String) -> Void
+    ) async throws {
+        var wire: [[String: Any]] = []
+        for m in messages { wire.append(["role": m.role.rawValue, "content": m.content]) }
+
+        let body: [String: Any] = [
+            "model": model,
+            "max_tokens": 4096,
+            "system": systemPrompt,
+            "messages": wire,
+            "stream": true
+        ]
+
+        var req = URLRequest(url: AIProvider.anthropic.endpoint)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        try await performStreamingRequest(req, session: session) { payload in
+            if let delta = SseDeltas.anthropicDelta(payload) {
+                onDelta(delta)
+            }
+        }
     }
 
     func fetchModels(key: String, session: URLSession) async throws -> [String] {

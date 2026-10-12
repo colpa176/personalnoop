@@ -1,11 +1,29 @@
 import XCTest
 @testable import Strand
+import StrandDesign
 
 /// Pins the suggestion catalogue (#714): the two new indoor presets exist, are spelled byte-for-byte
 /// the way Android persists them (the stored sport label round-trips cross-platform via CSV / export),
 /// and default GPS off (no route on a treadmill or a lifting session). Mirrors the Android
 /// WorkoutSportTest intent for the same two sports.
 final class WorkoutCatalogTests: XCTestCase {
+
+    /// Asked for by a user. The Swift catalogue carries no Health Connect type, so what is pinned here
+    /// is the label: it is the stored, cross-platform value and must read identically on Android.
+    func testNordicWalkingIsOffered() {
+        XCTAssertTrue(WorkoutCatalog.all.contains { $0.name == "Nordic walking" })
+    }
+
+    /// The WHOOP-parity batch. Labels only on this side, but they are the stored cross-platform value,
+    /// so a rename here silently splits one sport into two across the two apps.
+    func testWhoopParitySportsAreOffered() {
+        let names = Set(WorkoutCatalog.all.map(\.name))
+        for expected in ["Ballet", "Billiards", "Breakdancing", "Cheerleading", "Darts", "Disc golf",
+                         "Hurling/Camogie", "Jiu jitsu", "Judo", "Kiteboarding", "Motocross",
+                         "Muay Thai", "Paintball", "Parkour", "Polo", "Skydiving"] {
+            XCTAssertTrue(names.contains(expected), "missing \(expected)")
+        }
+    }
 
     func testTreadmillWalkPresetExistsWithGpsOff() {
         let s = WorkoutCatalog.sport(named: "Treadmill walk")
@@ -70,5 +88,25 @@ final class WorkoutCatalogTests: XCTestCase {
             return XCTFail("Bowling and Other must both be present")
         }
         XCTAssertLessThan(bowling, other, "Bowling extra must sit before the generic Other")
+    }
+
+    /// Iconography lockstep: every catalogue sport must resolve to a `KnownWorkoutType` with a unique
+    /// preferred glyph so the live-workout Liquid Glass control never shares icons across types.
+    func testCatalogueSportsHaveUniqueWorkoutTypeIcons() {
+        let catalogNames = WorkoutCatalog.all.map(\.name)
+        let knownNames = KnownWorkoutType.allCases.map(\.rawValue)
+        XCTAssertEqual(Set(catalogNames), Set(knownNames),
+                       "KnownWorkoutType raw values must match WorkoutCatalog.all names exactly")
+
+        var identities = Set<String>()
+        for sport in WorkoutCatalog.all {
+            guard let type = KnownWorkoutType.exact(matching: sport.name) else {
+                return XCTFail("No KnownWorkoutType for catalogue sport \(sport.name)")
+            }
+            let id = WorkoutTypeIconography.preferredIdentity(for: type)
+            XCTAssertFalse(identities.contains(id), "Duplicate icon \(id) for \(sport.name)")
+            identities.insert(id)
+        }
+        XCTAssertEqual(identities.count, WorkoutCatalog.all.count)
     }
 }

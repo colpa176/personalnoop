@@ -47,6 +47,10 @@ public struct OnboardingWizard: View {
     @State private var step: Step = .welcome
     @State private var glow = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Low Power Mode / "Reduce motion in NOOP" pose these looping glows still too. Onboarding is
+    /// first-run only, but a `repeatForever` is a `repeatForever` wherever it lives.
+    @ObservedObject private var motion = NoopMotionState.shared
+    private var poseStill: Bool { motion.poseStill(reduceMotion) }
 
     public var body: some View {
         ZStack {
@@ -91,7 +95,7 @@ public struct OnboardingWizard: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(StrandPalette.surfaceBase.ignoresSafeArea())
         // Reduce Motion: leave the ambient bloom at its resting frame (no breathing).
-        .onAppear { if !reduceMotion { glow = true } }
+        .onAppear { if !poseStill { glow = true } }
         // Isolated live observation — a hidden watcher slides Scan → celebration on bond
         // without subscribing the whole wizard to per-tick updates.
         .background(BondWatcher(onBonded: handleBond))
@@ -116,7 +120,7 @@ public struct OnboardingWizard: View {
             )
             .blendMode(.plusLighter)
             .opacity(glow ? 0.4 : 0.28)
-            .animation(StrandMotion.breathe(reduced: reduceMotion), value: glow)
+            .animation(StrandMotion.breathe(reduced: poseStill), value: glow)
             .ignoresSafeArea()
 
             // A faint indigo wash from the top — instrument-grade depth.
@@ -395,8 +399,7 @@ private struct ExpectationsStep: View {
                     }
                     .padding(14)
                     .frame(maxWidth: 520, alignment: .leading)
-                    .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
-                    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(StrandPalette.hairline))
+                    .background(NoopPanelSurface(cornerRadius: 14))
                     .opacity(shown ? 1 : 0)
                     .offset(y: shown ? 0 : 8)
                     .animation(StrandMotion.gentle.delay(Double(index) * 0.08), value: shown)
@@ -439,8 +442,7 @@ private struct ExpectationsStep: View {
         }
         .padding(14)
         .frame(maxWidth: 520, alignment: .leading)
-        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(StrandPalette.hairline))
+        .background(NoopPanelSurface(cornerRadius: 14))
     }
 }
 
@@ -449,6 +451,10 @@ private struct ExpectationsStep: View {
 private struct BluetoothStep: View {
     @State private var pulse = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Low Power Mode / "Reduce motion in NOOP" pose these looping glows still too. Onboarding is
+    /// first-run only, but a `repeatForever` is a `repeatForever` wherever it lives.
+    @ObservedObject private var motion = NoopMotionState.shared
+    private var poseStill: Bool { motion.poseStill(reduceMotion) }
     var body: some View {
         StepShell(title: String(localized: "A quick word before we connect"),
                   subtitle: String(localized: "\(Platform.deviceNoun) will ask for Bluetooth in a moment.")) {
@@ -482,7 +488,7 @@ private struct BluetoothStep: View {
                     .frame(maxWidth: 460)
             }
         }
-        .onAppear { if !reduceMotion { withAnimation(StrandMotion.breathe) { pulse = true } } }
+        .onAppear { if !poseStill { withAnimation(StrandMotion.breathe) { pulse = true } } }
     }
 }
 
@@ -709,8 +715,9 @@ private struct BondedStep: View {
     }
 
     private var batteryLine: String {
-        if let pct = live.batteryPct {
-            return String(localized: "Your strap is bonded · \(Int(pct))% battery.")
+        // Rounded through the shared seam so onboarding and the Devices card agree on one charge.
+        if let pct = LiveConsoleReadout.batteryPercent(activeIsWhoop: true, whoopPct: live.batteryPct, ringPct: nil) {
+            return String(localized: "Your strap is bonded · \(pct)% battery.")
         }
         return String(localized: "Your strap is bonded and ready to stream.")
     }
@@ -721,10 +728,17 @@ private struct BondedStep: View {
 private struct ProfileStep: View {
     @EnvironmentObject private var profile: ProfileStore
 
-    // Imperial/Metric display preference (D#103). The stored profile is always SI; the steppers keep
-    // operating in SI (0.5 kg / 1 cm) and only the DISPLAYED value re-labels to lb / ft-in.
+    // The stored profile is always SI. Body measurements and exercise distance can follow the regional
+    // conventions independently; an unset distance choice follows the body choice for compatibility.
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.distanceSystemKey) private var distanceSystemRaw = ""
     private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
+    private var distanceUnitSystem: UnitSystem {
+        UnitPrefs.resolveDistance(system: unitSystem, override: distanceSystemRaw)
+    }
+    private var distanceSystemBinding: Binding<String> {
+        Binding(get: { distanceUnitSystem.rawValue }, set: { distanceSystemRaw = $0 })
+    }
 
     private let sexes: [(String, String)] = [
         ("male", String(localized: "Male")), ("female", String(localized: "Female")),
@@ -761,16 +775,25 @@ private struct ProfileStep: View {
 
                         Divider().overlay(StrandPalette.hairline)
 
-                        // Units control (#781). Without this, onboarding read `unitSystemRaw` for the
-                        // Weight/Height display but had NO way to set it, so US users were locked to
-                        // kg/cm until they later found Settings → Units. Mirror the Sex picker idiom; the
-                        // stored profile stays SI either way, only the displayed labels re-format (lb / ft-in
-                        // via UnitFormatter). Same key (`units.system`) the Settings → Units card writes.
+                        // Keep the two choices explicit here: "Metric/Imperial" alone cannot describe
+                        // common mixed conventions such as Canadian pounds with kilometres.
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Units").strandOverline()
-                            Picker("Units", selection: $unitSystemRaw) {
+                            Text("Body measurements").strandOverline()
+                            Picker("Body measurements", selection: $unitSystemRaw) {
                                 Text("Metric").tag(UnitSystem.metric.rawValue)
                                 Text("Imperial").tag(UnitSystem.imperial.rawValue)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+
+                        Divider().overlay(StrandPalette.hairline)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Exercise distance & pace").strandOverline()
+                            Picker("Exercise distance & pace", selection: distanceSystemBinding) {
+                                Text("Kilometres").tag(UnitSystem.metric.rawValue)
+                                Text("Miles").tag(UnitSystem.imperial.rawValue)
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()
@@ -942,6 +965,10 @@ private struct ImportStep: View {
 private struct NotificationsStep: View {
     @State private var pulse = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Low Power Mode / "Reduce motion in NOOP" pose these looping glows still too. Onboarding is
+    /// first-run only, but a `repeatForever` is a `repeatForever` wherever it lives.
+    @ObservedObject private var motion = NoopMotionState.shared
+    private var poseStill: Bool { motion.poseStill(reduceMotion) }
     var body: some View {
         StepShell(title: String(localized: "Stay in the loop"),
                   subtitle: String(localized: "NOOP can tap your wrist when your \(Platform.deviceNoun) needs you. No glance at the screen required.")) {
@@ -994,7 +1021,7 @@ private struct NotificationsStep: View {
                 #endif
             }
         }
-        .onAppear { if !reduceMotion { withAnimation(StrandMotion.breathe) { pulse = true } } }
+        .onAppear { if !poseStill { withAnimation(StrandMotion.breathe) { pulse = true } } }
     }
 }
 
@@ -1104,6 +1131,11 @@ private struct StepShell<Content: View>: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 24)
         }
+        #if os(iOS)
+        // #697/#horizontal-swipe parity, see ScreenScaffold. First-run wizard, every step routes
+        // through this one shell, so a single fix here covers the whole onboarding flow.
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        #endif
     }
 }
 
@@ -1115,6 +1147,10 @@ private struct RadarSweep: View {
     @State private var angle: Double = 0
     @State private var ping = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Low Power Mode / "Reduce motion in NOOP" pose these looping glows still too. Onboarding is
+    /// first-run only, but a `repeatForever` is a `repeatForever` wherever it lives.
+    @ObservedObject private var motion = NoopMotionState.shared
+    private var poseStill: Bool { motion.poseStill(reduceMotion) }
 
     var body: some View {
         GeometryReader { geo in
@@ -1165,7 +1201,7 @@ private struct RadarSweep: View {
         .onChangeCompat(of: active) { isActive in
             if isActive { startSweep() }
         }
-        .animation(StrandMotion.breathe(reduced: reduceMotion), value: ping)
+        .animation(StrandMotion.breathe(reduced: poseStill), value: ping)
     }
 
     private func sweepWedge(size: CGFloat) -> some View {
@@ -1193,7 +1229,7 @@ private struct RadarSweep: View {
     private func startSweep() {
         // Reduce Motion: keep the wedge still (the static rings/crosshairs/blip
         // still convey "searching" / "found") instead of spinning forever.
-        guard !reduceMotion else { return }
+        guard !poseStill else { return }
         angle = 0
         withAnimation(.linear(duration: 2.4).repeatForever(autoreverses: false)) {
             angle = 360
@@ -1374,10 +1410,7 @@ private struct SecondaryButtonStyle: ButtonStyle {
             .foregroundStyle(StrandPalette.textPrimary)
             .padding(.vertical, 11)
             .padding(.horizontal, 18)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(StrandPalette.surfaceOverlay)
-            )
+            .background(NoopPanelSurface(cornerRadius: 12))
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .stroke(configuration.isPressed ? StrandPalette.hairlineStrong : StrandPalette.hairline, lineWidth: 1)

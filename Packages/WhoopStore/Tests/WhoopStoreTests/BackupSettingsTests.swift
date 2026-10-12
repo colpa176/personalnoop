@@ -17,9 +17,17 @@ final class BackupSettingsTests: XCTestCase {
             "profile.heightCm": 168.0,
             "profile.waistCm": 71.0,
             "profile.hrMax": 191,
+            "profile.hrZoneThresholds": "95,118,142,168,184",
             "units.system": "imperial",
+            "units.distance": "metric",
             "units.temperature": "celsius",
             "effort.scale": "whoop",
+            "dayCycle.mode": "sleep_onset",
+            // #today-hosted-cards: the one layout pref carried, a JSON [String] stored under the String kind.
+            "today.hostedCards": "[\"sleep.sleepMarks\"]",
+            // #1361: custom journal behaviours, a newline-joined name list — the embedded newline must
+            // survive the JSON round-trip (and stay byte-identical to Android's pref value).
+            "journal.customBehaviors": "Cold plunge\nMagnesium",
         ]
         let data = try XCTUnwrap(BackupSettings.encode(values))
         let back = BackupSettings.decode(data)
@@ -30,9 +38,14 @@ final class BackupSettingsTests: XCTestCase {
         XCTAssertEqual(back["profile.heightCm"] as? Double, 168.0)
         XCTAssertEqual(back["profile.waistCm"] as? Double, 71.0)
         XCTAssertEqual(back["profile.hrMax"] as? Int, 191)
+        XCTAssertEqual(back["profile.hrZoneThresholds"] as? String, "95,118,142,168,184")
         XCTAssertEqual(back["units.system"] as? String, "imperial")
+        XCTAssertEqual(back["units.distance"] as? String, "metric")
         XCTAssertEqual(back["units.temperature"] as? String, "celsius")
         XCTAssertEqual(back["effort.scale"] as? String, "whoop")
+        XCTAssertEqual(back["dayCycle.mode"] as? String, "sleep_onset")
+        XCTAssertEqual(back["today.hostedCards"] as? String, "[\"sleep.sleepMarks\"]")
+        XCTAssertEqual(back["journal.customBehaviors"] as? String, "Cold plunge\nMagnesium")
         XCTAssertEqual(back.count, values.count, "Nothing extra should appear")
     }
 
@@ -106,12 +119,14 @@ final class BackupSettingsTests: XCTestCase {
         defaults.set(82.5, forKey: "profile.weightKg")
         defaults.set(198, forKey: "profile.hrMaxOverride") // storage key, not the canonical name
         defaults.set("imperial", forKey: "units.system")
+        defaults.set("metric", forKey: "units.distance")
 
         let snap = BackupSettings.snapshot(from: defaults)
         XCTAssertEqual(snap["profile.age"] as? Int, 29)
         XCTAssertEqual(snap["profile.weightKg"] as? Double, 82.5)
         XCTAssertEqual(snap["profile.hrMax"] as? Int, 198, "hrMaxOverride surfaces under the canonical key")
         XCTAssertEqual(snap["units.system"] as? String, "imperial")
+        XCTAssertEqual(snap["units.distance"] as? String, "metric")
         XCTAssertNil(snap["profile.heightCm"], "Never-set keys are omitted, not defaulted")
         XCTAssertNil(snap["profile.sex"])
     }

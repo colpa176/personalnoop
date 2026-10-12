@@ -1,6 +1,7 @@
 import SwiftUI
 import StrandDesign
 import StrandAnalytics
+import StrandImport
 import WhoopStore
 import Foundation
 #if canImport(MapKit)
@@ -34,7 +35,12 @@ struct WorkoutDetailView: View {
     @Environment(\.dismiss) private var dismiss
 
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
-    private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
+    @AppStorage(UnitPrefs.distanceSystemKey) private var distanceSystemRaw = ""
+    private var distanceUnitSystem: UnitSystem {
+        UnitPrefs.resolveDistance(
+            system: UnitSystem(rawValue: unitSystemRaw) ?? .metric,
+            override: distanceSystemRaw)
+    }
 
     @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
     private var effortScale: EffortScale { UnitPrefs.resolveEffortScale(effortScaleRaw) }
@@ -54,6 +60,9 @@ struct WorkoutDetailView: View {
     /// The GPS route captured for this session on-device (#524), if any. Decoded from `RouteStore` by the
     /// row's natural key. nil = no route was recorded (honest — the map only shows when points exist).
     @State private var route: [RouteMath.LatLng] = []
+
+    /// Drives the GPX/FIT export chooser for the recorded route.
+    @State private var showRouteExport = false
 
     /// Steps over the session window for an on-foot sport (#398): the count plus whether it came from the
     /// strap's own counter (MG/5.0) or the phone pedometer (fallback for WHOOP 4.0 / not-yet-synced / CSV
@@ -123,7 +132,7 @@ struct WorkoutDetailView: View {
             }
         }
         if minutes == nil {
-            minutes = await repo.workoutZoneMinutes(from: row.startTs, to: row.endTs, age: profile.age,
+            minutes = await repo.workoutZoneMinutes(from: row.startTs, to: row.endTs, zoneSet: profile.hrZoneSet,
                                                     source: row.source)
         }
 
@@ -276,7 +285,7 @@ struct WorkoutDetailView: View {
     @ViewBuilder private var routeCard: some View {
         if route.count >= 2 {
             VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-                SectionHeader("Route", overline: "Recorded on device",
+                SectionHeader("Route", overline: routeOriginLabel,
                               trailing: distanceLabel(row.distanceM))
                 NoopCard(padding: 0, tint: StrandPalette.effortColor) {
                     VStack(alignment: .leading, spacing: 0) {
@@ -294,11 +303,48 @@ struct WorkoutDetailView: View {
                         .padding(NoopMetrics.cardPadding)
                     }
                 }
-                Text("Your GPS route for this session, recorded and stored on your device. Nothing leaves your phone.")
+                Text(routeDescription)
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Button {
+                    showRouteExport = true
+                } label: {
+                    Label("Export route", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(NoopButtonStyle(.secondary, fullWidth: true))
+                .confirmationDialog("Export route", isPresented: $showRouteExport, titleVisibility: .visible) {
+                    Button("GPX — Strava, Garmin, most apps") { exportRoute(.gpx) }
+                    Button("FIT — Garmin Connect") { exportRoute(.fit) }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Save this route as a standard file you can import into Strava, Garmin Connect, and other apps.")
+                }
             }
+        }
+    }
+
+    /// Write the route to a GPX/FIT file and hand it to the system share sheet (or a Save panel on macOS).
+    /// Points are decoded lat/lon only (the stored polyline), so the exporter interpolates per-point times
+    /// across the session window and carries the workout's summary (sport, distance, calories, HR).
+    ///
+    /// The build + disk write run OFF the main actor (a long route is a non-trivial encode, and blocking
+    /// file IO must never stall the UI); only the share-sheet present hops back to the main actor.
+    @MainActor private func exportRoute(_ format: RouteExporter.Format) {
+        guard route.count >= 2 else { return }
+        let points = route.map { RoutePoint(lat: $0.lat, lon: $0.lon) }
+        // Name the file by the workout's start (not export time) so it's stable + matches the Android twin.
+        let name = "noop-route-\(row.startTs).\(format.ext)"
+        let startTs = row.startTs, endTs = row.endTs, sport = row.sport
+        let distanceM = row.distanceM, energyKcal = row.energyKcal, avgHr = row.avgHr, maxHr = row.maxHr
+        Task.detached(priority: .userInitiated) {
+            let data = RouteExporter.render(
+                format, route: points, startTs: startTs, endTs: endTs, sport: sport,
+                distanceM: distanceM, energyKcal: energyKcal, avgHr: avgHr, maxHr: maxHr)
+            let url = NoopScratch.file(name)
+            do { try data.write(to: url) } catch { return }
+            await MainActor.run { FileExport.exportFile(at: url, suggestedName: name) }
         }
     }
 
@@ -320,17 +366,40 @@ struct WorkoutDetailView: View {
         let secs = row.durationS ?? Double(row.endTs - row.startTs)
         guard secs > 0 else { return "–" }
         let km = m / 1000.0
-        let (perUnit, label): (Double, String) = unitSystem == .imperial
-            ? (km * UnitFormatter.milesPerKilometer, "/mi")
-            : (km, "/km")
-        guard perUnit > 0 else { return "–" }
-        let secsPerUnit = Int((secs / perUnit).rounded())
-        return "\(secsPerUnit / 60):\(String(format: "%02d", secsPerUnit % 60)) \(label)"
+        return UnitFormatter.paceFromSecPerKm(secs / km, system: distanceUnitSystem)
     }
 
     private var routeAccessibilityLabel: String {
         let dist = distanceLabel(row.distanceM)
         return String(localized: "Map of your \(WorkoutSource.displaySport(row.sport)) route, \(dist).")
+    }
+
+    /// #1205: the route card's overline and description must be honest about where the route came
+    /// from. An on-device recorded route says "Recorded on device"; an imported route (Apple Health
+    /// or Health Connect) says "Imported from Apple Health" / "Imported" so the user is not told
+    /// their phone recorded GPS data that actually came from another app.
+    private var routeOriginLabel: LocalizedStringKey {
+        switch WorkoutSource.classify(row.source) {
+        // "Imported" rather than naming the app: every string here is one the catalog already carries in
+        // all nine locales, so the honesty fix ships translated on day one. A source-specific variant
+        // ("Imported from Apple Health") would be a NEW key, and nothing catches a missing entry: the i18n
+        // audit checks locale coverage OF catalog entries, not that a `String(localized:)` literal has one.
+        // It would have read English on every non-English device while the gate stayed green.
+        case .apple, .whoop, .lifting, .activityFile: return "Imported"
+        case .detected, .manual: return "Recorded on device"
+        }
+    }
+
+    private var routeDescription: String {
+        switch WorkoutSource.classify(row.source) {
+        // Same rule as the overline: both of these are existing catalog keys with all nine locales. The
+        // imported line carries the privacy claim without the "recorded on your device" the original
+        // string opens with, which is the part that was untrue for a route another app collected.
+        case .apple, .whoop, .lifting, .activityFile:
+            return String(localized: "This stays on your device. It is never uploaded, never synced, never shared.")
+        case .detected, .manual:
+            return String(localized: "Your GPS route for this session, recorded and stored on your device. Nothing leaves your phone.")
+        }
     }
 
     // MARK: - HR curve
@@ -354,7 +423,8 @@ struct WorkoutDetailView: View {
                         showsArea: true,
                         valueFormat: { String(localized: "\(Int($0.rounded())) bpm") },
                         dateFormat: { Self.tooltipTime.string(from: $0) },
-                        accessibilityLabel: String(localized: "Heart rate during \(WorkoutSource.displaySport(row.sport))")
+                        accessibilityLabel: String(localized: "Heart rate during \(WorkoutSource.displaySport(row.sport))"),
+                        workoutTimeAxis: Date(timeIntervalSince1970: TimeInterval(row.startTs))...Date(timeIntervalSince1970: TimeInterval(row.endTs))
                     )
                 } footer: {
                     ChartFooter([
@@ -532,18 +602,12 @@ struct WorkoutDetailView: View {
         f.dateFormat = "EEEE d MMM yyyy"
         return f
     }()
-    private static let timeFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale.current
-        f.setLocalizedDateFormatFromTemplate("jmm")
-        return f
-    }()
-    private static let tooltipTime: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale.current
-        f.setLocalizedDateFormatFromTemplate("jmm")
-        return f
-    }()
+    /// #1821: routed through AppClock so the Clock format setting reaches this label. Was a `static
+    /// let`, which would have frozen the reader's choice at first use until the app relaunched.
+    private static var timeFmt: DateFormatter { AppClock.hourMinuteFormatter() }
+    /// #1821: routed through AppClock so the Clock format setting reaches this label. Was a `static
+    /// let`, which would have frozen the reader's choice at first use until the app relaunched.
+    private static var tooltipTime: DateFormatter { AppClock.hourMinuteFormatter() }
 
     private func dateLabel(_ ts: Int) -> String {
         Self.dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
@@ -563,7 +627,7 @@ struct WorkoutDetailView: View {
     }
     private func distanceLabel(_ m: Double?) -> String {
         guard let m, m > 0 else { return "–" }
-        return UnitFormatter.distanceFromMeters(m, system: unitSystem)
+        return UnitFormatter.distanceFromMeters(m, system: distanceUnitSystem)
     }
     private func grouped(_ v: Double) -> String {
         Self.intFmt.string(from: NSNumber(value: Int(v.rounded()))) ?? "\(Int(v.rounded()))"
@@ -679,7 +743,7 @@ struct WorkoutRouteMap: View {
             endTs: Int(Date().timeIntervalSince1970),
             sport: "Running", source: "whoop", durationS: 3600, energyKcal: 712,
             avgHr: 152, maxHr: 178, strain: 14.2, distanceM: 10_400,
-            zonesJSON: #"{"z1":12.5,"z2":28.0,"z3":33.5,"z4":18.0,"z5":6.0}"#, notes: nil))
+            zonesJSON: #"{"z1":12.5,"z2":28.0,"z3":33.5,"z4":18.0,"z5":6.0}"#, notes: nil, steps: nil))
             .environmentObject(Repository(deviceId: "preview"))
     }
     .frame(width: 1040, height: 940)

@@ -1,6 +1,7 @@
 package com.noop.ui
 
 import org.json.JSONArray
+import com.noop.analytics.SleepStageVocabulary
 
 /** One persisted per-epoch stage segment (wall-clock unix seconds). */
 internal data class PersistedSegment(val start: Long, val end: Long, val stage: String)
@@ -37,6 +38,36 @@ internal fun parsePersistedSegments(json: String?): List<PersistedSegment>? {
 /** One contiguous run of a single sleep stage, in seconds from the night's onset. */
 internal data class StageInterval(val stage: String, val startSec: Double, val endSec: Double) {
     val durationSec: Double get() = endSec - startSec
+}
+
+/** What the hypnogram scrub is pointing at: the stage under the finger and its clock time. */
+internal data class ScrubHit(val stage: String, val timestamp: Long)
+
+/**
+ * Resolve a scrub x on the FILLED hypnogram into a stage and a real clock time (#1855).
+ *
+ * Valid here in a way it would NOT be on the proportional strip. `FilledHypnogram` positions every
+ * segment by `xOf(sec) = w * (sec / spanSec)` — linear in real time — from persisted per-epoch
+ * segments that carry their own start and end. So inverting x gives a timestamp the night actually
+ * had. The proportional strip is a different thing: it arranges stage TOTALS in a fixed
+ * light/deep/light/rem/light/awake order that is not the chronology, so a clock time read off it
+ * would be invented. That is why the scrub lives here and not there.
+ *
+ * The stage comes from containment on the real intervals rather than from the x fraction, so a gap
+ * the stager left unlabelled reports no stage instead of borrowing its neighbour's.
+ */
+internal fun scrubHitAt(
+    xPx: Float,
+    widthPx: Float,
+    intervals: List<StageInterval>,
+    originSec: Double,
+    spanSec: Double,
+): ScrubHit? {
+    if (widthPx <= 0f || spanSec <= 0.0 || intervals.isEmpty()) return null
+    val frac = (xPx / widthPx).coerceIn(0f, 1f).toDouble()
+    val sec = frac * spanSec
+    val stage = intervals.firstOrNull { sec >= it.startSec && sec <= it.endSec }?.stage.orEmpty()
+    return ScrubHit(stage = stage, timestamp = (originSec + sec).toLong())
 }
 
 /**
@@ -130,8 +161,10 @@ internal fun displaySmoothed(
  *  repeating the rule, so adding an alias here is all that is needed. Written as code rather than a
  *  KDoc link because the target is private in another file and would not resolve. */
 internal fun canonicalStage(name: String): String {
+    // #979: the alias rule has ONE definition — SleepStageVocabulary. This still folds toward
+    // "awake" because that is the key the stage-colour table and the minutes dictionaries use.
     val n = name.trim().lowercase()
-    return if (n == "wake") "awake" else n
+    return if (SleepStageVocabulary.isWake(n)) "awake" else n
 }
 
 /**

@@ -75,6 +75,18 @@ struct BackupSyncView: View {
                 Text("Tip: choose a folder in iCloud Drive and your backups sync to all your Apple devices automatically, no account setup needed.")
                     .font(StrandFont.caption).foregroundStyle(StrandPalette.accent)
                     .fixedSize(horizontal: false, vertical: true)
+                // #644: these .noopbak snapshots are a plain, unencrypted ZIP — pointing this folder at
+                // a cloud sync app (per the tip above) also uploads that readable file there. Say so
+                // plainly next to the folder picker, before anyone turns auto-backup on.
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(StrandPalette.statusWarning)
+                        .font(.system(size: 12))
+                        .accessibilityHidden(true)
+                    Text("These backups are unencrypted too. If this folder syncs to Drive, Dropbox or iCloud, the readable file goes there as well — only point it at a service you trust.")
+                        .font(StrandFont.caption).foregroundStyle(StrandPalette.statusWarning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 NoopButton(folderLabel == nil ? "Choose folder" : "Change folder",
                            systemImage: "folder", kind: .secondary) { chooseFolder() }
                     .disabled(busy)
@@ -127,6 +139,24 @@ struct BackupSyncView: View {
                 }
                 Text(lastMs > 0 ? "Last backup: \(relativeTime(lastMs))" : "No backup yet.")
                     .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                // Auto is ON but the last SUCCESSFUL backup is stale — the on-launch catch-up isn't landing
+                // (a moved/disconnected cloud folder stops backups silently, or NOOP hasn't been opened).
+                // Surface it so a silently-failing auto-backup is visible, not discovered only at restore.
+                // `lastMs > 0` excludes the never-backed-up state (the "No backup yet." line above owns that,
+                // and it would otherwise false-fire the moment auto is switched on, before the first backup).
+                if auto, folderLabel != nil, lastMs > 0,
+                   BackupSync.isBackupStale(lastBackupMs: lastMs,
+                                            nowMs: Int(Date().timeIntervalSince1970 * 1000.0)) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(StrandPalette.statusWarning)
+                            .font(.system(size: 12))
+                            .accessibilityHidden(true)
+                        Text("Auto-backup hasn't run in a few days. Check the backup folder is still available — a moved or disconnected cloud folder stops backups silently.")
+                            .font(StrandFont.caption).foregroundStyle(StrandPalette.statusWarning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 NoopButton(busy ? "Working…" : "Back up now",
                            systemImage: "icloud.and.arrow.up", kind: .primary, fullWidth: true) { backupNow() }
                     .disabled(folderLabel == nil || busy)
@@ -156,16 +186,22 @@ struct BackupSyncView: View {
         #if os(macOS)
         if FolderBackup.pickFolder() != nil { folderLabel = FolderBackup.folderLabel() }
         #else
-        // #1000a: on iOS the folder picker has reportedly refused to enable its Select button, leaving
-        // the user with only Cancel and NOOP silently doing nothing. We can't tell a deliberate Cancel
-        // apart from that dead-button dead-end (both come back nil), so when no folder arrives we show
-        // the screen's normal result alert with a concrete workaround instead of staying silent. Mildly
-        // chatty on a genuine Cancel; honest and actionable when the picker is actually broken.
+        // #1000a assumed the iOS picker was refusing to ENABLE its Select button, leaving the user with
+        // only Cancel. #2356 disproved that for at least one case: a reporter's log shows the delegate
+        // firing after they picked an iCloud folder and pressed Open, so the button worked and iOS
+        // declined the grant instead. Both still arrive here as nil, and UIKit gives us nothing to tell
+        // them apart, which is exactly why the alert below describes the outcome rather than a cause.
+        // Keep it that way: the previous guess is what sent the last investigation at the wrong failure.
+        // Mildly chatty on a genuine Cancel; honest and actionable whenever no folder comes back.
         // `busy` guards against a double-tap stacking a second picker presentation on top of the first.
         busy = true
         Task {
+            // Clear in a `defer` so it clears on ANY exit. It matters more here than elsewhere: every
+            // control on this screen is `.disabled(busy)`, so a pick that never returned wedged the whole
+            // screen — including the "Use NOOP's own folder" escape hatch. DocumentPicker now guarantees
+            // the continuation resumes, but the flag must not depend on that promise holding.
+            defer { busy = false }
             let picked = await FolderBackup.pickFolder()
-            busy = false
             if picked != nil {
                 folderLabel = FolderBackup.folderLabel()
             } else if !FolderBackup.useInternalFolder {
@@ -195,10 +231,10 @@ struct BackupSyncView: View {
     private func backupNow() {
         busy = true
         Task {
+            defer { busy = false }   // any exit, incl. cancellation — see chooseFolder
             let ok = await FolderBackup.backupNow(checkpoint: { await model.repo.checkpointForBackup() })
             await MainActor.run {
                 lastMs = FolderBackup.lastBackupMs
-                busy = false
                 alertTitle = ok ? String(localized: "Backed up") : String(localized: "Backup problem")
                 alertMessage = ok
                     ? String(localized: "Saved a backup to your folder.")
@@ -223,20 +259,27 @@ struct BackupSyncView: View {
         pendingRestore = nil
         busy = true
         Task {
+            defer { busy = false }   // any exit, incl. cancellation — see chooseFolder
             // The restore is synchronous file I/O; run it off the main actor so the UI stays responsive
             // for a large store, then report on the main actor.
             let result = await Task.detached(priority: .userInitiated) {
                 FolderBackup.restore(snapshotNamed: snap.name)
             }.value
             await MainActor.run {
-                busy = false
                 switch result {
                 case .imported:
                     alertTitle = String(localized: "Restored")
                     alertMessage = String(localized: "Fully quit and reopen NOOP to load it.")
                 case .failure(let m):
                     alertTitle = String(localized: "Restore problem"); alertMessage = m
-                case .cancelled, .exported:
+                case .restoreTooLarge(let name, let limit):
+                    // #1807: recoverable, but not from here — this view restores a snapshot directly and
+                    // has no confirm step to hang the override on. Point at the path that does, rather
+                    // than leaving the user with a refusal and nowhere to go.
+                    let cap = ByteCountFormatter.string(fromByteCount: limit, countStyle: .file)
+                    alertTitle = String(localized: "Backup problem")
+                    alertMessage = String(localized: "\(name) is larger than the \(cap) NOOP restores without asking. You can still restore it from Settings → Backup & restore → Import, which will ask you to confirm.")
+                case .cancelled, .exported, .exportedOversize:
                     alertTitle = String(localized: "Restore problem"); alertMessage = String(localized: "Couldn't restore that backup.")
                 }
                 showAlert = true
@@ -253,6 +296,8 @@ struct BackupSyncView: View {
 
     private func absoluteTime(_ ms: Int) -> String {
         let f = DateFormatter()
+        // #1821: localized DATE style untouched; only the hour cycle is the reader's.
+        f.locale = AppClock.formattingLocale
         f.dateStyle = .medium
         f.timeStyle = .short
         return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000.0))
@@ -296,6 +341,16 @@ private struct RestorePickerSheet: View {
                 }
             }
         }
+        // A macOS `.sheet` sizes to its content's ideal height, and a `List` inside a `NavigationStack`
+        // reports a near-zero intrinsic height there — so without an explicit frame the sheet collapses
+        // to just the title + Cancel and clips every row, leaving the user an empty "Choose a backup"
+        // with backups that ARE in the folder (the caller only opens this sheet when the list is
+        // non-empty). Give it a real size, the same way `AddDeviceWizard`/`HealthView` frame their macOS
+        // sheets with a fixed size. iOS/iPadOS sheets already take a sensible height, so the frame is
+        // macOS-only. A longer backup list scrolls within the List; a short one leaves trailing space. (#1093)
+        #if os(macOS)
+        .frame(width: 460, height: 420)
+        #endif
     }
 
     /// The row's headline: a friendly date when we resolved one, else the filename (never the epoch date).
@@ -311,6 +366,9 @@ private struct RestorePickerSheet: View {
 
     private func absoluteTime(_ ms: Int) -> String {
         let f = DateFormatter()
+        // #1821: localized DATE style untouched; only the hour cycle is the reader's. Second copy of
+        // this helper in the file - a single-shot replace fixed only the first, which the sweep caught.
+        f.locale = AppClock.formattingLocale
         f.dateStyle = .medium
         f.timeStyle = .short
         return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000.0))

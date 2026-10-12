@@ -27,8 +27,6 @@ public struct ChartTooltip: View {
     /// gradient colour for that datum) so the tooltip explains the colour.
     public var accent: Color?
 
-    @Environment(\.colorScheme) private var scheme
-
     public init(value: String, label: String? = nil, accent: Color? = nil) {
         self.value = value
         self.label = label
@@ -57,16 +55,7 @@ public struct ChartTooltip: View {
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(StrandPalette.surfaceOverlay)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(StrandPalette.hairlineStrong, lineWidth: 1)
-        )
-        .shadow(color: scheme == .light ? Color(hex: "#1A2230").opacity(0.18) : Color.black.opacity(0.45),
-                radius: scheme == .light ? 8 : 10, x: 0, y: scheme == .light ? 4 : 6)
+        .background(NoopPanelSurface(cornerRadius: 8, elevated: true))
         .fixedSize()
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label != nil ? "\(value), \(label!)" : value)
@@ -139,12 +128,20 @@ public enum ChartHoverMath {
 
 /// A thin vertical crosshair line drawn at a given x with a hairline-strong
 /// stroke. Shared by TrendChart / Sparkline so the rule reads identically.
-struct CrosshairRule: View {
-    var x: CGFloat
-    var height: CGFloat
-    var color: Color = StrandPalette.hairlineStrong
+/// `public`: app-target chart types outside this package (WorkoutRecoveryTrendChart, TrainingLoadCard,
+/// LiveTimeChart) reuse this instead of hand-rolling their own crosshair.
+public struct CrosshairRule: View {
+    public var x: CGFloat
+    public var height: CGFloat
+    public var color: Color
 
-    var body: some View {
+    public init(x: CGFloat, height: CGFloat, color: Color = StrandPalette.hairlineStrong) {
+        self.x = x
+        self.height = height
+        self.color = color
+    }
+
+    public var body: some View {
         Path { p in
             p.move(to: CGPoint(x: x, y: 0))
             p.addLine(to: CGPoint(x: x, y: height))
@@ -160,11 +157,17 @@ struct CrosshairRule: View {
 // MARK: - Highlighted point dot
 
 /// A small accented dot used to mark the highlighted sample on a line.
-struct HighlightDot: View {
-    var color: Color
-    var diameter: CGFloat = 9
+/// `public`: shared with app-target chart hover overlays — see `CrosshairRule`.
+public struct HighlightDot: View {
+    public var color: Color
+    public var diameter: CGFloat
 
-    var body: some View {
+    public init(color: Color, diameter: CGFloat = 9) {
+        self.color = color
+        self.diameter = diameter
+    }
+
+    public var body: some View {
         // Design Reset (WHOOP): a crisp solid dot with a clean surface ring, no blurred bloom halo.
         ZStack {
             Circle()
@@ -200,14 +203,21 @@ struct NowCapDot: View {
 
 /// Wraps a tooltip so its measured size feeds back into placement. Fades in
 /// with StrandMotion and positions itself within `container` near `anchor`.
-struct PositionedTooltip: View {
-    var anchor: CGPoint
-    var container: CGSize
-    var tooltip: ChartTooltip
+/// `public`: shared with app-target chart hover overlays — see `CrosshairRule`.
+public struct PositionedTooltip: View {
+    public var anchor: CGPoint
+    public var container: CGSize
+    public var tooltip: ChartTooltip
 
     @State private var measured: CGSize = .zero
 
-    var body: some View {
+    public init(anchor: CGPoint, container: CGSize, tooltip: ChartTooltip) {
+        self.anchor = anchor
+        self.container = container
+        self.tooltip = tooltip
+    }
+
+    public var body: some View {
         tooltip
             .background(
                 GeometryReader { g in

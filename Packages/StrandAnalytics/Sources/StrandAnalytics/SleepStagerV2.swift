@@ -5,7 +5,8 @@ import WhoopProtocol
 // percentile-band stager `SleepStager` (V1) after a 44-subject cross-subject benchmark; V1 stays available
 // behind the PuffinExperiment flag.
 //
-// Reimplemented clean from the contributor recipe in NoopApp/noop PR #600 (sunny-noop). We took only the
+// Reimplemented clean from @sunny-noop's contributor recipe (pre-fork PR #600 — NOT this repo's #600,
+// which is an iOS notification). We took only the
 // per-session STAGING engine, not the CLI runner the PR shipped with it. Session DETECTION (the in-bed
 // `[start, end]` spans) still comes entirely from V1 — this file only re-stages a window someone already
 // decided is sleep, so it is a true drop-in for `SleepStager.stageSession(start:end:grav:hr:rr:resp:)`:
@@ -52,16 +53,38 @@ public enum SleepStagerV2 {
         // farthest reach of any per-epoch window (the 11-min HR-flatness window: 330 s back, 390 s forward —
         // see `padLo`/`padHi` below). On the first post-sync pass (~21 nights cold) and the full-history Effort
         // rescore (up to 4000 nights cold) those out-of-window rows are what blow the per-second dictionaries
-        // and the sort allocations up to OOM. The streams arrive sorted by ts, so we lower/upper-bound slice
-        // each to the read window BEFORE fingerprinting and BEFORE the uncached recipe. This is output-identical
-        // (we drop only rows `features()` could never touch) and it also tightens the fingerprint to the rows
-        // that matter. PAD_LO/PAD_HI are the SAME values the Android twin (R1) clips with.
-        let gravW = clipToWindow(grav, lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
-        let hrW = clipToWindow(hr, lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
-        let rrW = clipToWindow(rr, lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
+        // and the sort allocations up to OOM. Establish timestamp order defensively, then lower/upper-bound
+        // slice each stream to the read window BEFORE fingerprinting and BEFORE the uncached recipe. This is
+        // output-identical for sorted callers (and stable for same-second rows), drops only rows `features()`
+        // could never touch, and tightens the fingerprint to the rows that matter. PAD_LO/PAD_HI are the SAME
+        // values the Android twin (R1) clips with.
+        let stableOrder: (Int, (Int) -> Int) -> [Int]? = { count, tsAt in
+            if count < 2 { return nil }
+            var hasInversion = false
+            for i in 1..<count where tsAt(i - 1) > tsAt(i) {
+                hasInversion = true
+                break
+            }
+            if !hasInversion { return nil }
+            return (0..<count).sorted { lhs, rhs in
+                let lts = tsAt(lhs), rts = tsAt(rhs)
+                return lts == rts ? lhs < rhs : lts < rts
+            }
+        }
+        let gravO = stableOrder(grav.count, { grav[$0].ts }).map { $0.map { grav[$0] } } ?? grav
+        let hrO = stableOrder(hr.count, { hr[$0].ts }).map { $0.map { hr[$0] } } ?? hr
+        let rrO = stableOrder(rr.count, { rr[$0].ts }).map { $0.map { rr[$0] } } ?? rr
+        let gravW = clipToWindow(gravO,
+                                 lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
+        let hrW = clipToWindow(hrO,
+                               lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
+        let rrW = clipToWindow(rrO,
+                               lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
         let key = V2Key(
             start: start, end: end,
-            grav: StreamFingerprint.of(gravW, ts: { $0.ts }, quant: { Int(($0.x + $0.y + $0.z) * 1024) }),
+            grav: StreamFingerprint.of(gravW, ts: { $0.ts }, quant: {
+                StreamFingerprint.gravityQuant(x: $0.x, y: $0.y, z: $0.z)
+            }),
             hr: StreamFingerprint.of(hrW, ts: { $0.ts }, quant: { Int($0.bpm) }),
             rr: StreamFingerprint.of(rrW, ts: { $0.ts }, quant: { Int($0.rrMs) }))
         return stageCache.value(key) {
@@ -108,13 +131,8 @@ public enum SleepStagerV2 {
     /// in front of it; behaviour is byte-identical (a cache miss runs exactly this).
     private static func stageSessionUncached(start: Int, end: Int, grav: [GravitySample],
                                              hr: [HRSample], rr: [RRInterval], resp: [RespSample]) -> [StageSegment] {
-        // Sort defensively so the windowed features behave regardless of caller ordering (V1's stageSession
-        // assumes its callers pass roughly-sorted streams; we make no such assumption here).
-        let gravS = grav.sorted { $0.ts < $1.ts }
-        let hrS = hr.sorted { $0.ts < $1.ts }
-        let rrS = rr.sortedByTsStable()   // stable: keeps #823 emission order within a second
-
-        let feats = features(start: start, end: end, grav: gravS, hr: hrS, rr: rrS)
+        // The public veneer has already established stable timestamp order before clipping.
+        let feats = features(start: start, end: end, grav: grav, hr: hr, rr: rr)
         if feats.isEmpty { return [StageSegment(start: start, end: end, stage: "light")] }
         let labels = stageEpochs(feats)
 
@@ -139,10 +157,18 @@ public enum SleepStagerV2 {
 
     static let stageNames = ["deep", "rem", "light", "awake"]
 
-    /// Population sleep-architecture base rates as log-priors (adult TST ≈ light 50 / deep 18 / rem 22 /
-    /// waso 10 %). Calibrates the boundary so light wins weak-evidence epochs.
+    /// Population sleep-architecture base rates as log-priors (adult TST ≈ light 50 / rem 22 / waso 10 %,
+    /// deep 15). Calibrates the boundary so light wins weak-evidence epochs.
+    ///
+    /// Deep was 0.18. Against human-scored PSG (PhysioNet sleep-accel, n = 31, `Tools/SleepPSG` section 7)
+    /// that over-called deep by +5.2 pp of the night pooled (18.9 % against 13.8 %). 0.15 is #348's value, not
+    /// a fit to this cohort; alone it raises per-subject kappa for 21 of 31 subjects and cuts |deep bias| for
+    /// 19 of 31, and moves no wake or REM epoch. #348's other prior (awake 0.10 → 0.34) is deliberately not
+    /// taken: it fixes the pooled wake share but worsens the mean per-subject wake error, the #437 shape.
+    /// The three freed points are not redistributed; the evidence is for this one value.
+    /// Kotlin twin: `SleepStagerV2.baseLogPrior`.
     static let baseLogPrior: [String: Double] = [
-        "light": log(0.50), "deep": log(0.18), "rem": log(0.22), "awake": log(0.10)]
+        "light": log(0.50), "deep": log(0.15), "rem": log(0.22), "awake": log(0.10)]
 
     /// Deep is eligible only in the night's lowest ~25 % HR-flatness epochs (≈ deep base rate + margin).
     /// Widened 0.20 -> 0.25 by the multi-subject (AAUWSS + sleep-accel LOSO) deep-boundary tune, which
@@ -176,11 +202,32 @@ public enum SleepStagerV2 {
 
     /// Transition matrix (rows = from, cols = to). Self-transitions dominate; deep↔rem rare; wake mostly
     /// to/from light. A priori, not fit.
+    ///
+    /// The AWAKE row encodes sleep-onset physiology directly: a sleeper does not enter N3 or REM straight
+    /// out of wakefulness — descent runs through N1/N2 — so wake→deep and wake→rem are ZERO rather than the
+    /// small non-zero values they used to carry, and the freed mass goes to the wake self-loop, which makes
+    /// a WASO episode span several epochs instead of flickering back to sleep after one. This row is the one
+    /// part of PR #348's DREAMT re-tune that survives measurement on a de-contaminated reference set; the
+    /// rest of that PR (its base priors, motion-gate multipliers, deep gate, awake dead-zone, emission
+    /// coefficients and the deep/rem/light transition rows) was reverted by #437 and stays reverted, having
+    /// measured neutral-to-negative here. See the header note on `viterbi` for why a zero is safe — and note
+    /// that ZERO is a strong prior rather than a prohibition: the viterbi floor turns it into ≈ -20.7 against
+    /// wake→light's ≈ -2.3, an ~18.4 log-unit penalty a sufficiently strong emission can still cross, so a
+    /// genuine sleep-onset REM period stays representable instead of structurally impossible.
+    ///
+    /// Measured on one wearer's 36 recorded nights, against the strap's own band `sleep_state` (an
+    /// independent reference the recipe cannot contaminate — 21 nights, 15 554 epochs): sleep/wake kappa
+    /// 0.105 → 0.118 and wake sensitivity 16.0 % → 17.6 %, with the healthy-stratum wake fraction essentially
+    /// unmoved (9.43 % → 9.96 %, i.e. no repeat of the #437 blow-out). Confirmed afterwards against
+    /// human-scored PSG hypnograms (PhysioNet sleep-accel, 31 subjects / 26 773 epochs, #991): 4-class kappa
+    /// 0.356 → 0.363, REM F1 0.569 → 0.575, wake sensitivity 30.42 % → 30.84 %, and the #437 stage-fraction
+    /// guard holds against truth as well. n = 1 wearer for the band figures; see `Tools/SleepBench` and the
+    /// PR for the full ablation and its limits.
     static let transition: [String: [String: Double]] = [
         "deep":  ["deep": 0.86, "rem": 0.007, "light": 0.126, "awake": 0.007],
         "rem":   ["deep": 0.005, "rem": 0.88, "light": 0.10, "awake": 0.015],
         "light": ["deep": 0.06, "rem": 0.06, "light": 0.85, "awake": 0.03],
-        "awake": ["deep": 0.01, "rem": 0.02, "light": 0.27, "awake": 0.70]]
+        "awake": ["deep": 0.0, "rem": 0.0, "light": 0.10, "awake": 0.90]]
 
     /// One 30 s epoch's recipe features. Optionals are "no measurement"; the z-score / percentile treat a
     /// missing value as the neutral centre so a sparse channel never blocks a stage.
@@ -284,6 +331,8 @@ public enum SleepStagerV2 {
         }
         var raws: [Raw] = []
         var allJerks: [Double] = []
+        // The RSA transform's twiddle factors, per grid length, for this night only (see `RespDFT`).
+        var respDFT: [Int: RespDFT] = [:]
         let firstE = ((start + 29) / 30) * 30
         var e = firstE
         while e < end {
@@ -315,7 +364,7 @@ public enum SleepStagerV2 {
                 if let vs = rrBy[s] { for v in vs { beats.append((Double(s), min(max(v, 300), 2000))) } }
             }
             beats.sort { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1 < $1.1 }
-            let respReg = respRegularity(beats)
+            let respReg = respRegularity(beats, dft: &respDFT)
 
             raws.append(Raw(start: e, hr: hrMean, hrVar: hrVar, hrFlat11: hrFlat11,
                             jerks: jerks, gapSec: max(1, gseq.count - 1), jerkMax: jerkMax,
@@ -348,10 +397,43 @@ public enum SleepStagerV2 {
         return feats
     }
 
+    /// The band-limited DFT's twiddle factors for one 4 Hz grid length `n`: `cos`/`sin` of
+    /// `-2π·k/n · j` for every in-band bin `k` and sample `j`.
+    ///
+    /// `respRegularity` runs once per 30-second epoch and used to evaluate these ~53 × ~836 pairs every time,
+    /// which was 13% of a cold re-score's CPU (Time Profiler, `__sincos_stret`). They depend on `n` alone,
+    /// and a night's beat window is whole seconds wide, so it sees only a handful of distinct `n`. The table
+    /// computes each factor with the very expressions the transform used inline, so reading it back is
+    /// bit-identical to recomputing it; a night builds it once per `n` and drops it with the night.
+    /// Kotlin twin: `SleepStagerV2.RespDft`.
+    struct RespDFT {
+        let kLo: Int
+        let cosines: [[Double]]
+        let sines: [[Double]]
+
+        init(n: Int, kLo: Int, kHi: Int) {
+            self.kLo = kLo
+            var cosines: [[Double]] = []
+            var sines: [[Double]] = []
+            for k in kLo...kHi {
+                let w = -2.0 * Double.pi * Double(k) / Double(n)
+                var c = [Double](repeating: 0, count: n)
+                var s = [Double](repeating: 0, count: n)
+                for j in 0..<n { let a = w * Double(j); c[j] = cos(a); s[j] = sin(a) }
+                cosines.append(c)
+                sines.append(s)
+            }
+            self.cosines = cosines
+            self.sines = sines
+        }
+    }
+
     /// RSA respiration regularity: tachogram → 4 Hz resample → detrend → power spectrum → peak/sum of the
     /// 0.15–0.40 Hz (9–24 brpm) band. Returns spectral peakedness (higher = more regular breathing) or nil
     /// when there are too few beats. A direct band-limited DFT (only the ~50 in-band bins are needed).
-    static func respRegularity(_ beats: [(Double, Double)]) -> Double? {
+    /// `dft` holds the twiddle factors per grid length (`RespDFT`), filled on first use; the caller keeps
+    /// one for a night. Kotlin twin: `SleepStagerV2.respRegularity`.
+    static func respRegularity(_ beats: [(Double, Double)], dft: inout [Int: RespDFT]) -> Double? {
         if beats.count < 12 { return nil }
         let t0 = beats.first!.0, tN = beats.last!.0
         if tN <= t0 { return nil }
@@ -375,11 +457,18 @@ public enum SleepStagerV2 {
         let kLo = Int(ceil(0.15 * 0.25 * Double(n)))
         let kHi = Int(floor(0.40 * 0.25 * Double(n)))
         if kHi < kLo || kLo < 0 { return nil }
+        let table: RespDFT
+        if let cached = dft[n] {
+            table = cached
+        } else {
+            table = RespDFT(n: n, kLo: kLo, kHi: kHi)
+            dft[n] = table
+        }
         var maxP = 0.0, sumP = 0.0
         for k in kLo...kHi {
             var re = 0.0, im = 0.0
-            let w = -2.0 * Double.pi * Double(k) / Double(n)
-            for j in 0..<n { let a = w * Double(j); re += y[j] * cos(a); im += y[j] * sin(a) }
+            let c = table.cosines[k - kLo], s = table.sines[k - kLo]
+            for j in 0..<n { re += y[j] * c[j]; im += y[j] * s[j] }
             let p = re * re + im * im
             sumP += p
             if p > maxP { maxP = p }
@@ -460,8 +549,11 @@ public enum SleepStagerV2 {
     /// uniform start. Ties resolve to the earlier stage in `stageNames`.
     static func viterbi(_ emSeq: [[String: Double]]) -> [String] {
         if emSeq.isEmpty { return [] }
-        // Floor before ln so a zeroed transition entry (a legal hand-edit) can never hit ln(0) = -Inf
-        // and poison the lattice. Inert for the current matrix (no zero entries). Kept from #348.
+        // Floor before ln so a zeroed transition entry can never hit ln(0) = -Inf and poison the lattice.
+        // LOAD-BEARING, not defensive: the awake row carries wake→deep = wake→rem = 0.0, so this floor is
+        // the only thing between those two entries and -Inf. Deleting it does not remove dead code, it
+        // breaks the stager. Floored, a zero costs ln(1e-9) ≈ -20.7 against wake→light's ≈ -2.3. The floor
+        // arrived with #348 and survived #437; the zeros it now carries arrived later.
         let logT = transition.mapValues { row in row.mapValues { log(max($0, 1e-9)) } }
         var V = emSeq[0]   // uniform start
         var back: [[String: String]] = []

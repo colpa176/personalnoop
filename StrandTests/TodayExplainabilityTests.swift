@@ -1,5 +1,6 @@
 import XCTest
 import SwiftUI
+import StrandAnalytics
 import WhoopStore
 @testable import Strand
 
@@ -34,7 +35,7 @@ private func rendered(_ key: LocalizedStringKey?) -> String? {
 /// rules can't silently regress and stay byte-for-byte in step with the Kotlin Today lane:
 ///   • Component 2 — explained score states (calibrating / carriedLastNight / needsStrap)
 ///   • Component 3 — recording status (recording / lastSynced Xm ago / notRecording)
-///   • Component 4 — provenance label (On-device / Whoop / Apple Health = the real per-day merge winner)
+///   • Component 4 — provenance label (On-device / WHOOP / Apple Health = the real per-day merge winner)
 final class TodayExplainabilityTests: XCTestCase {
 
     // MARK: - Component 2 — MetricTileState.resolve precedence
@@ -82,6 +83,62 @@ final class TodayExplainabilityTests: XCTestCase {
         XCTAssertEqual(rendered(s.title), "Latest sleep · 14 May")
         XCTAssertEqual(s.accessibilityText,
                        "Latest sleep, 14 May. This is your last scored session. Wear the strap overnight for a fresh score.")
+    }
+
+    func testScoreState_gapLongerThanTheChargeWindow_calibratesRatherThanCarrying() {
+        // #2525 WINS OVER #779 here, pinned as a decision of record rather than left as a side effect.
+        // #779 (the test directly above) chose to keep showing a weeks-old carry, relabelled "Latest
+        // sleep", so the number is never passed off as "Last night". Since #2525 a Charge baseline reads
+        // ONLY nights inside `ChargeBaselines.windowDays`, so after a longer gap the folded history is
+        // EMPTY, the calibration count is non-nil (0, which #335 deliberately includes), and calibrating
+        // takes precedence over the carry. The Today Charge tile therefore reads "Calibrating" on a gap
+        // this long where it used to read "Latest sleep".
+        //
+        // BOTH displays are pinned from the SAME nights, so the contrast is the test rather than a claim
+        // about it. The night count matters: fewer than `minNightsSeed` banked nights calibrate under
+        // either rule, which would pin nothing, so these fourteen would have been TRUSTED by the old
+        // whole-history fold and the carry genuinely used to win. The count is converted to "nights
+        // remaining" with the same expression the TodayView call site uses, so the nil that lets the
+        // carry through is the production one.
+        // Twin of the Kotlin `scoreState_gapLongerThanTheChargeWindow_calibratesRatherThanCarrying`.
+        let anchor = "2026-02-11"
+        // 2026-01-01..2026-01-14 are 41..28 days before the anchor: fourteen nights, every one of them
+        // outside the 21-day window (which opens 2026-01-22).
+        let oldNights: [(day: String, value: Double?)] = (1...14).map {
+            (day: String(format: "2026-01-%02d", $0), value: 70)
+        }
+        let remaining: (Int?) -> Int? = { $0.map { max(1, Baselines.minNightsSeed - $0) } }
+
+        // BEFORE #2525: the fold saw every banked night, so nValid was 14, over `minNightsSeed`, the
+        // count was nil and the carry won. That is the "Latest sleep" the test above describes.
+        let unwindowed = RecoveryScorer.calibrationNights(nightlyHrv: oldNights.map(\.value),
+                                                          dayKeys: oldNights.map(\.day),
+                                                          hasRecovery: false)
+        XCTAssertNil(unwindowed, "fourteen banked nights were trusted, so the tile carried")
+        XCTAssertEqual(MetricTileState.resolve(hasTodayValue: false,
+                                               calibratingNightsRemaining: remaining(unwindowed),
+                                               carriedDate: "14 Jan",
+                                               carriedStale: true),
+                       .carriedLastNight(date: "14 Jan", stale: true))
+
+        // SINCE #2525: the window drops all fourteen, so the fold is empty and the count is 0.
+        let history = ChargeBaselines.history(imported: [],
+                                              own: oldNights,
+                                              anchorDay: anchor,
+                                              cfg: Baselines.hrvCfg,
+                                              baselineEpoch: 0)
+        XCTAssertEqual(history.ownValidNights, 0)
+        XCTAssertTrue(history.values.isEmpty, "nights outside the window must not reach the fold")
+
+        let n = RecoveryScorer.calibrationNights(nightlyHrv: history.values,
+                                                 dayKeys: history.dayKeys,
+                                                 hasRecovery: false)
+        XCTAssertEqual(n, 0)
+        XCTAssertEqual(MetricTileState.resolve(hasTodayValue: false,
+                                               calibratingNightsRemaining: remaining(n),
+                                               carriedDate: "14 Jan",
+                                               carriedStale: true),
+                       .calibrating(nightsRemaining: Baselines.minNightsSeed))
     }
 
     func testScoreState_nothingBanked_isNeedsStrap() {
@@ -176,9 +233,29 @@ final class TodayExplainabilityTests: XCTestCase {
         XCTAssertEqual(s, .lastSynced(minutesAgo: 2))
     }
 
-    func testRecordingState_connectedNoLiveHR_noSync_isNotRecording() {
-        // Connected, no live HR, and nothing ever synced → "Not recording" (never a false "Recording").
+    func testRecordingState_connectedNoLiveHR_noSync_isConnectedNoData() {
+        // #612: connected, no live HR, and nothing EVER synced (a strap's first-ever pairing) must not
+        // claim "Not recording. Strap not connected." — the link genuinely IS up. Fixed from the prior
+        // `.notRecording` result, which was the exact bug #612 reported.
         let s = RecordingState.resolve(connected: true, heartRate: nil, lastSyncedAt: nil, now: 10_000)
+        XCTAssertEqual(s, .connectedNoData)
+    }
+
+    func testRecordingState_sustainedEmptyOffload_overridesAnOldLastSync() {
+        // #612: an established strap (old but known last-sync) whose recent offloads are a SUSTAINED
+        // empty streak reads "connected, no data" rather than a stale "Last synced 14d ago" that implies
+        // the last sync was just unusually long ago rather than actively failing right now.
+        let now: TimeInterval = 10_000
+        let s = RecordingState.resolve(connected: true, heartRate: nil, lastSyncedAt: now - 1_209_600,
+                                       sustainedEmptyOffload: true, now: now)
+        XCTAssertEqual(s, .connectedNoData)
+    }
+
+    func testRecordingState_sustainedEmptyOffload_withoutConnection_isNotConnectedNoData() {
+        // The `connected` gate still applies: a disconnected strap with a stale sustained-empty flag
+        // (carried over from before the drop) must not read "Connected".
+        let s = RecordingState.resolve(connected: false, heartRate: nil, lastSyncedAt: nil,
+                                       sustainedEmptyOffload: true, now: 10_000)
         XCTAssertEqual(s, .notRecording)
     }
 
@@ -238,8 +315,14 @@ final class TodayExplainabilityTests: XCTestCase {
                        "Not recording. Strap not connected. Tap to connect.")
     }
 
+    func testRecordingState_connectedNoData_copy() {
+        XCTAssertEqual(RecordingState.connectedNoData.accessibilityText,
+                       "Connected. No live heart rate or synced history yet this session.")
+    }
+
     func testRecordingState_copy_hasNoEmDash() {
-        let states: [RecordingState] = [.recording, .lastSynced(minutesAgo: 5), .notRecording]
+        let states: [RecordingState] = [.recording, .lastSynced(minutesAgo: 5), .notRecording,
+                                         .historyExperimental, .connectedNoData]
         for s in states {
             XCTAssertFalse(s.accessibilityText.contains("\u{2014}"),
                            "RecordingState \(s) must not contain an em-dash")
@@ -255,7 +338,7 @@ final class TodayExplainabilityTests: XCTestCase {
 
     func testProvenance_importedStrapSource_isWhoop() {
         XCTAssertEqual(TodayView.provenanceDisplayLabel(rawSource: "my-whoop", deviceId: "my-whoop"),
-                       "Whoop")
+                       "WHOOP")
     }
 
     func testProvenance_appleHealthSource_isAppleHealth() {
@@ -268,7 +351,7 @@ final class TodayExplainabilityTests: XCTestCase {
         XCTAssertEqual(TodayView.provenanceDisplayLabel(rawSource: "whoop5-AB12-noop", deviceId: "whoop5-AB12"),
                        "On-device")
         XCTAssertEqual(TodayView.provenanceDisplayLabel(rawSource: "whoop5-AB12", deviceId: "whoop5-AB12"),
-                       "Whoop")
+                       "WHOOP")
     }
 
     func testProvenance_crossStrapComputedSibling_stillOnDevice() {
@@ -313,7 +396,7 @@ final class TodayExplainabilityTests: XCTestCase {
         XCTAssertEqual(
             TodayView.todayProvenanceChipLabel(rawSource: "my-whoop", deviceId: "my-whoop",
                                                appleHealthSource: "apple-health"),
-            "Whoop")
+            "WHOOP")
         XCTAssertEqual(
             TodayView.todayProvenanceChipLabel(rawSource: "my-whoop-noop", deviceId: "my-whoop",
                                                appleHealthSource: "apple-health"),
@@ -325,7 +408,7 @@ final class TodayExplainabilityTests: XCTestCase {
     }
 
     func testTodayScoreProviderLabel_coversImportedAndRegisteredProviders() {
-        XCTAssertEqual(TodayView.todayScoreProviderLabel(sourceId: "my-whoop", brand: "WHOOP"), "Whoop")
+        XCTAssertEqual(TodayView.todayScoreProviderLabel(sourceId: "my-whoop", brand: "WHOOP"), "WHOOP")
         XCTAssertEqual(TodayView.todayScoreProviderLabel(sourceId: "apple-health", brand: nil), "Apple Watch")
         XCTAssertEqual(TodayView.todayScoreProviderLabel(sourceId: "health-connect", brand: nil), "Health Connect")
         XCTAssertEqual(TodayView.todayScoreProviderLabel(sourceId: "oura-import", brand: nil), "Oura")
@@ -361,7 +444,7 @@ final class TodayExplainabilityTests: XCTestCase {
                     .init(sourceId: "oura-import", brand: nil),
                     .init(sourceId: "apple-health", brand: nil),
                 ]),
-            "Whoop + Oura")
+            "WHOOP + Oura")
     }
 
     func testLiquidHeroSourceLabel_hidesWhenNoScoreHasAResolvedSource() {

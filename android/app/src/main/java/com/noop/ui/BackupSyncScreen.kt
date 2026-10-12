@@ -16,14 +16,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -68,6 +71,9 @@ fun BackupSyncScreen() {
     var auto by remember { mutableStateOf(BackupSyncPrefs.autoEnabled(context)) }
     var lastMs by remember { mutableStateOf(BackupSyncPrefs.lastBackupMs(context)) }
     var busy by remember { mutableStateOf(false) }
+    // #1014 family: these failures carry a next step in their LAST clause, which is exactly what a
+    // Toast drops. Held here and shown in a dialog, the same way Settings does.
+    var backupFailure by remember { mutableStateOf<String?>(null) }
     // How many dated snapshots to keep; pruning deletes the oldest beyond this (BackupSync.snapshotsToPrune).
     var keep by remember { mutableStateOf(BackupSyncPrefs.keepCount(context)) }
     var keepMenu by remember { mutableStateOf(false) }
@@ -83,32 +89,48 @@ fun BackupSyncScreen() {
     fun runRestore(uri: Uri) {
         busy = true
         scope.launch {
-            val r = withContext(Dispatchers.IO) { DataBackup.importFrom(context, uri) }
-            busy = false
-            when (r) {
-                is DataBackup.ImportResult.NeedsRestart -> {
-                    // #57: the restore CLOSED and swapped the database file. The long-lived WhoopRepository +
-                    // BLE client still hold a DAO on the OLD (now-closed) connection, so any strap sync would
-                    // fail with "connection pool has been closed" — and, worse, empty/metadata history ENDs
-                    // would still ack and trim the strap PAST records we can't store, discarding real history.
-                    // Relaunching the process re-opens Room against the restored file. Do it automatically
-                    // rather than trust the user to read a toast (which is exactly how #57 happened).
-                    Toast.makeText(context, "Backup restored — restarting NOOP…", Toast.LENGTH_LONG).show()
-                    // NonCancellable: this coroutine runs in the screen's scope, which is cancelled the
-                    // instant the user navigates away. The restart is a data-safety guarantee (the DB is
-                    // already swapped), so it must complete even if the composition leaves — otherwise the
-                    // user could keep syncing into the closed DB, the very bug we're fixing.
-                    withContext(NonCancellable) {
-                        delay(800)   // let the toast render before the process dies
-                        val ctx = context.applicationContext
-                        ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
-                            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-                            ?.let { ctx.startActivity(it) }
-                        Runtime.getRuntime().exit(0)
+            // Clear in a `finally` so it clears on ANY exit — the twin of the Apple `defer` in
+            // `BackupSyncView.runRestore`. All five controls in the screen body are gated on `!busy`
+            // — folder picker, auto toggle, keep-count, Back up now, Restore — so a flag left set is a
+            // dead end rather than one stuck button. (The restore sheet and confirm dialog are not
+            // gated, but they are transient overlays, not the way back to a working screen.)
+            //
+            // The NeedsRestart branch never reaches the `finally`: it exits the process first. That is
+            // the wanted behaviour — the screen stays disabled through the restart rather than briefly
+            // accepting taps against a database that has already been swapped underneath it.
+            try {
+                val r = withContext(Dispatchers.IO) { DataBackup.importFrom(context, uri) }
+                when (r) {
+                    is DataBackup.ImportResult.NeedsRestart -> {
+                        // #57: the restore CLOSED and swapped the database file. The long-lived WhoopRepository +
+                        // BLE client still hold a DAO on the OLD (now-closed) connection, so any strap sync would
+                        // fail with "connection pool has been closed" — and, worse, empty/metadata history ENDs
+                        // would still ack and trim the strap PAST records we can't store, discarding real history.
+                        // Relaunching the process re-opens Room against the restored file. Do it automatically
+                        // rather than trust the user to read a toast (which is exactly how #57 happened).
+                        Toast.makeText(context, "Backup restored — restarting NOOP…", Toast.LENGTH_LONG).show()
+                        // NonCancellable: this coroutine runs in the screen's scope, which is cancelled the
+                        // instant the user navigates away. The restart is a data-safety guarantee (the DB is
+                        // already swapped), so it must complete even if the composition leaves — otherwise the
+                        // user could keep syncing into the closed DB, the very bug we're fixing.
+                        withContext(NonCancellable) {
+                            delay(800)   // let the toast render before the process dies
+                            val ctx = context.applicationContext
+                            ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+                                ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                                ?.let { ctx.startActivity(it) }
+                            Runtime.getRuntime().exit(0)
+                        }
                     }
+                    is DataBackup.ImportResult.Failed -> backupFailure = r.message
+                    // #1807: recoverable, but not from here — this screen restores a folder snapshot
+                    // directly and has no confirm step to hang the override on. Settings → Backup & restore
+                    // → Import does, and shows the same sentence with a way through. Which is the reason
+                    // it has to be READABLE here: the dialog is where the reader learns where to go.
+                    is DataBackup.ImportResult.TooLarge -> backupFailure = r.message
                 }
-                is DataBackup.ImportResult.Failed ->
-                    Toast.makeText(context, r.message, Toast.LENGTH_LONG).show()
+            } finally {
+                busy = false
             }
         }
     }
@@ -154,10 +176,24 @@ fun BackupSyncScreen() {
                         style = NoopType.footnote, color = Palette.textTertiary,
                     )
                     Text(
-                        uiString(R.string.l10n_backup_sync_screen_tip_a_desktop_drive_dropbox_app_2eaff1e3) +
-                            "folder a sync app (e.g. FolderSync / Autosync) keeps in your cloud.",
+                        uiString(R.string.l10n_backup_sync_screen_tip_a_desktop_drive_dropbox_app_2eaff1e3),
                         style = NoopType.caption, color = Palette.accent,
                     )
+                    // #644: these .noopbak snapshots are a plain, unencrypted ZIP — pointing this folder
+                    // at a cloud sync app (per the tip above) also uploads that readable file there.
+                    // Say so plainly next to the folder picker, before anyone turns auto-backup on.
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(
+                            Icons.Filled.Warning,
+                            contentDescription = null,
+                            tint = Palette.statusWarning,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Text(
+                            uiString(R.string.l10n_backup_sync_screen_these_backups_are_unencrypted_too_if_53e70fe8),
+                            style = NoopType.caption, color = Palette.statusWarning,
+                        )
+                    }
                     NoopButton(
                         text = if (treeUri == null) "Choose folder" else "Change folder",
                         leadingIcon = Icons.Filled.FolderOpen,
@@ -180,8 +216,7 @@ fun BackupSyncScreen() {
                         ) {
                             Text(uiString(R.string.l10n_backup_sync_screen_daily_auto_backup_e5627357), style = NoopType.body, color = Palette.textPrimary)
                             Text(
-                                uiString(R.string.l10n_backup_sync_screen_writes_a_fresh_dated_backup_to_bd964fc5) +
-                                    "the latest $keep. Off by default - flip it on if you want it.",
+                                uiString(R.string.l10n_backup_sync_screen_writes_a_fresh_dated_backup_to_bd964fc5, keep),
                                 style = NoopType.footnote, color = Palette.textTertiary,
                             )
                         }
@@ -212,8 +247,7 @@ fun BackupSyncScreen() {
                         ) {
                             Text(uiString(R.string.l10n_backup_sync_screen_keep_last_snapshots_cd5c9ea9), style = NoopType.body, color = Palette.textPrimary)
                             Text(
-                                uiString(R.string.l10n_backup_sync_screen_older_backups_beyond_this_many_are_00b7daa6) +
-                                    "daily backups). For recovery: if data ever corrupts, grab the newest snapshot.",
+                                uiString(R.string.l10n_backup_sync_screen_older_backups_beyond_this_many_are_00b7daa6),
                                 style = NoopType.footnote, color = Palette.textTertiary,
                             )
                         }
@@ -280,6 +314,29 @@ fun BackupSyncScreen() {
                         },
                         style = NoopType.caption, color = Palette.textTertiary,
                     )
+                    // Auto is ON but the last SUCCESSFUL backup is stale — the daily catch-up isn't landing
+                    // (a lost folder grant, or the app hasn't been opened in a while). backupNow only stamps
+                    // lastMs on success, so this surfaces a silently-failing auto-backup instead of it being
+                    // discovered only at restore.
+                    if (auto && treeUri != null && lastMs > 0L &&
+                        BackupSync.isBackupStale(lastMs, System.currentTimeMillis())
+                    ) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(
+                                Icons.Filled.Warning,
+                                contentDescription = null,
+                                tint = Palette.statusWarning,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Text(
+                                uiString(R.string.l10n_backup_sync_screen_auto_backup_hasn_t_run_in_e3cd484e),
+                                style = NoopType.caption, color = Palette.statusWarning,
+                                // weight(1f) so the long warning wraps within the Row instead of overflowing
+                                // the card on a narrow screen (parity with the iOS row's fixedSize wrap).
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
                     NoopButton(
                         text = if (busy) "Working…" else "Back up now",
                         leadingIcon = Icons.Filled.CloudUpload,
@@ -288,18 +345,24 @@ fun BackupSyncScreen() {
                         onClick = {
                             busy = true
                             scope.launch {
-                                val ok = withContext(Dispatchers.IO) { BackupSync.backupNow(context) }
-                                lastMs = BackupSyncPrefs.lastBackupMs(context)
-                                busy = false
-                                Toast.makeText(
-                                    context,
-                                    if (ok) {
-                                        "Backed up to your folder."
-                                    } else {
-                                        "Backup failed - re-pick the folder and try again."
-                                    },
-                                    Toast.LENGTH_LONG,
-                                ).show()
+                                // Clear in a `finally` so it clears on ANY exit — the twin of the Apple `defer` in
+                                // `BackupSyncView.backupNow`. The flag now clears after the toast rather than before it,
+                                // which is the point: the screen stays disabled until the work is genuinely finished.
+                                try {
+                                    val ok = withContext(Dispatchers.IO) { BackupSync.backupNow(context) }
+                                    lastMs = BackupSyncPrefs.lastBackupMs(context)
+                                    Toast.makeText(
+                                        context,
+                                        if (ok) {
+                                            "Backed up to your folder."
+                                        } else {
+                                            "Backup failed - re-pick the folder and try again."
+                                        },
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                } finally {
+                                    busy = false
+                                }
                             }
                         },
                     )
@@ -313,8 +376,7 @@ fun BackupSyncScreen() {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(uiString(R.string.l10n_backup_sync_screen_restore_3cbe6d6b), style = NoopType.headline, color = Palette.textPrimary)
                     Text(
-                        uiString(R.string.l10n_backup_sync_screen_replace_this_device_s_data_with_b8679c51) +
-                            "so back up first if unsure.",
+                        uiString(R.string.l10n_backup_sync_screen_replace_this_device_s_data_with_b8679c51),
                         style = NoopType.footnote, color = Palette.textTertiary,
                     )
                     NoopButton(
@@ -428,6 +490,10 @@ fun BackupSyncScreen() {
                 }
             },
         )
+    }
+
+    backupFailure?.let { failure ->
+        BackupFailureDialog(message = failure, onDismiss = { backupFailure = null })
     }
 }
 

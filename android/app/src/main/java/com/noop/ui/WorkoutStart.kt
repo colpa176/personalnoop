@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
@@ -18,6 +19,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
@@ -159,6 +161,14 @@ private fun StartSportRow(sp: Sport, isSelected: Boolean, onPick: () -> Unit) {
             .clickable(onClick = onPick)
             .padding(vertical = 10.dp),
     ) {
+        // Per-sport glyph (shared sportIcon catalogue), so the picker reads by icon like the iOS
+        // workout selection screen and the Workouts list rows — not a bare text list.
+        Icon(
+            sportIcon(sp.name), contentDescription = null,
+            tint = if (isSelected) Palette.accent else Palette.textSecondary,
+            modifier = Modifier.size(20.dp),
+        )
+        Spacer(Modifier.width(12.dp))
         Text(
             sp.name, style = NoopType.body,
             color = if (isSelected) Palette.accent else Palette.textPrimary,
@@ -173,11 +183,11 @@ private fun StartSportRow(sp: Sport, isSelected: Boolean, onPick: () -> Unit) {
 /**
  * Start-a-workout entry for the Workouts screen (#115) — mirrors the Live screen's control so a user
  * can begin a session from either place. Shows a compact "running" banner while a workout is active
- * (the rich live card stays on Live), the "Start workout" button when a strap is bonded, or nothing
- * when there's no strap to stream from (matching Live, which only offers the start when bonded).
+ * (the rich live card stays on Live); otherwise an action row with Start (when a strap is bonded, since
+ * a live session needs the strap to stream) beside Add — or just Add when there's no strap.
  */
 @Composable
-fun WorkoutStartSection(vm: AppViewModel) {
+fun WorkoutStartSection(vm: AppViewModel, onAdd: () -> Unit) {
     val live by vm.live.collectAsStateWithLifecycle()
     val activeWorkout by vm.activeWorkout.collectAsStateWithLifecycle()
     var showSportPicker by remember { mutableStateOf(false) }
@@ -193,41 +203,89 @@ fun WorkoutStartSection(vm: AppViewModel) {
         LaunchedEffect(w.startMs) {
             while (true) { nowMs = System.currentTimeMillis(); delay(1000) }
         }
-        val elapsedS = ((nowMs - w.startMs) / 1000).coerceAtLeast(0)
-        NoopCard {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Text(uiString(R.string.l10n_workout_start_w_sport_name_uppercase_e59bc678, w.sport.name.uppercase()), style = NoopType.overline, color = Palette.statusCritical)
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    String.format("%d:%02d", elapsedS / 60, elapsedS % 60),
-                    style = NoopType.title2, color = Palette.textPrimary,
-                )
-                Spacer(Modifier.weight(1f))
-                // Re-open the full-screen live workout view.
-                OutlinedButton(
-                    onClick = { showLiveWorkout = true },
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.accent),
-                ) { Text(uiString(R.string.l10n_workout_start_open_cf9b7706), style = NoopType.captionNumber) }
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = { confirmingEnd = true },
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
-                    ),
-                ) { Text(uiString(R.string.l10n_workout_start_end_a2bb9d34), style = NoopType.captionNumber) }
+        val elapsedS = ActiveWorkoutClock.activeElapsedSeconds(
+            startMs = w.startMs, pausedAtMs = w.pausedAtMs,
+            pausedDurationMs = w.pausedDurationMs, nowMs = nowMs,
+        )
+        // Recording: the live banner, with Add kept visible below so a past workout can still be logged
+        // mid-session (it used to live in the range bar).
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            NoopCard {
+                // Two rows, not one: this banner already carried a sport label, a clock, Open and End,
+                // and a third button would squeeze all five onto one line on a narrow phone. The state
+                // reads on top, the actions sit below with equal weight.
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Text(uiString(R.string.l10n_workout_start_w_sport_name_uppercase_e59bc678, w.sport.name.uppercase()), style = NoopType.overline, color = Palette.statusCritical)
+                        // A frozen clock alone is ambiguous with a STALLED one, so say which it is. Reuses
+                        // the string #1533 already localized rather than minting new copy for a tag.
+                        if (w.pausedAtMs != null) {
+                            Spacer(Modifier.width(8.dp))
+                            Text(uiString(R.string.workout_action_paused), style = NoopType.overline, color = Palette.textSecondary)
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        // elapsedClock, not a local %d:%02d — that one had no hour roll-over at all, so a
+                        // 90-minute session read "90:00" here while every other surface read "1:30:00".
+                        Text(elapsedClock(elapsedS), style = NoopType.title2, color = Palette.textPrimary)
+                        Spacer(Modifier.weight(1f))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        // End was reachable here and Pause was not, so the only control this banner
+                        // offered without opening the live view was the irreversible one.
+                        Button(
+                            onClick = { vm.toggleWorkoutPause() },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                        ) {
+                            Text(
+                                if (w.pausedAtMs != null) uiString(R.string.workout_action_resume)
+                                else uiString(R.string.workout_action_pause),
+                                style = NoopType.captionNumber,
+                            )
+                        }
+                        // Re-open the full-screen live workout view.
+                        OutlinedButton(
+                            onClick = { showLiveWorkout = true },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.accent),
+                        ) { Text(uiString(R.string.l10n_workout_start_open_cf9b7706), style = NoopType.captionNumber) }
+                        Button(
+                            onClick = { confirmingEnd = true },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
+                            ),
+                        ) { Text(uiString(R.string.l10n_workout_start_end_a2bb9d34), style = NoopType.captionNumber) }
+                    }
+                }
             }
+            AddWorkoutButton(onAdd, Modifier.fillMaxWidth())
         }
     } else if (live.bonded) {
-        Button(
-            onClick = { showSportPicker = true },
+        // Start + Add as an equal-width action row (EXP-018 parity with the iOS workoutActionRow).
+        // Both actions use the shared opaque button surfaces: unlike the old accent-muted/translucent
+        // pair, their fills and labels keep their contrast over the full-bleed daytime scene (#1625).
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Palette.accent, contentColor = Palette.surfaceBase,
-            ),
-        ) { Text(uiString(R.string.l10n_workout_start_start_workout_d0f3f2cd), style = NoopType.captionNumber) }
+        ) {
+            NoopButton(
+                text = uiString(R.string.l10n_workout_start_start_workout_d0f3f2cd),
+                kind = NoopButtonKind.Primary,
+                onClick = { showSportPicker = true },
+                modifier = Modifier.weight(1f),
+            )
+            AddWorkoutButton(onAdd, Modifier.weight(1f))
+        }
+    } else {
+        // No strap to stream from: no live Start, but keep Add so a user with no imports can still log.
+        // PRIMARY here, unlike the pair above. There is no Start to be secondary to, and this is the
+        // only action the screen offers, so the secondary treatment would leave a wearer with no strap
+        // looking at the faintest control in the app as their sole way forward.
+        AddWorkoutButton(onAdd, Modifier.fillMaxWidth(), kind = NoopButtonKind.Primary)
     }
 
     if (showSportPicker) {

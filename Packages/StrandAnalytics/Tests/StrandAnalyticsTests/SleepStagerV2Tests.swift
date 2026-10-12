@@ -2,7 +2,7 @@ import XCTest
 @testable import StrandAnalytics
 import WhoopProtocol
 
-/// Basic coverage for `SleepStagerV2` (V7 Pillar 3b, reimplemented from contributor PR #600) — the recipe
+/// Basic coverage for `SleepStagerV2` (V7 Pillar 3b, reimplemented from @sunny-noop's recipe) — the recipe
 /// that stages a normal user's nights, since `PuffinExperiment.experimentalSleepV2Enabled` is default ON
 /// (#277 promoted it over V1; #351 extended it to every strap family). These assert the drop-in CONTRACT —
 /// same `stageSession` signature + return shape as V1, segments that tile `[start, end]` with canonical
@@ -31,7 +31,77 @@ final class SleepStagerV2Tests: XCTestCase {
         }
     }
 
+    private func oddEven<T>(_ rows: [T]) -> [T] {
+        stride(from: 0, to: rows.count, by: 2).map { rows[$0] }
+            + stride(from: 1, to: rows.count, by: 2).map { rows[$0] }
+    }
+
     // MARK: - drop-in contract
+
+    /// bhelm/noop#67: the public entry accepts caller streams in any order. Binary-search clipping must not
+    /// run until timestamp order is established, otherwise this deterministic permutation drops valid rows.
+    func testShuffledInputsMatchSortedInputs() {
+        let start = 1_751_513_600
+        let duration = 90 * 60
+        let padding = 600
+        let streamStart = start - padding
+        let streamDuration = duration + 2 * padding
+        let grav = (0..<streamDuration).map { i in
+            i.isMultiple(of: 2)
+                ? GravitySample(ts: streamStart + i, x: 1, y: 0, z: 0)
+                : GravitySample(ts: streamStart + i, x: 0, y: 0, z: 1)
+        }
+        let hr = sleepHR(start: streamStart, durationS: streamDuration, base: 50)
+        let rr = regularRR(start: streamStart, durationS: streamDuration)
+
+        let sorted = SleepStagerV2.stageSession(
+            start: start, end: start + duration, grav: grav, hr: hr, rr: rr, resp: [])
+        XCTAssertEqual(sorted, [StageSegment(start: start, end: start + duration, stage: "light")],
+                       "the sorted-input output is the frozen control")
+
+        let shuffled = SleepStagerV2.stageSession(
+            start: start, end: start + duration,
+            grav: oddEven(grav), hr: oddEven(hr), rr: oddEven(rr), resp: [])
+        XCTAssertEqual(shuffled, sorted,
+                       "clipping must establish timestamp order before binary-search bounds")
+    }
+
+    /// Same-second gravity accumulation is order-sensitive under catastrophic cancellation. Each call uses a
+    /// distinct translated window so the memo cannot answer one permutation from another's cache entry.
+    func testShuffledTimestampGroupsPreserveOrderSensitiveDuplicateOutcomes() {
+        let duration = 90 * 60
+        let padding = 600
+        let streamDuration = duration + 2 * padding
+        func stagedShape(start: Int, signalLast: Bool, shuffled: Bool) -> [String] {
+            let streamStart = start - padding
+            let gravGroups = (0..<streamDuration).map { i -> [GravitySample] in
+                let ts = streamStart + i
+                let signal = i % 30 == 15 ? 0.25 : 0.0
+                let huge = GravitySample(ts: ts, x: 8e15, y: 0, z: 0)
+                let small = GravitySample(ts: ts, x: signal, y: 0, z: 0)
+                let negative = GravitySample(ts: ts, x: -8e15, y: 0, z: 0)
+                return signalLast ? [huge, negative, small] : [huge, small, negative]
+            }
+            let grav = (shuffled ? oddEven(gravGroups) : gravGroups).flatMap { $0 }
+            let hr = sleepHR(start: streamStart, durationS: streamDuration, base: 50)
+            let rr = regularRR(start: streamStart, durationS: streamDuration)
+            let segments = SleepStagerV2.stageSession(
+                start: start, end: start + duration,
+                grav: grav, hr: shuffled ? oddEven(hr) : hr, rr: shuffled ? oddEven(rr) : rr, resp: [])
+            return segments.map { "\($0.start - start):\($0.end - start):\($0.stage)" }
+        }
+        let base = 1_752_513_600
+        let cancelledSorted = stagedShape(start: base, signalLast: false, shuffled: false)
+        let cancelledShuffled = stagedShape(start: base + 10_000_000, signalLast: false, shuffled: true)
+        let retainedSorted = stagedShape(start: base + 20_000_000, signalLast: true, shuffled: false)
+        let retainedShuffled = stagedShape(start: base + 30_000_000, signalLast: true, shuffled: true)
+        let cancelledOracle = ["0:5400:light"]
+        let retainedOracle = ["0:5400:wake"]
+        XCTAssertEqual(cancelledSorted, cancelledOracle)
+        XCTAssertEqual(cancelledShuffled, cancelledOracle)
+        XCTAssertEqual(retainedSorted, retainedOracle)
+        XCTAssertEqual(retainedShuffled, retainedOracle)
+    }
 
     func testStagesTileTheWholeSpanContiguously() {
         let start = 1_700_000_000
@@ -207,7 +277,7 @@ final class SleepStagerV2Tests: XCTestCase {
         XCTAssertEqual(path, ["light"])
     }
 
-    // MARK: - #690: the V2 flag drives the NORMAL detected-night staging path
+    // MARK: - 7.0.0: the V2 flag drives the NORMAL detected-night staging path
 
     /// A regular R-R stream at ~1 Hz (steady ~1000 ms beats with a small respiratory sinus oscillation),
     /// long enough for the V2 recipe to express both early deep and later REM across the night.
@@ -218,7 +288,7 @@ final class SleepStagerV2Tests: XCTestCase {
         }
     }
 
-    /// #690 (v7 regression): the "Experimental sleep staging (V2)" toggle must affect a NORMAL detected
+    /// 7.0.0 regression: the "Experimental sleep staging (V2)" toggle must affect a NORMAL detected
     /// night — not only the userEdited self-heal restage. With the flag ON, `detectSleep` stages the
     /// accepted window with V2 (deep + REM present); with the flag OFF it returns the EXACT V1 result, so
     /// the byte-identical default (and the frozen-golden tests) is preserved.
@@ -326,5 +396,29 @@ final class SleepStagerV2Tests: XCTestCase {
         for (from, row) in SleepStagerV2.transition {
             XCTAssertEqual(row.values.reduce(0, +), 1.0, accuracy: 1e-9, "transition row '\(from)' must sum to 1.0")
         }
+    }
+
+    /// Pin the base log-priors, deep included. The golden hypnogram does not move when a prior changes, so
+    /// without this a one-sided edit would pass. Deep is 0.15, not 0.18: the one prior the sleep-accel PSG
+    /// comparison (`Tools/SleepPSG` section 7) supports moving. Twin: `SleepStagerV2Test.baseLogPriorsArePinned`.
+    func testBaseLogPriorsArePinned() {
+        XCTAssertEqual(SleepStagerV2.baseLogPrior,
+                       ["light": log(0.50), "deep": log(0.15), "rem": log(0.22), "awake": log(0.10)])
+    }
+
+    /// Pin the AWAKE transition row directly, for the same reason the deep row is pinned: the end-to-end
+    /// golden is only sensitive where its own input sits near a decision boundary, and it does NOT move when
+    /// this row changes — so without this assertion the row is effectively unguarded. Twin:
+    /// `SleepStagerV2Test.wakeRowForbidsDirectDescentIntoDeepOrRem`.
+    ///
+    /// The zeros are the physiological claim: sleep onset descends through N1/N2, so wake never transitions
+    /// straight into N3 or REM. They are also why `viterbi` floors the log at 1e-9 — asserted here so the two
+    /// can never drift apart and reintroduce ln(0) = -inf.
+    func testWakeRowForbidsDirectDescentIntoDeepOrRem() {
+        XCTAssertEqual(SleepStagerV2.transition["awake"]!,
+                       ["deep": 0.0, "rem": 0.0, "light": 0.10, "awake": 0.90])
+        // A zeroed entry must reach the lattice as a large finite penalty, never -inf.
+        let lp = log(max(SleepStagerV2.transition["awake"]!["deep"]!, 1e-9))
+        XCTAssertTrue(lp.isFinite, "a zeroed transition must not produce a non-finite log-weight")
     }
 }

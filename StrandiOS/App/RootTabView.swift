@@ -6,10 +6,35 @@ import StrandDesign
 /// natural analogue is a `TabView` with the most-used screens as tabs and everything else under a
 /// "More" list. Every screen is the same `StrandDesign`-built view the macOS app uses.
 struct RootTabView: View {
+    /// #1841: shared with Android by NAME and meaning, not by storage — the two platforms keep their own
+    /// stores, exactly as the Clock format setting does.
+    ///
+    /// Default FALSE here while Android defaults true, and the divergence is deliberate. Apple's forums
+    /// report `.tabBarMinimizeBehavior(.onScrollDown)` failing to trigger in tabs built on
+    /// `NavigationStack(path:)` — which is every primary tab in this file, bound deliberately so a tab
+    /// root can pop and re-scroll. So this may well be inert on our structure, and defaulting ON would
+    /// advertise a behaviour that never happens. Off until someone confirms it on an iOS 26 device.
+    /// The Coach master switch, under the same `noop.` key Android writes. Default ON, so every install
+    /// that shipped with the tab is unchanged.
+    ///
+    /// Not tab chrome: with this off the AI is off. The tab goes, the Today launcher card goes, and the
+    /// daily brief is cancelled, because the brief calls a provider from the BACKGROUND with no UI
+    /// attached and would otherwise keep posting AI notifications for a feature the wearer switched off.
+    @AppStorage("noop.coachEnabled") private var coachEnabled = true
+    @AppStorage("noop.bottomBarAutoHide") private var bottomBarAutoHide = false
+
+    /// The live gym session, owned at the app root — see `LiftSessionController`.
+    @EnvironmentObject private var liftSession: LiftSessionController
+    /// External entry points must wait until the mandatory first-run gates have completed. The root owns
+    /// that state; keeping it explicit here prevents this shell's window-level sheet from covering a gate.
+    let homeScreenQuickActionsEnabled: Bool
+
     @EnvironmentObject private var repo: Repository
     /// Cross-screen navigation requests (e.g. Live → "Manage devices"). Devices isn't a tab — it lives
     /// behind the More list — so a request presents it as a sheet, matching the quick-action screens.
     @EnvironmentObject private var router: NavRouter
+    /// The scene-local receiver for actions chosen from NOOP's Home Screen icon menu.
+    @EnvironmentObject private var homeScreenQuickActions: HomeScreenQuickActionSceneDelegate
 
     /// Which quick-action screen the centre FAB is presenting (nil = sheet closed).
     @State private var quickAction: QuickAction?
@@ -26,12 +51,12 @@ struct RootTabView: View {
     /// root view alive, so an at-root re-tap keeps scroll position and never re-runs `.task`
     /// (#198; the #197 resetID/`.id()` rebuild reset both). Requires the tab roots' first-hop
     /// links to push `TabRoute`/`MoreDestination` VALUES — closure-destination links bypass the path.
-    @State private var tabPaths: [NavigationPath] = Array(repeating: NavigationPath(), count: RootTabView.tabCount)
+    @State private var tabPaths: [NavigationPath] = Array(repeating: NavigationPath(), count: 5)
     /// One scroll-to-top token per tab. Bumped when the user re-taps the active tab while it's ALREADY
     /// at its root — the other half of the iOS convention #197/#198 left unserved (an at-root re-tap was
     /// a no-op). Threaded into each tab's root via `\.scrollToTopSignal`; ScreenScaffold / LiquidTodayView
     /// scroll to their top anchor when their tab's token changes.
-    @State private var scrollTop: [Int] = Array(repeating: 0, count: RootTabView.tabCount)
+    @State private var scrollTop: [Int] = Array(repeating: 0, count: 5)
     /// Which More-tab groups are expanded (S2). Insights + Body stay open at rest; Data + App collapse to
     /// just their header until tapped. Persisted (#860 item 2): the user's open/closed choice must SURVIVE
     /// leaving and re-entering the More tab (and relaunch), not reset to the seed every visit. Backed by an
@@ -39,13 +64,6 @@ struct RootTabView: View {
     /// `Set<String>` through `MoreSectionPrefs` so the section logic below is unchanged.
     @AppStorage(MoreSectionPrefs.storageKey) private var expandedMoreSectionsCSV = MoreSectionPrefs.defaultCSV
     private var expandedMoreSections: Set<String> { MoreSectionPrefs.decode(expandedMoreSectionsCSV) }
-
-    /// How many primary tabs the bar carries (Today / Trends / Sleep / Nutrition / More). `tabPaths`,
-    /// `scrollTop` and the anywhere-swipe clamp all size themselves from this, so adding a tab is one
-    /// constant plus its `tab(...)` row rather than four separate literals that can silently disagree —
-    /// a stale clamp would make the last tab unreachable by swipe, and a short array would crash on
-    /// `tabPaths[4]`. `FloatingTabBar.nav` below must list the same number of items.
-    static let tabCount = 5
 
     /// V8 liquid redesign is the default Today; the Settings toggle lets a user fall back to the classic
     /// Today if they prefer it (keyed identically to the SettingsView toggle). Default ON.
@@ -56,18 +74,29 @@ struct RootTabView: View {
         if liquidTodayEnabled { LiquidTodayView() } else { TodayView() }
     }
 
-    init() {
-        // Plain Titanium bar: pin the background to `surfaceBase` and clear the system
-        // selection-indicator tint so there is NO gold/accent pill behind the selected
-        // icon — the gold `.tint` below colours only the selected icon + label, nothing
-        // is filled behind it. (UIKit derives a selection-indicator fill from the tint
-        // unless it's explicitly cleared.)
-        let appearance = UITabBarAppearance()
-        appearance.configureWithOpaqueBackground()
-        appearance.backgroundColor = UIColor(StrandPalette.surfaceBase)
-        appearance.selectionIndicatorTintColor = .clear
-        UITabBar.appearance().standardAppearance = appearance
-        UITabBar.appearance().scrollEdgeAppearance = appearance
+    /// Native tab selection binding. SwiftUI sends taps on the already-selected item through the
+    /// setter, which lets the system tab bar retain the app's refresh / pop-to-root / scroll-to-top
+    /// convention without placing a custom hit-testing layer over the platform bar.
+    private var nativeTabSelection: Binding<Int> {
+        Binding(
+            get: { selectedTab },
+            set: { tag in
+                if tag == selectedTab {
+                    reselectTab(tag)
+                } else {
+                    selectedTab = tag
+                }
+            }
+        )
+    }
+
+    private func reselectTab(_ tag: Int) {
+        Task { await repo.refresh() }
+        if !tabPaths[tag].isEmpty {
+            tabPaths[tag] = NavigationPath()
+        } else {
+            scrollTop[tag] += 1
+        }
     }
 
     /// The anywhere-swipe tab-switch drag (2026-07-02). Held as a property so the attachment site can
@@ -85,7 +114,7 @@ struct RootTabView: View {
                 guard selectedTab != 0 else { return }
                 let dx = v.translation.width, dy = v.translation.height
                 guard abs(dx) > 60, abs(dx) > abs(dy) * 1.6 else { return }
-                let next = min(Self.tabCount - 1, max(0, selectedTab + (dx < 0 ? 1 : -1)))
+                let next = min(4, max(0, selectedTab + (dx < 0 ? 1 : -1)))
                 if next != selectedTab {
                     withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = next }
                 }
@@ -93,25 +122,35 @@ struct RootTabView: View {
     }
 
     var body: some View {
-        // The native TabView keeps every existing destination + system gesture; the signature
-        // raised gold FAB is overlaid on top, bottom-centre, floating ~20pt above the bar (a
-        // native TabView can't host a centre item that overflows the bar, so we float it).
-        ZStack(alignment: .bottom) {
-            // A custom floating bar — two frosted "glass" islands with the gold action button nested
-            // cleanly in the gap between them — replaces the native tab bar: no overlap, no glow. The
-            // native TabView still drives content + per-tab nav state; only its bar is hidden.
-            TabView(selection: $selectedTab) {
-                tab(todayTabRoot, "Today", "square.grid.2x2", path: $tabPaths[0], scrollSignal: scrollTop[0]).tag(0)
-                tab(TrendsView(), "Trends", "chart.line.uptrend.xyaxis", path: $tabPaths[1], scrollSignal: scrollTop[1]).tag(1)
-                tab(SleepView(), "Sleep", "bed.double", path: $tabPaths[2], scrollSignal: scrollTop[2]).tag(2)
-                tab(NutritionView(), "Nutrition", "fork.knife", path: $tabPaths[3], scrollSignal: scrollTop[3]).tag(3)
-                // More stays LAST — the catch-all index belongs at the end of the bar, so Nutrition is
-                // inserted before it rather than appended after (which is also why every index below
-                // moved from 3 to 4).
-                moreTab(path: $tabPaths[4], scrollSignal: scrollTop[4]).tag(4)
+        // The platform tab bar is intentionally left fully native. iOS 26 supplies Liquid Glass and
+        // its dynamic interaction with scrolling content automatically; older supported releases use
+        // the corresponding system material and safe-area behaviour from the same TabView.
+        TabView(selection: nativeTabSelection) {
+            tab(todayTabRoot, "Today", "square.grid.2x2", path: $tabPaths[0], scrollSignal: scrollTop[0]).tag(0)
+            tab(TrendsView(), "Trends", "chart.line.uptrend.xyaxis", path: $tabPaths[1], scrollSignal: scrollTop[1]).tag(1)
+            tab(SleepView(), "Sleep", "bed.double", path: $tabPaths[2], scrollSignal: scrollTop[2]).tag(2)
+            // K3: Coach promoted to a top-level tab (was behind the More list). The sparkles icon
+            // matches the More-tab row and the macOS sidebar entry.
+            // Conditional on the master switch. The tags stay LITERAL rather than being renumbered when
+            // Coach is absent: `tabPaths` and `scrollTop` are indexed by tag, and More stays tag 4 in both
+            // shapes, so a wearer's More tab keeps its identity, its navigation path and its scroll
+            // position across a flip instead of inheriting Coach's.
+            if coachEnabled {
+                tab(CoachView(), "Coach", "sparkles", path: $tabPaths[3], scrollSignal: scrollTop[3]).tag(3)
             }
-            .tint(StrandPalette.accent)
-            .toolbar(.hidden, for: .tabBar)
+            moreTab(path: $tabPaths[4], scrollSignal: scrollTop[4]).tag(4)
+        }
+        .tint(StrandPalette.accent)
+        // Switching Coach off while STANDING on it leaves `selectedTab` pointing at a tag no tab claims
+        // any more, which renders as an empty tab rather than as an error. Send that wearer to Today, and
+        // only in that case, so a flip made from anywhere else does not move them.
+        .onChangeCompat(of: coachEnabled) { enabled in
+            if !enabled && selectedTab == 3 { selectedTab = 0 }
+        }
+        // #1841: the same "Hide bar when scrolling" preference Android drives its own bar with. Here the
+        // system owns the behaviour — iOS 26's tab bar MINIMISES to a pill on scroll down rather than
+        // sliding away entirely, so this is the platform's read of the same intent, not a copy of ours.
+        .noopTabBarAutoHide(bottomBarAutoHide)
             // Tab crossfade — README §Motion: ~240ms opacity swap between tab roots, global calm
             // easing cubic-bezier(0.22,1,0.36,1).
             .animation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24), value: selectedTab)
@@ -136,20 +175,6 @@ struct RootTabView: View {
             // interactive-pop itself: far worse than the bug being fixed.
             .simultaneousGesture(tabSwipeGesture,
                                  including: tabPaths[selectedTab].isEmpty ? .all : .subviews)
-
-            FloatingTabBar(selection: $selectedTab, onReselect: { tag in
-                // Re-tapping the active tab refreshes that page's data (2026-07-02) and, from a
-                // subpage, pops that tab's stack back to its root (#135) — an animated pop via the
-                // path, not a rebuild. At the root the pop is skipped, so scroll position survives
-                // and the refresh doesn't double with a re-run of the root's `.task` (#198).
-                Task { await repo.refresh() }
-                if !tabPaths[tag].isEmpty {
-                    tabPaths[tag] = NavigationPath()   // on a subpage: animated pop back to the root
-                } else {
-                    scrollTop[tag] += 1                // already at root: scroll to the top (#198 follow-up)
-                }
-            })
-        }
         .task {
             await repo.refresh()
             // Backup & Sync: on-launch catch-up (see RootView). Detached + utility priority so a
@@ -182,8 +207,23 @@ struct RootTabView: View {
             case .devices:
                 showDevices = true
                 router.requestedDestination = nil
-            case .insightsHub, .labBook, .fusedRecord, .rhythm:
+            case .insightsHub, .labBook, .fusedRecord, .rhythm, .alarms:
                 routedPillar = dest
+                router.requestedDestination = nil
+            case .coach:
+                // K3: Coach is now a top-level tab (tag 3) — switch to it directly instead of
+                // presenting it as a pillar sheet.
+                //
+                // Guarded on the master switch, because this route is reachable with Coach OFF. A brief
+                // notification already sitting in Notification Centre still calls `openCoach()` when it is
+                // tapped (StrandApp wires `onCoachBriefTapped` to it), and with no tab claiming tag 3 the
+                // wearer would land on a BLANK tab. Dropping the request leaves them where they were, which
+                // is the honest answer for a feature that is switched off.
+                guard coachEnabled else {
+                    router.requestedDestination = nil
+                    break
+                }
+                withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = 3 }
                 router.requestedDestination = nil
             case .trends:
                 // Trends is a primary tab on iPhone (not a pillar sheet) — switch to it.
@@ -216,6 +256,58 @@ struct RootTabView: View {
                 router.quickActionsRequested = false
             }
         }
+        // A cold-launch selection is already pending when this shell appears; a warm selection arrives
+        // through the change callback. Both route through the same screens as the centre FAB.
+        .onAppear {
+            presentPendingHomeScreenQuickActionIfPossible()
+        }
+        .onChange(of: homeScreenQuickActions.pendingAction) { _, _ in
+            presentPendingHomeScreenQuickActionIfPossible()
+        }
+        .onChange(of: homeScreenQuickActionsEnabled) { _, _ in
+            presentPendingHomeScreenQuickActionIfPossible()
+        }
+        // The running gym session, reachable from ANY tab. It sits above the tab bar rather than
+        // inside the Lift Log screen, because a workout outlives whichever screen you wandered to —
+        // and because swiping the sheet away must minimise the session, not end it.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if liftSession.isActive {
+                LiftSessionBar()
+                    .padding(.horizontal, 14)
+                    // Clear the floating tab bar with the same constant every screen uses, or the
+                    // session bar sits on top of the tab labels.
+                    .padding(.bottom, NoopMetrics.tabBarClearance)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: liftSession.isActive)
+        // A session left running by a previous launch is back before this view exists
+        // (`LiftSessionController.resumeSaved`, from `StrandiOSApp.init`), as the BAR — not as a sheet
+        // thrown in the user's face; they open it when they want it.
+        .sheet(isPresented: $liftSession.isPresented) {
+            LiftSessionView { }
+        }
+    }
+
+    /// Mandatory launch gates defer an external action. Once the shell is available, an explicit Home
+    /// Screen choice supersedes any ordinary shell sheet; choosing the already-open destination simply
+    /// consumes the request and leaves that screen in place.
+    private func presentPendingHomeScreenQuickActionIfPossible() {
+        guard homeScreenQuickActionsEnabled,
+              let action = homeScreenQuickActions.pendingAction else { return }
+
+        let destination: QuickAction = switch action {
+        case .liveHeartRate: .live
+        case .startWorkout: .workout
+        case .logJournal: .journal
+        case .breathe: .breathe
+        }
+        homeScreenQuickActions.consume(action)
+        withAnimation(Self.sheetEase) {
+            showDevices = false
+            routedPillar = nil
+            quickAction = destination
+        }
     }
 
     /// A routed v5 pillar screen wrapped in its own nav stack + Done button (mirrors `quickScreen`).
@@ -242,6 +334,12 @@ struct RootTabView: View {
                 // .journal opens through the quick-action Journal sheet (handled above); this keeps the
                 // switch exhaustive and falls back to the journal's Insights host if it ever reaches here.
                 case .journal: InsightsView()
+                // .coach switches to the Coach tab (handled above — the morning-brief tap-through and the
+                // #1862 launcher both arrive that way, the launcher's question riding on
+                // `AICoachEngine.pendingPrompt`); this keeps the switch exhaustive and falls back to Coach if
+                // it ever reaches the host.
+                case .coach: CoachView()
+                case .alarms: SmartAlarmView()
                 }
             }
             // The Trends/Today fallbacks above emit TabRoute value pushes (#198), which need a
@@ -352,7 +450,6 @@ struct RootTabView: View {
         // Drive this tab's root scroll-to-top on an at-root re-tap (#198 follow-up); read by ScreenScaffold
         // / LiquidTodayView inside. Only THIS tab's token changes on its reselect, so the others don't scroll.
         .environment(\.scrollToTopSignal, scrollSignal)
-        .toolbar(.hidden, for: .tabBar)   // we draw our own FloatingTabBar
         .tabItem { Label(title, systemImage: icon) }
     }
 
@@ -369,7 +466,7 @@ struct RootTabView: View {
                 moreSection("Insights") {
                     MoreRow("What Moves You", "wand.and.sparkles", .insightsHub)
                     MoreRow("Intelligence", "brain.head.profile", .intelligence)
-                    MoreRow("Coach", "sparkles", .coach)
+                    // K3: Coach promoted to a top-level tab — no longer listed under More.
                     MoreRow("Insights", "lightbulb.fill", .insights)
                     MoreRow("Explore", "square.grid.2x2.fill", .explore)
                     MoreRow("Compare", "rectangle.split.2x1.fill", .compare)
@@ -377,7 +474,11 @@ struct RootTabView: View {
                 moreSection("Body") {
                     MoreRow("Live", "waveform.path.ecg", .live)
                     MoreRow("Workouts", "figure.run", .workouts)
+                    MoreRow("Lift Log", "dumbbell.fill", .liftLog)
                     MoreRow("Health", "heart.text.square.fill", .health)
+                    // Fork: the food + hydration log. Listed under More rather than as a tab, since the
+                    // native iPhone bar fits five and upstream gives that slot to Coach.
+                    MoreRow("Nutrition", "fork.knife", .nutrition)
                     MoreRow("Lab Book", "books.vertical.fill", .labBook)
                     MoreRow("Stress", "bolt.heart.fill", .stress)
                     MoreRow("Breathe", "wind", .breathe)
@@ -394,6 +495,8 @@ struct RootTabView: View {
                     // #155: HealthKit-free Apple Health path for sideloaded installs (Siri Shortcut
                     // reads the opt-in Documents/noop_sync.txt drop file).
                     MoreRow("Shortcuts Export", "square.and.arrow.up.fill", .shortcutsExport)
+                    // The plain 4.0 vs 5.0/MG capability grid — what NOOP reads live off each strap.
+                    MoreRow("NOOP Limitations", "list.bullet.rectangle", .noopLimitations)
                 }
                 moreSection("App") {
                     // #805/#811: the v7.3.1 #766 alarm consolidation moved Smart Alarm under a single
@@ -412,10 +515,12 @@ struct RootTabView: View {
                     // just buried in Settings, so the feedback loop is one tap from the More tab.
                     MoreRow("Test Centre", "stethoscope", .testCentre)
                     MoreRow("Siri & Shortcuts", "mic.fill", .siriShortcuts)
+                    // #477 lives here rather than inside Settings: the strap-battery levers are the
+                    // ones people reach for when a strap is running down, so they get their own row.
+                    MoreRow("Power saving", "battery.25", .powerSaving)
                     MoreRow("Settings", "gearshape.fill", .settings)
                 }
             }
-            .toolbar(.hidden, for: .tabBar)   // we draw our own FloatingTabBar
             // The rows push MoreDestination VALUES so a re-tap of the More tab can pop them off the
             // bound path (#135/#198). Each destination keeps the per-screen wrapper the rows used to
             // apply inline (surfaceBase background, inline title bar, hidden bar background):
@@ -432,7 +537,7 @@ struct RootTabView: View {
         }
         // Scroll the More index to the top on an at-root re-tap (#198 follow-up); read by its ScreenScaffold.
         .environment(\.scrollToTopSignal, scrollSignal)
-        .tabItem { Label("More", systemImage: "ellipsis.circle.fill") }
+        .tabItem { Label("More", systemImage: "ellipsis") }
     }
 
     /// One titled, COLLAPSIBLE group in the More index (S2): the app's overline (UPPERCASE) becomes a
@@ -496,9 +601,9 @@ struct RootTabView: View {
 /// registration in `moreTab`.
 private enum MoreDestination: Hashable {
     case insightsHub, intelligence, coach, insights, explore, compare
-    case live, workouts, health, labBook, stress, breathe, intervals, rhythm
-    case fusedRecord, appleHealth, miBand, dataSources, backupSync, shortcutsExport
-    case alarms, automations, testCentre, siriShortcuts, settings
+    case live, workouts, liftLog, health, nutrition, labBook, stress, breathe, intervals, rhythm
+    case fusedRecord, appleHealth, miBand, dataSources, backupSync, shortcutsExport, noopLimitations
+    case alarms, automations, testCentre, siriShortcuts, powerSaving, settings
 
     @ViewBuilder var destination: some View {
         switch self {
@@ -510,7 +615,9 @@ private enum MoreDestination: Hashable {
         case .compare:         CompareView()
         case .live:            LiveView()
         case .workouts:        WorkoutsView()
+        case .liftLog:         LiftLogView()
         case .health:          HealthView()
+        case .nutrition:       NutritionView()
         case .labBook:         LabBookView()
         case .stress:          StressView()
         case .breathe:         BreathingView()
@@ -520,12 +627,14 @@ private enum MoreDestination: Hashable {
         case .appleHealth:     AppleHealthView()
         case .miBand:          XiaomiBandView()
         case .dataSources:     DataSourcesView()
+        case .noopLimitations: NoopLimitationsView()
         case .backupSync:      BackupSyncView()
         case .shortcutsExport: ShortcutExportSettingsView()
         case .alarms:          SmartAlarmView()
         case .automations:     AutomationsView()
         case .testCentre:      TestCentreView()
         case .siriShortcuts:   SiriShortcutsSettingsView()
+        case .powerSaving:     PowerSavingView()
         case .settings:        SettingsView()
         }
     }
@@ -624,7 +733,7 @@ private struct QuickActionSheet: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(
-            StrandPalette.surfaceOverlay
+            NoopChromeSurface()
                 .overlay(alignment: .top) {
                     // Gold hairline top edge per the bottom-sheet spec.
                     Rectangle()
@@ -654,96 +763,33 @@ private struct QuickActionSheet: View {
             }
             .padding(.vertical, 10)
             .padding(.horizontal, 12)
-            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(StrandPalette.surfaceRaised))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(StrandPalette.hairline, lineWidth: 1))
+            .background(NoopPanelSurface(cornerRadius: 14))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 }
 
-// MARK: - Floating tab bar
-
-/// The signature bottom bar: two frosted "glass" islands (Today·Trends / Sleep·More) with the gold
-/// action button nested cleanly in the gap between them — no overlap, no glow. Real iOS 26 Liquid
-/// Glass where available, a `.ultraThinMaterial` fallback below. Replaces the hidden native tab bar.
-private struct FloatingTabBar: View {
-    @Binding var selection: Int
-    /// Fires when the user taps the ALREADY-active tab (2026-07-02: re-tap should refresh).
-    var onReselect: (Int) -> Void = { _ in }
-
-    private struct Item: Identifiable { let title: LocalizedStringKey; let icon: String; let tag: Int; var id: Int { tag } }
-    private let nav = [Item(title: "Today", icon: "square.grid.2x2", tag: 0),
-                       Item(title: "Trends", icon: "chart.line.uptrend.xyaxis", tag: 1),
-                       Item(title: "Sleep", icon: "bed.double", tag: 2),
-                       Item(title: "Nutrition", icon: "fork.knife", tag: 3),
-                       Item(title: "More", icon: "ellipsis", tag: 4)]
-
-    var body: some View {
-        // One frosted glass bar, five evenly-spaced tabs. The quick-action "+" now lives in the
-        // top-right of each screen's header (balancing the profile avatar on the left).
-        HStack(spacing: 2) {
-            ForEach(nav) { tabButton($0) }
-        }
-        .padding(.vertical, 7)
-        .padding(.horizontal, 8)
-        .liquidGlass(in: Capsule())
-        // Over the liquid Today the sky ends at ~340pt, so the bar floats on flat opaque surfaceBase —
-        // a blur material has nothing to dissolve and hardens into a solid lozenge (2026-07-02:
-        // "clips into a solid shape"). A faint translucent scrim INSIDE the same Capsule keeps the pill
-        // reading as tinted glass, not a slab, even against dead-flat colour.
-        .background(.white.opacity(0.06), in: Capsule())
-        // Soft top-lit rim instead of one hard hairline, so there's no crisp cut-out edge.
-        .overlay(
-            Capsule().strokeBorder(
-                LinearGradient(colors: [.white.opacity(0.22), .white.opacity(0.04)],
-                               startPoint: .top, endPoint: .bottom),
-                lineWidth: 0.75)
-        )
-        // Lighter, wider shadow: real elevation without stamping a dark halo on the flat canvas.
-        .shadow(color: .black.opacity(0.22), radius: 18, x: 0, y: 8)
-        .padding(.horizontal, 22)
-        .padding(.bottom, 4)
-    }
-
-    private func tabButton(_ item: Item) -> some View {
-        let active = selection == item.tag
-        return Button {
-            if active {
-                onReselect(item.tag)
-            } else {
-                withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selection = item.tag }
-            }
-        } label: {
-            VStack(spacing: 3) {
-                Image(systemName: item.icon)
-                    .font(.system(size: 18, weight: active ? .semibold : .regular))
-                Text(item.title)
-                    .font(.system(size: 10, weight: active ? .semibold : .medium))
-            }
-            .foregroundStyle(active ? StrandPalette.accent : StrandPalette.textSecondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 3)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(item.title)
-        .accessibilityAddTraits(active ? [.isButton, .isSelected] : .isButton)
-    }
-
-}
-
-// MARK: - Liquid Glass (iOS 26) with a Material fallback
-
-private extension View {
-    /// Real iOS 26 Liquid Glass where available; `.ultraThinMaterial` on iOS 17–25 — a clean
-    /// blended degrade so the bar stays modern on new OSes without breaking older ones.
-    @ViewBuilder func liquidGlass(in shape: some Shape) -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular, in: shape)
-        } else {
-            self.background(.ultraThinMaterial, in: shape)
-        }
-    }
-}
 #endif
+
+/// #1841: apply the iOS 26 tab-bar minimise behaviour, doing nothing on older systems.
+///
+/// The availability branch is deliberately the ONLY branch. `RootTabView` already documents what happens
+/// when a condition that flips at runtime wraps this `TabView`: #519 put two states in separate
+/// `_ConditionalContent` branches, and every navigation rebuilt the whole subtree, resetting `@State`
+/// inside the tab roots — scroll offsets, chart ranges, expanded sections.
+///
+/// So the preference must NOT select between branches. It selects the modifier's ARGUMENT, while the
+/// availability check — fixed for the life of the process — is what picks a branch. Toggling the setting
+/// changes a value, never the view's identity.
+extension View {
+    @ViewBuilder
+    func noopTabBarAutoHide(_ enabled: Bool) -> some View {
+        if #available(iOS 26.0, *) {
+            // `.onScrollDown` minimises to a pill on downward scroll; `.never` pins it fully visible.
+            self.tabBarMinimizeBehavior(enabled ? .onScrollDown : .never)
+        } else {
+            self
+        }
+    }
+}

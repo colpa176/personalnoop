@@ -11,6 +11,17 @@ import Foundation
 /// `canonical` string is the verbatim DB/engine key and is NEVER localised or rewritten; only
 /// `displayName` changes on a rename. The legacy custom/hidden UserDefaults arrays are folded into
 /// the v2 items once, then read-only.
+/// The UserDefaults keys `JournalCatalogStore` persists under, exposed so the backup bridge
+/// (`DataBackup`, which runs OFF the main actor) can read/write them directly without driving the
+/// `@MainActor` store. Kept beside the store so the key strings can never drift (#1361). A restore
+/// writes the restored custom names to `legacyCustom` and clears `items`; the store's init then
+/// re-migrates them into v2 on the relaunch a restore forces.
+enum JournalCatalogBackupKeys {
+    static let items = "journal.catalog.v2"
+    static let legacyCustom = "journal.customQuestions"
+    static let legacyHidden = "journal.hiddenQuestions"
+}
+
 @MainActor
 final class JournalCatalogStore: ObservableObject {
 
@@ -53,10 +64,10 @@ final class JournalCatalogStore: ObservableObject {
 
     private let d = UserDefaults.standard
     private enum K {
-        static let items = "journal.catalog.v2"
+        static let items = JournalCatalogBackupKeys.items
         // Legacy (v1) keys, read once for the one-time migration, never written again.
-        static let custom = "journal.customQuestions"
-        static let hidden = "journal.hiddenQuestions"
+        static let custom = JournalCatalogBackupKeys.legacyCustom
+        static let hidden = JournalCatalogBackupKeys.legacyHidden
     }
 
     init() {
@@ -250,11 +261,6 @@ final class JournalCatalogStore: ObservableObject {
     /// Change an item's type. `.numeric` carries an optional unit label (e.g. "mg", "units").
     func setKind(_ canonical: String, to kind: JournalKind) {
         edit(canonical) { $0.kind = kind }
-    }
-
-    /// Set an item's sort index within its group (drag-reorder).
-    func setSortIndex(_ canonical: String, to sortIndex: Int) {
-        edit(canonical) { $0.sortIndex = sortIndex }
     }
 
     // MARK: - Custom add / remove / restore (v1 API preserved)

@@ -1,4 +1,5 @@
 import Foundation
+import StrandAnalytics
 
 struct OpenAIClient: AIProviderClient {
 
@@ -23,6 +24,37 @@ struct OpenAIClient: AIProviderClient {
                 return try await chat(key: key, model: model, wire: wire, modernParams: true, session: session)
             }
             throw AICoachError.server(code, detail)
+        }
+    }
+
+    /// K1: Stream via `stream: true`. Same body as `send`, with `stream: true` added. SSE parsing
+    /// via `SseDeltas.openAiDelta`. The modern-params retry on 400 is NOT streamed (rare path;
+    /// falls back to `send`'s retry). Byte-parity pin in `SseDeltasTests.openAiReassembleMatchesFullReply`.
+    func stream(
+        key: String,
+        model: String,
+        systemPrompt: String,
+        messages: [(role: ChatMessage.Role, content: String)],
+        session: URLSession,
+        onDelta: (String) -> Void
+    ) async throws {
+        var wire: [[String: Any]] = [["role": "system", "content": systemPrompt]]
+        for m in messages { wire.append(["role": m.role.rawValue, "content": m.content]) }
+
+        var body: [String: Any] = ["model": model, "messages": wire, "stream": true]
+        body["temperature"] = 0.6
+        body["max_tokens"] = 4096
+
+        var req = URLRequest(url: AIProvider.openAI.endpoint)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        try await performStreamingRequest(req, session: session) { payload in
+            if let delta = SseDeltas.openAiDelta(payload) {
+                onDelta(delta)
+            }
         }
     }
 
@@ -54,11 +86,13 @@ struct OpenAIClient: AIProviderClient {
         session: URLSession
     ) async throws -> String {
         var body: [String: Any] = ["model": model, "messages": wire]
+        // #1074: 900 truncated detailed coaching replies mid-sentence; 4096 lets a full multi-section
+        // reply complete (a cap, not a target — the system prompt keeps it short). Matches Gemini + Android.
         if modernParams {
-            body["max_completion_tokens"] = 900
+            body["max_completion_tokens"] = 4096
         } else {
             body["temperature"] = 0.6
-            body["max_tokens"] = 900
+            body["max_tokens"] = 4096
         }
 
         var req = URLRequest(url: AIProvider.openAI.endpoint)
@@ -71,8 +105,9 @@ struct OpenAIClient: AIProviderClient {
         guard let choices = json["choices"] as? [[String: Any]],
               let first = choices.first,
               let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw AICoachError.decode
+              let content = (message["content"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines), !content.isEmpty else {
+            throw emptyReplyError(json)   // #1074: surface the provider's real error if the 200 body has one
         }
         return content
     }

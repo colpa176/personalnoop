@@ -9,11 +9,12 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.PI
+import kotlin.math.ln
 import kotlin.math.sin
 import kotlin.math.roundToInt
 
 /**
- * Basic coverage for [SleepStagerV2] (V7 Pillar 3b, reimplemented from contributor PR #600), the Android
+ * Basic coverage for [SleepStagerV2] (V7 Pillar 3b, reimplemented from @sunny-noop's recipe), the Android
  * twin of SleepStagerV2Tests.swift — the recipe that stages a normal user's nights, since the stored
  * `experimentalSleepV2` preference is default TRUE (#277 promoted it over V1; #351 extended it to every
  * strap family). Asserts the drop-in CONTRACT — same [SleepStager.stageSession] signature + return shape,
@@ -42,7 +43,76 @@ class SleepStagerV2Test {
             RrInterval(deviceId = dev, ts = start + i, rrMs = 1000 + rsa)
         }
 
+    private fun <T> oddEven(rows: List<T>): List<T> =
+        rows.filterIndexed { index, _ -> index % 2 == 0 } +
+            rows.filterIndexed { index, _ -> index % 2 == 1 }
+
     // ── drop-in contract ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * bhelm/noop#67 mirrored control: Android already sorts before binary-search clipping. The same rows in
+     * this deterministic permutation must produce the frozen sorted-input result on both native twins.
+     */
+    @Test
+    fun shuffledInputsMatchSortedInputs() {
+        val start = refMidnight + 2_000_000L
+        val duration = 90 * 60
+        val padding = 600
+        val streamStart = start - padding
+        val streamDuration = duration + 2 * padding
+        val grav = (0 until streamDuration).map { i ->
+            if (i % 2 == 0) GravitySample(dev, streamStart + i, x = 1.0, y = 0.0, z = 0.0)
+            else GravitySample(dev, streamStart + i, x = 0.0, y = 0.0, z = 1.0)
+        }
+        val hr = sleepHR(streamStart, streamDuration, base = 50)
+        val rr = regularRR(streamStart, streamDuration)
+
+        val sorted = SleepStagerV2.stageSession(start, start + duration, grav, hr, rr, emptyList())
+        assertEquals(
+            "the sorted-input output is the frozen control",
+            listOf(StageSegment(start, start + duration, "light")), sorted)
+
+        val shuffled = SleepStagerV2.stageSession(
+            start, start + duration, oddEven(grav), oddEven(hr), oddEven(rr), emptyList())
+        assertEquals(
+            "clipping must establish timestamp order before binary-search bounds", sorted, shuffled)
+    }
+
+    /**
+     * Same-second gravity accumulation is order-sensitive under catastrophic cancellation. Each call uses a
+     * distinct translated window so the memo cannot answer one permutation from another's cache entry.
+     */
+    @Test
+    fun shuffledTimestampGroupsPreserveOrderSensitiveDuplicateOutcomes() {
+        val duration = 90 * 60
+        val padding = 600
+        val streamDuration = duration + 2 * padding
+        fun stagedShape(start: Long, signalLast: Boolean, shuffled: Boolean): List<String> {
+            val streamStart = start - padding
+            val gravGroups = (0 until streamDuration).map { i ->
+                val ts = streamStart + i
+                val signal = if (i % 30 == 15) 0.25 else 0.0
+                val huge = GravitySample(dev, ts, x = 8e15, y = 0.0, z = 0.0)
+                val small = GravitySample(dev, ts, x = signal, y = 0.0, z = 0.0)
+                val negative = GravitySample(dev, ts, x = -8e15, y = 0.0, z = 0.0)
+                if (signalLast) listOf(huge, negative, small) else listOf(huge, small, negative)
+            }
+            val grav = (if (shuffled) oddEven(gravGroups) else gravGroups).flatten()
+            val hr = sleepHR(streamStart, streamDuration, base = 50)
+            val rr = regularRR(streamStart, streamDuration)
+            return SleepStagerV2.stageSession(
+                start, start + duration, grav,
+                if (shuffled) oddEven(hr) else hr, if (shuffled) oddEven(rr) else rr, emptyList())
+                .map { "${it.start - start}:${it.end - start}:${it.stage}" }
+        }
+        val base = refMidnight + 3_000_000L
+        val cancelledOracle = listOf("0:5400:light")
+        val retainedOracle = listOf("0:5400:wake")
+        assertEquals(cancelledOracle, stagedShape(base, signalLast = false, shuffled = false))
+        assertEquals(cancelledOracle, stagedShape(base + 10_000_000L, signalLast = false, shuffled = true))
+        assertEquals(retainedOracle, stagedShape(base + 20_000_000L, signalLast = true, shuffled = false))
+        assertEquals(retainedOracle, stagedShape(base + 30_000_000L, signalLast = true, shuffled = true))
+    }
 
     @Test
     fun stagesTileTheWholeSpanContiguously() {
@@ -114,10 +184,10 @@ class SleepStagerV2Test {
         assertTrue("V2 output is a segment array", v2!!.trimStart().startsWith("["))
     }
 
-    // ── #690: the V2 flag drives the NORMAL detected-night staging path ─────────────────────────────────
+    // ── 7.0.0: the V2 flag drives the NORMAL detected-night staging path ─────────────────────────────────
 
     /**
-     * #690 (v7 regression): the "Experimental sleep staging (V2)" toggle must affect a NORMAL detected
+     * 7.0.0 regression: the "Experimental sleep staging (V2)" toggle must affect a NORMAL detected
      * night — not only the userEdited self-heal restage. With the flag ON, [SleepStager.detectSleep]
      * stages the accepted window with V2 (deep + REM present); with the flag OFF it returns the EXACT V1
      * result, so the byte-identical default (and the frozen-golden tests) is preserved. Android twin of
@@ -356,5 +426,37 @@ class SleepStagerV2Test {
         for ((from, row) in SleepStagerV2.transition) {
             assertEquals("transition row '$from' must sum to 1.0", 1.0, row.values.sum(), 1e-9)
         }
+    }
+
+    /**
+     * Pin the base log-priors, deep included. The golden hypnogram does not move when a prior changes, so without
+     * this a one-sided edit would pass. Deep is 0.15, not 0.18: the one prior the sleep-accel PSG comparison
+     * (`Tools/SleepPSG` section 7) supports moving. Twin: `SleepStagerV2Tests.testBaseLogPriorsArePinned`.
+     */
+    @Test
+    fun baseLogPriorsArePinned() {
+        assertEquals(
+            mapOf("light" to ln(0.50), "deep" to ln(0.15), "rem" to ln(0.22), "awake" to ln(0.10)),
+            SleepStagerV2.baseLogPrior)
+    }
+
+    /**
+     * Pin the AWAKE transition row directly, for the same reason the deep row is pinned: the end-to-end golden
+     * is only sensitive where its own input sits near a decision boundary, and it does NOT move when this row
+     * changes — so without this assertion the row is effectively unguarded. Twin:
+     * `SleepStagerV2Tests.testWakeRowForbidsDirectDescentIntoDeepOrRem`.
+     *
+     * The zeros are the physiological claim: sleep onset descends through N1/N2, so wake never transitions
+     * straight into N3 or REM. They are also why [SleepStagerV2.viterbi] floors the log at 1e-9 — asserted here
+     * so the two can never drift apart and reintroduce ln(0) = -Inf.
+     */
+    @Test
+    fun wakeRowForbidsDirectDescentIntoDeepOrRem() {
+        assertEquals(
+            mapOf("deep" to 0.0, "rem" to 0.0, "light" to 0.10, "awake" to 0.90),
+            SleepStagerV2.transition["awake"])
+        // A zeroed entry must reach the lattice as a large finite penalty, never -Inf.
+        val lp = ln(maxOf(SleepStagerV2.transition["awake"]!!["deep"]!!, 1e-9))
+        assertTrue("a zeroed transition must not produce a non-finite log-weight", lp.isFinite())
     }
 }

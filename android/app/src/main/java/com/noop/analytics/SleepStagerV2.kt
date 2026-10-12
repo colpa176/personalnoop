@@ -18,7 +18,8 @@ import kotlin.math.sqrt
  * PuffinExperiment flag.
  *
  * Byte-identical-logic Kotlin twin of StrandAnalytics/SleepStagerV2.swift, itself reimplemented clean from
- * the contributor recipe in NoopApp/noop PR #600 (sunny-noop). We took only the per-session STAGING engine,
+ * @sunny-noop's contributor recipe (pre-fork PR #600 — NOT this repo's #600, which is an iOS
+ * notification). We took only the per-session STAGING engine,
  * not the CLI runner the PR shipped with it. Session DETECTION (the in-bed [start, end] spans) still comes
  * entirely from V1 — this file only re-stages a window someone already decided is sleep, so it is a true
  * drop-in for [SleepStager.stageSession]: SAME signature, SAME List<StageSegment> return shape.
@@ -125,6 +126,7 @@ object SleepStagerV2 {
     }
 
     /** The pure recipe, exactly as before — extracted so [stageSession] can memoize it. */
+    @Suppress("UNUSED_PARAMETER") // `resp` keeps this a drop-in for SleepStager.stageSession(…resp:) (parity)
     private fun stageSessionUncached(
         start: Long, end: Long, grav: List<GravitySample>,
         hr: List<HrSample>, rr: List<RrInterval>, resp: List<RespSample>,
@@ -159,10 +161,13 @@ object SleepStagerV2 {
 
     private val stageNames = listOf("deep", "rem", "light", "awake")
 
-    /** Population sleep-architecture base rates as log-priors (adult TST ≈ light 50 / deep 18 / rem 22 /
-     *  waso 10 %). Calibrates the boundary so light wins weak-evidence epochs. */
-    private val baseLogPrior: Map<String, Double> = mapOf(
-        "light" to ln(0.50), "deep" to ln(0.18), "rem" to ln(0.22), "awake" to ln(0.10))
+    /** Population sleep-architecture base rates as log-priors (adult TST ≈ light 50 / rem 22 / waso 10 %,
+     *  deep 15). Calibrates the boundary so light wins weak-evidence epochs. Deep was 0.18, which over-called
+     *  deep against PSG (PhysioNet sleep-accel, n = 31: +5.2 pp pooled); 0.15 alone raises per-subject kappa for
+     *  21 of 31 subjects and moves no wake or REM epoch. Swift twin, with the full evidence:
+     *  `SleepStagerV2.baseLogPrior`. */
+    internal val baseLogPrior: Map<String, Double> = mapOf(
+        "light" to ln(0.50), "deep" to ln(0.15), "rem" to ln(0.22), "awake" to ln(0.10))
 
     /** Deep is eligible only in the night's lowest ~25 % HR-flatness epochs (≈ deep base rate + margin).
      *  Widened 0.20 -> 0.25 by the multi-subject (AAUWSS + sleep-accel LOSO) deep-boundary tune, which
@@ -196,12 +201,33 @@ object SleepStagerV2 {
     private const val respWeight = 0.6
 
     /** Transition matrix (rows = from, cols = to). Self-transitions dominate; deep↔rem rare; wake mostly
-     *  to/from light. A priori, not fit. */
+     *  to/from light. A priori, not fit.
+     *
+     *  The AWAKE row encodes sleep-onset physiology directly: a sleeper does not enter N3 or REM straight
+     *  out of wakefulness — descent runs through N1/N2 — so wake→deep and wake→rem are ZERO rather than the
+     *  small non-zero values they used to carry, and the freed mass goes to the wake self-loop, which makes
+     *  a WASO episode span several epochs instead of flickering back to sleep after one. This row is the one
+     *  part of PR #348's DREAMT re-tune that survives measurement on a de-contaminated reference set; the
+     *  rest of that PR (its base priors, motion-gate multipliers, deep gate, awake dead-zone, emission
+     *  coefficients and the deep/rem/light transition rows) was reverted by #437 and stays reverted, having
+     *  measured neutral-to-negative here. See the header note on [viterbi] for why a zero is safe — and note
+     *  that ZERO is a strong prior rather than a prohibition: the viterbi floor turns it into ≈ -20.7 against
+     *  wake→light's ≈ -2.3, an ~18.4 log-unit penalty a sufficiently strong emission can still cross, so a
+     *  genuine sleep-onset REM period stays representable instead of structurally impossible.
+     *
+     *  Measured on one wearer's 36 recorded nights, against the strap's own band `sleep_state` (an
+     *  independent reference the recipe cannot contaminate — 21 nights, 15 554 epochs): sleep/wake kappa
+     *  0.105 → 0.118 and wake sensitivity 16.0 % → 17.6 %, with the healthy-stratum wake fraction essentially
+     *  unmoved (9.43 % → 9.96 %, i.e. no repeat of the #437 blow-out). Confirmed afterwards against
+     *  human-scored PSG hypnograms (PhysioNet sleep-accel, 31 subjects / 26 773 epochs, #991): 4-class kappa
+     *  0.356 → 0.363, REM F1 0.569 → 0.575, wake sensitivity 30.42 % → 30.84 %, and the #437 stage-fraction
+     *  guard holds against truth as well. n = 1 wearer for the band figures; see `Tools/SleepBench` and the
+     *  PR for the full ablation and its limits. */
     internal val transition: Map<String, Map<String, Double>> = mapOf(
         "deep" to mapOf("deep" to 0.86, "rem" to 0.007, "light" to 0.126, "awake" to 0.007),
         "rem" to mapOf("deep" to 0.005, "rem" to 0.88, "light" to 0.10, "awake" to 0.015),
         "light" to mapOf("deep" to 0.06, "rem" to 0.06, "light" to 0.85, "awake" to 0.03),
-        "awake" to mapOf("deep" to 0.01, "rem" to 0.02, "light" to 0.27, "awake" to 0.70))
+        "awake" to mapOf("deep" to 0.0, "rem" to 0.0, "light" to 0.10, "awake" to 0.90))
 
     /** One 30 s epoch's recipe features. Nullable means "no measurement"; the z-score / percentile treat a
      *  missing value as the neutral centre so a sparse channel never blocks a stage. Internal (not private) so
@@ -317,6 +343,8 @@ object SleepStagerV2 {
         )
         val raws = ArrayList<Raw>()
         val allJerks = ArrayList<Double>()
+        // The RSA transform's twiddle factors, per grid length, for this night only (see [RespDft]).
+        val respDft = HashMap<Int, RespDft>()
         val firstE = ((start + 29) / 30) * 30
         var e = firstE
         while (e < end) {
@@ -350,7 +378,7 @@ object SleepStagerV2 {
                 bs++
             }
             beats.sortWith(compareBy({ it.first }, { it.second }))
-            val respReg = respRegularity(beats)
+            val respReg = respRegularity(beats, respDft)
 
             raws.add(Raw(
                 start = e, hr = hrMean, hrVar = hrVar, hrFlat11 = hrFlat11,
@@ -383,11 +411,34 @@ object SleepStagerV2 {
     }
 
     /**
+     * The band-limited DFT's twiddle factors for one 4 Hz grid length `n`: `cos`/`sin` of `-2π·k/n · j` for
+     * every in-band bin `k` and sample `j`. [respRegularity] runs once per 30-second epoch and used to evaluate
+     * these ~53 × ~836 pairs every time; they depend on `n` alone, and a night's beat window is whole seconds
+     * wide, so it sees only a handful of distinct `n`. Each factor is computed with the very expressions the
+     * transform used inline, so reading it back is bit-identical to recomputing it. Swift twin:
+     * `SleepStagerV2.RespDFT`.
+     */
+    internal class RespDft(n: Int, val kLo: Int, kHi: Int) {
+        val cosines: Array<DoubleArray> = Array(kHi - kLo + 1) { DoubleArray(n) }
+        val sines: Array<DoubleArray> = Array(kHi - kLo + 1) { DoubleArray(n) }
+
+        init {
+            for (k in kLo..kHi) {
+                val w = -2.0 * PI * k / n
+                val c = cosines[k - kLo]; val s = sines[k - kLo]
+                for (j in 0 until n) { val a = w * j; c[j] = cos(a); s[j] = sin(a) }
+            }
+        }
+    }
+
+    /**
      * RSA respiration regularity: tachogram → 4 Hz resample → detrend → power spectrum → peak/sum of the
      * 0.15–0.40 Hz (9–24 brpm) band. Returns spectral peakedness (higher = more regular breathing) or null
      * when there are too few beats. A direct band-limited DFT (only the ~50 in-band bins are needed).
+     * [dft] holds the twiddle factors per grid length ([RespDft]), filled on first use; the caller keeps one
+     * for a night. Swift twin: `SleepStagerV2.respRegularity`.
      */
-    private fun respRegularity(beats: List<Pair<Double, Double>>): Double? {
+    internal fun respRegularity(beats: List<Pair<Double, Double>>, dft: MutableMap<Int, RespDft>): Double? {
         if (beats.size < 12) return null
         val t0 = beats.first().first; val tN = beats.last().first
         if (tN <= t0) return null
@@ -411,11 +462,12 @@ object SleepStagerV2 {
         val kLo = ceil(0.15 * 0.25 * n).toInt()
         val kHi = floor(0.40 * 0.25 * n).toInt()
         if (kHi < kLo || kLo < 0) return null
+        val table = dft.getOrPut(n) { RespDft(n, kLo, kHi) }
         var maxP = 0.0; var sumP = 0.0
         for (k in kLo..kHi) {
             var re = 0.0; var im = 0.0
-            val w = -2.0 * PI * k / n
-            for (j in 0 until n) { val a = w * j; re += y[j] * cos(a); im += y[j] * sin(a) }
+            val c = table.cosines[k - kLo]; val s = table.sines[k - kLo]
+            for (j in 0 until n) { re += y[j] * c[j]; im += y[j] * s[j] }
             val p = re * re + im * im
             sumP += p
             if (p > maxP) maxP = p
@@ -496,8 +548,11 @@ object SleepStagerV2 {
      *  uniform start. Ties resolve to the earlier stage in [stageNames]. */
     private fun viterbi(emSeq: List<Map<String, Double>>): List<String> {
         if (emSeq.isEmpty()) return emptyList()
-        // Floor before ln so a zeroed transition entry (a legal hand-edit) can never hit ln(0) = -Inf
-        // and poison the lattice. Inert for the current matrix (no zero entries). Kept from #348.
+        // Floor before ln so a zeroed transition entry can never hit ln(0) = -Inf and poison the lattice.
+        // LOAD-BEARING, not defensive: the awake row carries wake→deep = wake→rem = 0.0, so this floor is
+        // the only thing between those two entries and -Inf. Deleting it does not remove dead code, it
+        // breaks the stager. Floored, a zero costs ln(1e-9) ≈ -20.7 against wake→light's ≈ -2.3. The floor
+        // arrived with #348 and survived #437; the zeros it now carries arrived later.
         val logT = transition.mapValues { (_, row) -> row.mapValues { (_, v) -> ln(maxOf(v, 1e-9)) } }
         var v = emSeq[0]   // uniform start
         val back = ArrayList<Map<String, String>>()

@@ -34,6 +34,15 @@ interface DeviceRegistryDao {
     @Query("UPDATE pairedDevice SET status = 'active', lastSeenAt = :now WHERE id = :id")
     suspend fun promote(id: String, now: Long)
 
+    /** Stamp a device as seen right now. Nothing in the BLE path wrote `lastSeenAt` before #1527 — it was
+     *  set only when the row was created or promoted to active — so the Devices card reported
+     *  time-since-ADDED, and a strap syncing daily could read "Last seen 45 d ago".
+     *
+     *  Archived rows are excluded: "Removed - data kept" is a deliberate resting state and a stray connect
+     *  must not quietly resurrect one into looking live. Twin of the Swift store's `touchLastSeen`. */
+    @Query("UPDATE pairedDevice SET lastSeenAt = :now WHERE id = :id AND status != 'archived'")
+    suspend fun touchLastSeen(id: String, now: Long)
+
     /** Archive a device (keeps the row + its samples — invariant I4). */
     @Query("UPDATE pairedDevice SET status = 'archived' WHERE id = :id")
     suspend fun archiveDevice(id: String)
@@ -76,7 +85,6 @@ interface DeviceRegistryDao {
     @Query("DELETE FROM stepSample WHERE deviceId = :deviceId") suspend fun deleteStepsFor(deviceId: String)
     @Query("DELETE FROM ppgHrSample WHERE deviceId = :deviceId") suspend fun deletePpgHrFor(deviceId: String)
     @Query("DELETE FROM ppgWaveformSample WHERE deviceId = :deviceId") suspend fun deletePpgWaveformFor(deviceId: String)
-    @Query("DELETE FROM rawImuSample WHERE deviceId = :deviceId") suspend fun deleteRawImuFor(deviceId: String)   // #423
     @Query("DELETE FROM v18AuxSample WHERE deviceId = :deviceId") suspend fun deleteV18AuxFor(deviceId: String)
     @Query("DELETE FROM event WHERE deviceId = :deviceId") suspend fun deleteEventsFor(deviceId: String)
     @Query("DELETE FROM battery WHERE deviceId = :deviceId") suspend fun deleteBatteryFor(deviceId: String)
@@ -85,6 +93,10 @@ interface DeviceRegistryDao {
     @Query("DELETE FROM journal WHERE deviceId = :deviceId") suspend fun deleteJournalFor(deviceId: String)
     @Query("DELETE FROM workout WHERE deviceId = :deviceId") suspend fun deleteWorkoutsFor(deviceId: String)
     @Query("DELETE FROM appleDaily WHERE deviceId = :deviceId") suspend fun deleteAppleDailyFor(deviceId: String)
+    // v38-apple-step-hour: no Android importer writes this table, but a `.noopbak` restored FROM iOS
+    // carries its rows, so "delete this device's data" must clear them here too — otherwise the hourly
+    // step history survives a delete on Android alone (the defect this set exists to close).
+    @Query("DELETE FROM appleStepHour WHERE deviceId = :deviceId") suspend fun deleteAppleStepHoursFor(deviceId: String)
     @Query("DELETE FROM metricSeries WHERE deviceId = :deviceId") suspend fun deleteMetricSeriesFor(deviceId: String)
     @Query("DELETE FROM dayOwnership WHERE deviceId = :deviceId") suspend fun deleteDayOwnershipFor(deviceId: String)
     @Query("DELETE FROM scoreInputProvenance WHERE deviceId = :deviceId OR sourceId = :deviceId")
@@ -99,6 +111,24 @@ interface DeviceRegistryDao {
     @Query("DELETE FROM liveSession WHERE deviceId = :deviceId") suspend fun deleteLiveSessionsFor(deviceId: String)
     @Query("DELETE FROM dismissedWorkout WHERE deviceId = :deviceId") suspend fun deleteDismissedWorkoutsFor(deviceId: String)
     @Query("DELETE FROM dismissedSleep WHERE deviceId = :deviceId") suspend fun deleteDismissedSleepsFor(deviceId: String)
+    // v46-lift-log: the five strength-log tables, including the CHILD rows. `liftProgramItem` and
+    // `liftSet` join to their parents by id rather than by a foreign key, so deleting only the parents
+    // would strip the programs and sessions and leave every logged set behind — the same shape as the
+    // audit finding above. Landed WITH the schema rather than after it: no Android DAO writes these
+    // tables yet, so nothing would notice the gap until something did, and `deleteDeviceDataCallsEvery\
+    // DaoDeleteMethod` cannot see a table that has no method at all.
+    @Query("DELETE FROM liftExercise WHERE deviceId = :deviceId") suspend fun deleteLiftExercisesFor(deviceId: String)
+    @Query("DELETE FROM liftProgram WHERE deviceId = :deviceId") suspend fun deleteLiftProgramsFor(deviceId: String)
+    @Query("DELETE FROM liftProgramItem WHERE deviceId = :deviceId") suspend fun deleteLiftProgramItemsFor(deviceId: String)
+    @Query("DELETE FROM liftSession WHERE deviceId = :deviceId") suspend fun deleteLiftSessionsFor(deviceId: String)
+    @Query("DELETE FROM liftSet WHERE deviceId = :deviceId") suspend fun deleteLiftSetsFor(deviceId: String)
+
+    /**
+     * Delete individual sets by id, as editing a finished session does when a set is removed. The
+     * session itself stays. Ported ahead of its consumer: Android has no Lift Log screen yet.
+     * The Swift twin is `WhoopStore.deleteLiftSets`.
+     */
+    @Query("DELETE FROM liftSet WHERE id IN (:ids)") suspend fun deleteLiftSets(ids: List<String>)
 
     // #771 adopt-serial: re-key one device's rows onto the serial id across every device-scoped table.
     // `UPDATE OR IGNORE` so the canonical (serial) row wins any (deviceId, ts…) primary-key clash; the
@@ -113,7 +143,6 @@ interface DeviceRegistryDao {
     @Query("UPDATE OR IGNORE stepSample SET deviceId = :to WHERE deviceId = :from") suspend fun reKeySteps(from: String, to: String)
     @Query("UPDATE OR IGNORE ppgHrSample SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyPpgHr(from: String, to: String)
     @Query("UPDATE OR IGNORE ppgWaveformSample SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyPpgWaveform(from: String, to: String)
-    @Query("UPDATE OR IGNORE rawImuSample SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyRawImu(from: String, to: String)
     @Query("UPDATE OR IGNORE v18AuxSample SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyV18Aux(from: String, to: String)
     @Query("UPDATE OR IGNORE event SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyEvents(from: String, to: String)
     @Query("UPDATE OR IGNORE battery SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyBattery(from: String, to: String)
@@ -122,6 +151,7 @@ interface DeviceRegistryDao {
     @Query("UPDATE OR IGNORE journal SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyJournal(from: String, to: String)
     @Query("UPDATE OR IGNORE workout SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyWorkouts(from: String, to: String)
     @Query("UPDATE OR IGNORE appleDaily SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyAppleDaily(from: String, to: String)
+    @Query("UPDATE OR IGNORE appleStepHour SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyAppleStepHour(from: String, to: String)
     @Query("UPDATE OR IGNORE metricSeries SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyMetricSeries(from: String, to: String)
     @Query("UPDATE OR IGNORE dayOwnership SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyDayOwnership(from: String, to: String)
     @Query("UPDATE OR IGNORE sleepStateSample SET deviceId = :to WHERE deviceId = :from") suspend fun reKeySleepStates(from: String, to: String)
@@ -129,6 +159,11 @@ interface DeviceRegistryDao {
     @Query("UPDATE OR IGNORE liveSession SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyLiveSessions(from: String, to: String)
     @Query("UPDATE OR IGNORE dismissedWorkout SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyDismissedWorkouts(from: String, to: String)
     @Query("UPDATE OR IGNORE dismissedSleep SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyDismissedSleeps(from: String, to: String)
+    @Query("UPDATE OR IGNORE liftExercise SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyLiftExercises(from: String, to: String)
+    @Query("UPDATE OR IGNORE liftProgram SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyLiftPrograms(from: String, to: String)
+    @Query("UPDATE OR IGNORE liftProgramItem SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyLiftProgramItems(from: String, to: String)
+    @Query("UPDATE OR IGNORE liftSession SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyLiftSessions(from: String, to: String)
+    @Query("UPDATE OR IGNORE liftSet SET deviceId = :to WHERE deviceId = :from") suspend fun reKeyLiftSets(from: String, to: String)
 
     /** The registry row for [id], or null. (#771 adopt-serial needs the active row's fields to clone/carry.) */
     @Query("SELECT * FROM pairedDevice WHERE id = :id")

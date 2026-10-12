@@ -29,7 +29,7 @@ final class FoodLogStoreTests: XCTestCase {
     func testV33DoesNotDropExistingTables() async throws {
         let store = try await WhoopStore.inMemory()
         let tables = try await store.tableNames()
-        for t in ["metricSeries", "dailyMetric", "coachTurn", "journal", "workout"] {
+        for t in ["metricSeries", "dailyMetric", "coachMessage", "journal", "workout"] {
             XCTAssertTrue(tables.contains(t), "v33 must not drop \(t)")
         }
     }

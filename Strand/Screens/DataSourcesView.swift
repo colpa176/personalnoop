@@ -55,6 +55,7 @@ struct DataSourcesView: View {
     // LOCAL Bluetooth only — nothing leaves the device. The toggle is persisted; the broadcaster is owned
     // here (a pure consumer of LiveState, isolated from the WHOOP/central path).
     @AppStorage(HrBroadcaster.defaultsKey) private var broadcastHrEnabled = false
+    @AppStorage(PuffinExperiment.broadcastHrKey) private var strapBroadcastHrEnabled = false
 
     // The broadcaster's diagnostic sink forwards to THIS box, which `onAppear` points at the screen's
     // `live`. A reference box lets the `@StateObject` capture a stable target at init even though the
@@ -472,7 +473,7 @@ struct DataSourcesView: View {
                         strain: nil,                 // never a fabricated cardiovascular strain
                         distanceM: nil,
                         zonesJSON: nil,
-                        notes: s.volumeLoadNote()
+                        notes: s.volumeLoadNote(), steps: nil
                     )
                 }
                 try await store.upsertWorkouts(rows, deviceId: LiftingImporter.sourceId)
@@ -561,7 +562,8 @@ struct DataSourcesView: View {
                     strain: nil,                         // never a fabricated cardiovascular strain
                     distanceM: activity.distanceM,
                     zonesJSON: nil,
-                    notes: activity.importNote()
+                    notes: activity.importNote(),
+                    steps: activity.steps                 // #1058: per-session steps, summed into the day below
                 )
                 try await store.upsertWorkouts([row], deviceId: ActivityFileImporter.sourceId)
 
@@ -573,24 +575,38 @@ struct DataSourcesView: View {
                     let hr = activity.hrSamples.map { HRSample(ts: $0.ts, bpm: $0.bpm) }
                     _ = try? await store.insert(Streams(hr: hr), deviceId: ActivityFileImporter.sourceId)
                 }
-                if let steps = activity.steps, steps > 0 {
-                    let day = Repository.localDayKey(activity.start)
-                    let metric = DailyMetric(
-                        day: day,
-                        totalSleepMin: nil,
-                        efficiency: nil,
-                        deepMin: nil,
-                        remMin: nil,
-                        lightMin: nil,
-                        disturbances: nil,
-                        restingHr: nil,
-                        avgHrv: nil,
-                        recovery: nil,
-                        strain: nil,
-                        exerciseCount: nil,
-                        steps: steps
-                    )
-                    try? await store.upsertDailyMetrics([metric], deviceId: ActivityFileImporter.sourceId)
+                // #1058: recompute the day's activity-file step total as the SUM over ALL that day's
+                // sessions (now that each carries its own steps), so a second file for the same day ADDS
+                // to the first instead of clobbering it. Idempotent on re-import: the file's workout row
+                // (keyed on startTs+sport) is replaced, not duplicated, so the re-summed total is unchanged.
+                // Only recompute when THIS file contributed steps (a foot sport); a cycling import leaves
+                // the day's step total untouched.
+                if (activity.steps ?? 0) > 0 {
+                    let dayStart = Calendar.current.startOfDay(for: activity.start)
+                    let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart)
+                        ?? dayStart.addingTimeInterval(86_400)
+                    let daySteps = (try? await store.sumWorkoutSteps(
+                        deviceId: ActivityFileImporter.sourceId,
+                        from: Int(dayStart.timeIntervalSince1970),
+                        to: Int(dayEnd.timeIntervalSince1970))) ?? 0
+                    if daySteps > 0 {
+                        let metric = DailyMetric(
+                            day: Repository.localDayKey(activity.start),
+                            totalSleepMin: nil,
+                            efficiency: nil,
+                            deepMin: nil,
+                            remMin: nil,
+                            lightMin: nil,
+                            disturbances: nil,
+                            restingHr: nil,
+                            avgHrv: nil,
+                            recovery: nil,
+                            strain: nil,
+                            exerciseCount: nil,
+                            steps: daySteps
+                        )
+                        try? await store.upsertDailyMetrics([metric], deviceId: ActivityFileImporter.sourceId)
+                    }
                 }
 
                 // #137 (B1): register `activity-file` as an `.activityFile` device so the per-day owner
@@ -899,15 +915,38 @@ struct DataSourcesView: View {
         // Three-state, consistent with the Live screen's connection pill — a connected-but-
         // not-yet-streaming strap (e.g. an experimental WHOOP 5/MG link) no longer reads as
         // "Not connected" on one screen and "Connected" on another (issue #8).
-        let (tone, label): (StrandTone, LocalizedStringKey) =
-            live.bonded ? (.positive, "Bonded, streaming.")
-            : live.connected ? (.warning, "Connected.")
-            : (.critical, "Not connected. Open Live to pair.")
+        // Written as statements rather than a ternary chain: five arms of (StrandTone,
+        // LocalizedStringKey) tuples is the shape that pushes this expression past the iOS type-check
+        // budget, and it fails in CI rather than here.
+        let tone: StrandTone
+        let label: LocalizedStringKey
+        if live.encryptedBond {
+            tone = .positive; label = "Bonded, streaming."
+        } else if live.bonded {
+            tone = .warning; label = "Live HR (not fully paired)"
+        } else if live.connected {
+            tone = .warning; label = "Connected."
+        } else {
+            tone = .critical; label = "Not connected. Open Live to pair."
+        }
         return card(title: String(localized: "WHOOP Strap (Live BLE)"), icon: "antenna.radiowaves.left.and.right",
              tint: StrandPalette.accent,
              status: StatePill(label, tone: tone, pulsing: live.connected && !live.bonded),
              subtitle: String(localized: "Pairs directly with your strap over Bluetooth: no WHOOP app, no cloud.")) {
-            EmptyView()
+            Toggle(isOn: $strapBroadcastHrEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Broadcast heart rate from the strap")
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Text("Broadcasts the strap's own live heart rate over Bluetooth.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                }
+            }
+            .toggleStyle(.switch)
+            .tint(StrandPalette.accent)
+            .accessibilityLabel("Broadcast heart rate from the strap")
+            .onChangeCompat(of: strapBroadcastHrEnabled) { model.ble.setBroadcastHr($0) }
         }
     }
 

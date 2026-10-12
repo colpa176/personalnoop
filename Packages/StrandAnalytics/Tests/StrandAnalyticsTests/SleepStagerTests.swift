@@ -475,7 +475,9 @@ final class SleepStagerTests: XCTestCase {
     private func depthEpoch(rmssd: Double) -> SleepStager.EpochFeatures {
         SleepStager.EpochFeatures(index: 0, midTs: 0, count: 0, moveFrac: 0,   // still
                                   ckSleep: true, hr: 50, hrVar: 0, rmssd: rmssd, sdnn: 0,
-                                  respRate: 14, rrv: .nan,            // missing resp → regular (pro-deep)
+                                  // No respiration reading: `RespEvidence.unmeasured`, which is WAIVED for
+                                  // deep (not asserted as "regular" — see SleepStagerRespEvidenceTests).
+                                  respRate: 14, rrv: .nan,
                                   clock: 0.5)
     }
 
@@ -497,7 +499,7 @@ final class SleepStagerTests: XCTestCase {
     // epoch stays sleep. A dense 4.0 night (cardiacSparse:false) keeps the original hrHigh||hrvarHigh signal.
     private func ppgWakeEpoch() -> SleepStager.EpochFeatures {
         // moveFrac just over the wake bar (0.15), HR normal (60, below hrHi=90, above hrLo=55 so not deep),
-        // hrVar inflated above the high bar, missing R-R (sparse → resp also NaN → regular).
+        // hrVar inflated above the high bar, missing R-R (sparse → resp also NaN → unmeasured/waived).
         SleepStager.EpochFeatures(index: 0, midTs: 0, count: 0, moveFrac: 0.16,
                                   ckSleep: true, hr: 60, hrVar: 200, rmssd: .nan, sdnn: 0,
                                   respRate: 14, rrv: .nan, clock: 0.5)
@@ -857,6 +859,182 @@ final class SleepStagerTests: XCTestCase {
         XCTAssertLessThan(hrv!, 50, "ectopic spikes must be rejected before rMSSD")
     }
 
+    // MARK: - Session window endpoint: the closed [start, end] window has a closed FINAL bin
+
+    // `sessionRestingHR` and `sessionHrvWindows` prefilter ts ∈ [start, end], so a sample sitting
+    // exactly ON `end` is admitted. Binned as [t, t + 300) with a loop that stops at `end`, an
+    // ALIGNED end (end - start a multiple of the window) left that admitted sample in no bin: it
+    // counted as data and was then silently ignored. The final bin is therefore closed on `end`,
+    // the same rule RecoveryScorer already carries. Each case is paired with a non-aligned twin
+    // that was always correct, so the fix cannot be mistaken for a change to trailing partial bins.
+    // Expected values are the verbatim stdout of a standalone Swift oracle over the fixed binning;
+    // SleepStagerWindowEndpointTest.kt pins the same scenarios with the same literals.
+
+    func testSessionRestingHRAlignedEndpointSampleReachesABin() {
+        // Minimal case: start = 0, end = 300 (one window wide), five samples on the endpoint.
+        // Already returned 60 before the fix, but only via the all-sample fallback (no bin held
+        // anything); it now flows through the bin path.
+        let hr = (0..<5).map { _ in HRSample(ts: 300, bpm: 60) }
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 300, hr: hr), 60,
+                       "a sample exactly on an aligned end must belong to the final bin")
+    }
+
+    func testSessionRestingHRNonAlignedEndpointSampleReachesABin() {
+        // Paired non-aligned case: end = 450 falls mid-window, so the endpoint sample was always
+        // inside the trailing partial bin. Same answer, before and after.
+        let hr = (0..<5).map { _ in HRSample(ts: 450, bpm: 60) }
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 450, hr: hr), 60,
+                       "a sample on a non-aligned end stays in the trailing partial bin")
+    }
+
+    func testSessionRestingHREndpointSampleLandsInFinalBinOnly() {
+        // Where the fallback cannot hide the dropped sample: a dense 70 bpm first bin plus five
+        // endpoint beats at 40 makes the floor 40, and the 70 bpm bin stays untouched. Before the
+        // fix the endpoint beats vanished and the shipped resting HR read 70.
+        var hr: [HRSample] = (0..<300).map { HRSample(ts: $0, bpm: 70) }
+        hr.append(contentsOf: (0..<5).map { _ in HRSample(ts: 600, bpm: 40) })
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 600, hr: hr), 40,
+                       "the endpoint sample belongs to the final bin only")
+    }
+
+    func testSessionRestingHRDegenerateZeroLengthWindow() {
+        // start == end: the single instant is one closed bin — the same number the all-sample
+        // fallback produced before.
+        let hr = (0..<5).map { _ in HRSample(ts: 1000, bpm: 58) }
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 1000, end: 1000, hr: hr), 58)
+    }
+
+    func testSessionRestingHREndpointSweepMatchesOracle() {
+        // `end` walks a whole window width and beyond in 25 s steps against a dense 70 bpm opening
+        // bin plus five endpoint beats at 60. Verbatim oracle stdout, the check that catches drift
+        // the eye does not — including end = 300, where the single closed bin holds BOTH groups.
+        let expected = [62, 68, 69, 69, 70, 70, 70, 70, 70, 70, 70, 70, 70,
+                        60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60,
+                        60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60]
+        var i = 0
+        var endTs = 0
+        while endTs <= 900 {
+            var hr: [HRSample] = (0..<300).map { HRSample(ts: $0, bpm: 70) }
+            hr.append(contentsOf: (0..<5).map { _ in HRSample(ts: endTs, bpm: 60) })
+            XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: endTs, hr: hr), expected[i],
+                           "sessionRestingHR.end=\(endTs)")
+            i += 1
+            endTs += 25
+        }
+    }
+
+    // MARK: - #1943: sessionRestingHR bin-population + plausibility gates
+
+    // A one-sample bin at a dropout bpm would have won the floor before the gate. The gate excludes
+    // it (winnerN < minBinSamples), and the floor falls back to the next-best qualifying bin.
+    func testSessionRestingHRThinBinCannotWinTheFloor() {
+        // 300 samples at 60 in the first bin (qualifies), one sample at 38 in the final bin (thin).
+        // Before #1943 the floor was 38; now the thin bin is excluded and the floor is 60.
+        var hr: [HRSample] = (0..<300).map { HRSample(ts: $0, bpm: 60) }
+        hr.append(HRSample(ts: 600, bpm: 38))
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 600, hr: hr), 60,
+                       "a one-sample bin cannot win the floor under the #1943 gate")
+    }
+
+    // A sub-physiological mean (below 25 bpm) is excluded even when the bin is well-populated, so a
+    // dropout artefact sustained across several samples cannot become the resting HR either.
+    func testSessionRestingHRImplausibleBinCannotWinTheFloor() {
+        // 300 samples at 60 (qualifies), then 300 samples at 20 (well-populated but implausible).
+        // Before #1943 the floor was 20; now the implausible bin is excluded and the floor is 60.
+        let hr: [HRSample] = (0..<300).map { HRSample(ts: $0, bpm: 60) }
+            + (300..<600).map { HRSample(ts: $0, bpm: 20) }
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 600, hr: hr), 60,
+                       "a sub-25 bpm bin cannot win the floor under the #1943 gate")
+    }
+
+    // When every bin is thin or implausible, the gate falls back to the lowest of ALL bin means
+    // (ungated), preserving the never-null-on-data behaviour. The floor is the same as before the
+    // gate existed.
+    func testSessionRestingHRAllBinsGatedFallsBackToUngatedMin() {
+        // Two bins, each with one sample: 40 and 50. Neither qualifies (both thin). The fallback
+        // is the min of all bin means = 40, the same value the ungated path produced.
+        let hr: [HRSample] = [HRSample(ts: 0, bpm: 40), HRSample(ts: 300, bpm: 50)]
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 600, hr: hr), 40,
+                       "when no bin qualifies, the floor falls back to the ungated min")
+    }
+
+    // A dense, ordinary night (every bin well-populated and plausible) is unchanged by the gate.
+    func testSessionRestingHRDenseNightUnchangedByGate() {
+        let hr: [HRSample] = (0..<1800).map { HRSample(ts: $0, bpm: 60) }
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 1800, hr: hr), 60,
+                       "a well-populated night is unchanged by the gate")
+    }
+
+    // The gate's threshold is exactly 5 samples: a bin with 5 qualifies, a bin with 4 does not.
+    func testSessionRestingHRBinSampleCountBoundary() {
+        // First bin: 300 samples at 70 (qualifies). Final bin: 4 samples at 40 (below threshold).
+        // The 4-sample bin is excluded; the floor is 70.
+        var hr: [HRSample] = (0..<300).map { HRSample(ts: $0, bpm: 70) }
+        hr.append(contentsOf: (0..<4).map { _ in HRSample(ts: 600, bpm: 40) })
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 600, hr: hr), 70,
+                       "a 4-sample bin is below the minBinSamples=5 threshold and cannot win")
+    }
+
+    // The plausibility gate's threshold is exactly 25 bpm: a mean of 25 qualifies, 24.9 does not.
+    func testSessionRestingHRPlausibilityBoundary() {
+        // First bin: 300 samples at 60 (qualifies). Final bin: 300 samples at 24 (implausible).
+        // The 24-bpm bin is excluded; the floor is 60.
+        let hr: [HRSample] = (0..<300).map { HRSample(ts: $0, bpm: 60) }
+            + (300..<600).map { HRSample(ts: $0, bpm: 24) }
+        XCTAssertEqual(SleepStager.sessionRestingHR(start: 0, end: 600, hr: hr), 60,
+                       "a 24-bpm mean is below the minPlausibleBpm=25 threshold and cannot win")
+    }
+
+    func testSessionHrvWindowsAlignedEndpointBeatsFillTheFinalWindow() {
+        // 120 beats in the opening window plus 25 beats exactly on an aligned end = 600 (enough to clear
+        // the `minBeats` floor). The second window is the final one, so it closes on `end` and holds them;
+        // before the fix it was emitted empty and its RMSSD was nil. Constant 900 ms RR keeps the
+        // RMSSD analytically 0.0 on both platforms — this pins the BINNING, not the RMSSD math.
+        var rr: [RRInterval] = (0..<120).map { RRInterval(ts: $0, rrMs: 900) }
+        rr.append(contentsOf: (0..<25).map { _ in RRInterval(ts: 600, rrMs: 900) })
+        let wins = SleepStager.sessionHrvWindows(start: 0, end: 600, rr: rr, stages: [])
+        XCTAssertEqual(wins.map { $0.startTs }, [0, 300])
+        XCTAssertEqual(wins.map { $0.cleanBeats }, [120, 25],
+                       "the endpoint beats must fill the final window")
+        XCTAssertEqual(wins.map { $0.rmssd }, [0.0, 0.0])
+    }
+
+    func testSessionHrvWindowsNonAlignedEndpointUnchanged() {
+        // Paired non-aligned case: end = 450 sits mid-window, so the endpoint beats were already
+        // inside the trailing partial window. Same shape, before and after.
+        var rr: [RRInterval] = (0..<120).map { RRInterval(ts: $0, rrMs: 900) }
+        rr.append(contentsOf: (0..<3).map { _ in RRInterval(ts: 450, rrMs: 900) })
+        let wins = SleepStager.sessionHrvWindows(start: 0, end: 450, rr: rr, stages: [])
+        XCTAssertEqual(wins.map { $0.startTs }, [0, 300])
+        XCTAssertEqual(wins.map { $0.cleanBeats }, [120, 3])
+    }
+
+    func testSessionAvgHRVZeroLengthWindowUsesTheEndpointBeats() {
+        // The value-level consequence: a zero-length window (start == end) is one closed bin, so
+        // beats admitted by the prefilter produce a number instead of nil.
+        let rr = (0..<25).map { _ in RRInterval(ts: 1000, rrMs: 900) }
+        XCTAssertEqual(SleepStager.sessionAvgHRV(start: 1000, end: 1000, rr: rr), 0.0)
+    }
+
+    func testSessionHrvWindowNeedsMinBeatsCleanIntervals() {
+        // A window emits an RMSSD only with `HRVAnalyzer.minBeats` (20) clean intervals: 19 is nil, 20 is
+        // a value. Before the floor a window needed just 2, and weighed as much as a full one in the mean.
+        func window(_ n: Int) -> Double? {
+            let rr = (0..<n).map { RRInterval(ts: $0, rrMs: 900) }
+            return SleepStager.sessionHrvWindows(start: 0, end: 300, rr: rr, stages: []).first?.rmssd
+        }
+        XCTAssertNil(window(HRVAnalyzer.minBeats - 1))
+        XCTAssertEqual(window(HRVAnalyzer.minBeats), 0.0)
+    }
+
+    func testSessionAvgHRVIgnoresASparseWindow() {
+        // A full window of alternating 900/1000 ms (RMSSD 100) next to a sparse one of 900/1300 ms
+        // (RMSSD 400, 10 beats). Without the floor the sparse window counted equally and the mean was 250.
+        let full = (0..<300).map { RRInterval(ts: $0, rrMs: $0 % 2 == 0 ? 900 : 1000) }
+        let sparse = (0..<10).map { RRInterval(ts: 300 + $0 * 25, rrMs: $0 % 2 == 0 ? 900 : 1300) }
+        XCTAssertEqual(SleepStager.sessionAvgHRV(start: 0, end: 600, rr: full + sparse), 100.0)
+    }
+
     // MARK: - Helper robustness
 
     func testConvolveReflectShortInputDoesNotCrash() {
@@ -1052,6 +1230,184 @@ final class SleepStagerTests: XCTestCase {
             SleepStager.passesMorningStillnessGuard(p, restingHR: 74, baseline: 80,
                                                     morningWakeEnd: wakeEnd, bandSleepState: reconstructed),
             "the persisted+re-expanded band grid drives the H7 confirm end to end")
+    }
+
+    // MARK: - Band sleep_state WAKE-veto (recover strap-disputed false wakes)
+
+    /// A hypnogram tiling [0, 960] (32 epochs of 30 s): a leading onset-latency wake block, an INTERIOR
+    /// WASO wake block (epochs 10–15 = [300, 480)), and a trailing final-morning wake block — the exact
+    /// shape the veto must treat differently at the edges vs the interior.
+    private func vetoHypnoFixture() -> [StageSegment] {
+        [ StageSegment(start: 0,   end: 60,  stage: "wake"),    // epochs 0–1  (onset latency)
+          StageSegment(start: 60,  end: 300, stage: "light"),   // epochs 2–9
+          StageSegment(start: 300, end: 480, stage: "wake"),    // epochs 10–15 (interior WASO)
+          StageSegment(start: 480, end: 900, stage: "light"),   // epochs 16–29
+          StageSegment(start: 900, end: 960, stage: "wake") ]   // epochs 30–31 (final wake)
+    }
+    /// One band sample per 30 s epoch carrying the given states (the shape sessionEpochSleepState grids).
+    private func bandSamples(start: Int, _ states: [Int]) -> [(ts: Int, state: Int)] {
+        states.enumerated().map { (ts: start + $0.offset * 30, state: $0.element) }
+    }
+    private func bandAllAsleep(start: Int, end: Int) -> [(ts: Int, state: Int)] {
+        let n = max(1, Int(ceil(Double(end - start) / 30.0)))
+        return (0..<n).map { (ts: start + $0 * 30, state: 2) }
+    }
+
+    func testBandStateWakeVetoRecoversInteriorFalseWake() {
+        // The strap's OWN band reads "asleep" (2) across the WHOLE night. The interior WASO block is
+        // recovered to light (and merges with the flanking light); the leading onset-latency and trailing
+        // final-wake blocks are NEVER touched even though the band scored them asleep too.
+        let out = SleepStager.applyBandStateWakeVeto(vetoHypnoFixture(), start: 0, end: 960,
+                                                     bandSleepState: bandAllAsleep(start: 0, end: 960),
+                                                     enabled: true)
+        XCTAssertEqual(out, [
+            StageSegment(start: 0,   end: 60,  stage: "wake"),
+            StageSegment(start: 60,  end: 900, stage: "light"),
+            StageSegment(start: 900, end: 960, stage: "wake"),
+        ], "interior @81-asleep wake → light (merged); onset-latency + final-wake blocks stay wake")
+    }
+
+    func testBandStateWakeVetoOnlyAsleepStateVetoes() {
+        // Interior wake epochs 10–15 get band states still(1)/up(3)/wake(0) — none is asleep(2) — so NONE
+        // is recovered. (Sleep + edge epochs are asleep(2) but the veto only ever looks at wake epochs, and
+        // the edges are excluded.) The hypnogram is returned byte-identical.
+        var states = [Int](repeating: 2, count: 32)
+        for (k, i) in (10...15).enumerated() { states[i] = [1, 1, 3, 3, 0, 0][k] }
+        let out = SleepStager.applyBandStateWakeVeto(vetoHypnoFixture(), start: 0, end: 960,
+                                                     bandSleepState: bandSamples(start: 0, states),
+                                                     enabled: true)
+        XCTAssertEqual(out, vetoHypnoFixture(),
+                       "still/up/wake band never vetoes — only the strap's explicit asleep(2) does")
+    }
+
+    func testBandStateWakeVetoPartialInteriorRecovery() {
+        // Per-EPOCH: within the interior WASO block, only epochs 10–12 are asleep(2); 13–15 are up(3). The
+        // block splits — [300,390) recovered to light, [390,480) stays wake — proving epoch granularity.
+        var states = [Int](repeating: 2, count: 32)
+        for i in 13...15 { states[i] = 3 }
+        let out = SleepStager.applyBandStateWakeVeto(vetoHypnoFixture(), start: 0, end: 960,
+                                                     bandSleepState: bandSamples(start: 0, states),
+                                                     enabled: true)
+        XCTAssertEqual(out, [
+            StageSegment(start: 0,   end: 60,  stage: "wake"),
+            StageSegment(start: 60,  end: 390, stage: "light"),
+            StageSegment(start: 390, end: 480, stage: "wake"),
+            StageSegment(start: 480, end: 900, stage: "light"),
+            StageSegment(start: 900, end: 960, stage: "wake"),
+        ], "only the asleep-banded sub-run of an interior wake block is recovered")
+    }
+
+    func testBandStateWakeVetoNoOpWhenBandAbsent() {
+        // No band stream (WHOOP 4.0 / unbanded window) → byte-identical hypnogram, whatever the flag.
+        XCTAssertEqual(
+            SleepStager.applyBandStateWakeVeto(vetoHypnoFixture(), start: 0, end: 960, bandSleepState: [],
+                                               enabled: true),
+            vetoHypnoFixture(), "absent band → veto is a no-op even when armed")
+        // Band entirely outside the window grids to empty → also a no-op (never fabricates asleep).
+        XCTAssertEqual(
+            SleepStager.applyBandStateWakeVeto(vetoHypnoFixture(), start: 0, end: 960,
+                                               bandSleepState: [(ts: 100_000, state: 2)],
+                                               enabled: true),
+            vetoHypnoFixture())
+    }
+
+    func testBandStateWakeVetoPreservesTilingAndOnlyRemovesWake() {
+        XCTAssertFalse(SleepStager.bandStateWakeVetoEnabled,
+                       "band sleep_state veto ships default-OFF until PSG supports it — the harness "
+                       + "currently measures the shipped recipe UNDER-calling wake (bias −4.92 pp), "
+                       + "so converting wake→light by default would move away from truth")
+        let stages = vetoHypnoFixture()
+        let out = SleepStager.applyBandStateWakeVeto(stages, start: 0, end: 960,
+                                                     bandSleepState: bandAllAsleep(start: 0, end: 960),
+                                                     enabled: true)
+        XCTAssertEqual(out.first?.start, 0)
+        XCTAssertEqual(out.last?.end, 960)
+        for i in 1..<out.count {
+            XCTAssertEqual(out[i].start, out[i - 1].end, "segments tile [start,end] with no gaps/overlaps")
+        }
+        let wake: ([StageSegment]) -> Int = { $0.filter { $0.stage == "wake" }.reduce(0) { $0 + ($1.end - $1.start) } }
+        XCTAssertLessThan(wake(out), wake(stages), "the veto only ever turns wake into sleep")
+    }
+
+    func testBandStateWakeVetoDefaultOffLeavesHypnogramUnchangedEndToEnd() {
+        // WIRING PROOF through detectSleep, for the SHIPPED default (OFF until PSG supports the veto —
+        // the harness currently measures the recipe UNDER-calling wake against truth, bias −4.92 pp, so
+        // default-on would move away from it). A still overnight night with a mid-sleep motion+HR burst
+        // that NOOP scores as INTERIOR wake, plus an all-"asleep" band threaded end to end: with the
+        // flag off the band must change NOTHING — byte-identical stages, identical efficiency. This is
+        // the wiring test's inverse: it proves the band stream reaches the veto AND that the flag gates
+        // it, so flipping the default is the only change needed to re-enable (the ON-path mechanism is
+        // covered by the pure `applyBandStateWakeVeto(enabled: true)` tests above).
+        let start = nightStart(2)                 // 02:00 overnight (skips the daytime nap guard)
+        let dur = 6 * 3600
+        var grav = stillGravity(start: start, durationS: dur)
+        var hr = hrStream(start: start, durationS: dur, bpm: 50)
+        for i in (3 * 3600)..<(3 * 3600 + 5 * 60) {   // 5-min burst at +3h: high motion + elevated HR
+            grav[i] = GravitySample(ts: start + i, x: Double(i % 2) * 0.5, y: 0, z: 1.0)
+            hr[i] = HRSample(ts: start + i, bpm: 95)
+        }
+        let noBand = SleepStager.detectSleep(hr: hr, gravity: grav)
+        XCTAssertEqual(noBand.count, 1)
+        let withBand = SleepStager.detectSleep(hr: hr, gravity: grav,
+                                               bandSleepState: bandAllAsleep(start: start, end: start + dur))
+        XCTAssertEqual(withBand.count, 1)
+        XCTAssertEqual(withBand[0].stages, noBand[0].stages,
+                       "default-off: an all-asleep band changes NOTHING — byte-identical hypnogram")
+        XCTAssertEqual(withBand[0].efficiency, noBand[0].efficiency, accuracy: 1e-9,
+                       "default-off: efficiency is untouched by the band stream")
+    }
+
+    func testBandVetoShadowLineIsNamespacedAndUncounted() {
+        // #1210 shadow: the validation line formats the recovered delta and is NEVER miscounted as a captured
+        // sleep day (carries no `sleep day=` / `gate run=` / `day=` token). Byte-identical format to Kotlin.
+        let line = SleepStager.bandVetoShadowLine(startTs: 1_723_000_000, recoveredMin: 31.4,
+                                                  rawEff: 0.742, shadowEff: 0.808)
+        XCTAssertEqual(line, "bandVeto(shadow): startTs=1723000000 recoveredMin=31 eff 74%->81%")
+        XCTAssertEqual(CaptureAccumulator.capturedDays(domain: .sleep, reportText: line, tzOffsetSeconds: 0), 0,
+                       "shadow line must not be counted as a captured sleep day")
+    }
+
+    func testBandVetoShadowTraceReportsRecoveryOutputNeutral() {
+        // #1210 shadow: veto DORMANT (default-off) + a band present + a collecting traceSink -> a
+        // `bandVeto(shadow):` line quantifying what the veto WOULD recover, WITHOUT changing the persisted
+        // hypnogram (detectSleep's documented trace contract). Same burst fixture as the default-off wiring
+        // test. (The line reports MAGNITUDE only; whether the move is toward truth needs the PSG harness.)
+        let start = nightStart(2)
+        let dur = 6 * 3600
+        var grav = stillGravity(start: start, durationS: dur)
+        var hr = hrStream(start: start, durationS: dur, bpm: 50)
+        for i in (3 * 3600)..<(3 * 3600 + 5 * 60) {   // interior 5-min burst -> false wake
+            grav[i] = GravitySample(ts: start + i, x: Double(i % 2) * 0.5, y: 0, z: 1.0)
+            hr[i] = HRSample(ts: start + i, bpm: 95)
+        }
+        let band = bandAllAsleep(start: start, end: start + dur)
+        let untraced = SleepStager.detectSleep(hr: hr, gravity: grav, bandSleepState: band)
+        var lines: [String] = []
+        let traced = SleepStager.detectSleep(hr: hr, gravity: grav, bandSleepState: band,
+                                             traceSink: { lines.append($0) })
+        XCTAssertEqual(traced[0].stages, untraced[0].stages,
+                       "shadow trace must not change the persisted hypnogram")
+        XCTAssertTrue(lines.contains { $0.hasPrefix("bandVeto(shadow):") && $0.contains("recoveredMin=") },
+                      "a banded night with interior false-wake emits a shadow line")
+    }
+
+    func testBandVetoCutoffSparesNightsBeforeCutoff() {
+        // #1210 item 2: with the veto ON, a non-zero cutoff spares a night that STARTED before it (history
+        // keeps its raw hypnogram) and applies to one starting at/after it. Boundary is inclusive. Kotlin twin.
+        let base = 1_000_000
+        let fixture = vetoHypnoFixture().map {
+            StageSegment(start: $0.start + base, end: $0.end + base, stage: $0.stage)
+        }
+        let band = bandAllAsleep(start: base, end: base + 960)
+        let recovered = SleepStager.applyBandStateWakeVeto(fixture, start: base, end: base + 960,
+                                                           bandSleepState: band, enabled: true, cutoffTs: 0)
+        XCTAssertNotEqual(recovered, fixture, "sanity: the veto does change this fixture")
+        XCTAssertEqual(SleepStager.applyBandStateWakeVeto(fixture, start: base, end: base + 960,
+                                                          bandSleepState: band, enabled: true, cutoffTs: base + 1),
+                       fixture, "a night starting before the cutoff keeps its raw hypnogram")
+        XCTAssertEqual(SleepStager.applyBandStateWakeVeto(fixture, start: base, end: base + 960,
+                                                          bandSleepState: band, enabled: true, cutoffTs: base),
+                       recovered, "a night starting at/after the cutoff (inclusive) gets the veto")
     }
 
     // MARK: - REM-funnel diagnostic (#688)

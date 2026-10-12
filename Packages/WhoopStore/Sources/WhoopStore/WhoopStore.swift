@@ -5,7 +5,9 @@ import WhoopProtocol
 /// OpenWhoop persistence library — decoded streams are durable; raw frames are a
 /// transient, compressed, prunable outbox. Built on GRDB/SQLite.
 public enum WhoopStoreInfo {
-    /// Bumped whenever the migrator gains a new migration.
+    /// The store schema-version marker, bumped per migration. Surfaced in the backup manifest (#1410) so an
+    /// export records the platform's schema version (a platform-scoped indicator — Android reports its Room
+    /// version independently; the two numbering schemes are not expected to match).
     public static let schemaVersion = 18
 }
 
@@ -57,9 +59,17 @@ private actor StoreOpenGate {
 /// data or the query results.
 public actor WhoopStore {
 
+    /// PPG waveform rows banked since its retention sweep last ran, PER DEVICE, for the same reason as
+    /// `v18AuxRowsSincePrune` below: the sweep is per device, so a shared counter would let one strap
+    /// spend another's budget. Separate counter from the v18 aux one because the two caps differ and a
+    /// batch commonly writes one table and not the other. See `StreamStore`.
+    var ppgWaveformRowsSincePrune: [String: Int] = [:]
+
     /// v18 aux rows banked since the retention sweep last ran, PER DEVICE — the sweep is per device too,
     /// so a shared counter would let one strap spend another's budget. See `StreamStore`.
     var v18AuxRowsSincePrune: [String: Int] = [:]
+    var stepDataRevision = StepDataRevisionIndex()
+    let revisionInstanceToken = UUID().uuidString
     let dbWriter: any DatabaseWriter
 
     /// Read-only handle to the underlying GRDB writer for the synchronous `DeviceRegistryStore`.
@@ -172,6 +182,17 @@ public actor WhoopStore {
         try checkpointWALImpl()
     }
 
+    /// #1410: append one app-level event (e.g. `APP_VERSION_CHANGED`) onto the event table. Idempotent on
+    /// the `(deviceId, ts, kind)` primary key. Twin of Android `WhoopRepository.recordEvent`.
+    public func recordEvent(deviceId: String, ts: Int, kind: String, payloadJSON: String) async throws {
+        try syncWrite { db in
+            try db.execute(sql: """
+                INSERT INTO event (deviceId, ts, kind, payloadJSON) VALUES (?, ?, ?, ?)
+                ON CONFLICT(deviceId, ts, kind) DO NOTHING
+                """, arguments: [deviceId, ts, kind, payloadJSON])
+        }
+    }
+
     /// Non-async so GRDB's synchronous `writeWithoutTransaction` overload is chosen (mirrors the
     /// syncRead/syncWrite pattern). Runs on the actor's executor, off the main thread.
     private func checkpointWALImpl() throws {
@@ -256,5 +277,46 @@ public actor WhoopStore {
         try syncRead { db in
             try Set(db.indexes(on: table).map(\.name))
         }
+    }
+}
+
+/// Compact process-local cache witness keyed by owner and UTC day. Cycle windows move with `now`, so
+/// using their exact end timestamp as a cache key would invalidate an otherwise unchanged active cycle
+/// every second. Keeping revisions per UTC day makes the signature stable until a row in that day lands.
+/// Its process-lifetime size is proportional to owners × UTC days that receive new step rows.
+struct StepDataRevisionIndex {
+    private static let utcDaySeconds = 86_400
+    private var nextRevision = 0
+    private var byOwnerDay: [OwnerDay: Int] = [:]
+
+    private struct OwnerDay: Hashable {
+        let owner: String
+        let day: Int
+    }
+
+    mutating func record(deviceId: String, insertedTimestamps: [Int]) {
+        guard !insertedTimestamps.isEmpty else { return }
+        nextRevision += 1
+        for timestamp in insertedTimestamps {
+            byOwnerDay[OwnerDay(owner: deviceId, day: timestamp.floorDividing(by: Self.utcDaySeconds))]
+                = nextRevision
+        }
+    }
+
+    func signature(deviceId: String, from: Int, to: Int) -> String {
+        guard to > from else { return "" }
+        let first = from.floorDividing(by: Self.utcDaySeconds)
+        let last = (to - 1).floorDividing(by: Self.utcDaySeconds)
+        return (first...last).map { day in
+            "\(day):\(byOwnerDay[OwnerDay(owner: deviceId, day: day), default: 0])"
+        }.joined(separator: ",")
+    }
+}
+
+private extension Int {
+    func floorDividing(by divisor: Int) -> Int {
+        let quotient = self / divisor
+        let remainder = self % divisor
+        return remainder < 0 ? quotient - 1 : quotient
     }
 }

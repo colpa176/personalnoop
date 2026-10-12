@@ -230,7 +230,13 @@ struct LabBookView: View {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
                 let data = try Data(contentsOf: url)
-                let result = LabMarkerCsvImport.parse(data: data)
+                // A WHOOP biomarker export (its own header signature) routes to the vendor parser —
+                // packed units, US 2-digit dates, a Status column carried into note; any other file
+                // takes the generic (date,marker,value,unit) path.
+                let isWhoop = WhoopBiomarkerExportParser.matches(data: data)
+                let result = isWhoop ? WhoopBiomarkerExportParser.parse(data: data)
+                                     : LabMarkerCsvImport.parse(data: data)
+                let sourceId = isWhoop ? WhoopBiomarkerExportParser.sourceId : LabMarkerCsvImport.sourceId
                 guard !result.fileTooLarge else {
                     csvSummary = String(localized: "That file is too large for a markers CSV import.")
                     csvFailed = true
@@ -265,8 +271,8 @@ struct LabBookView: View {
                         value: r.value,
                         valueText: nil,
                         unit: r.unit,
-                        source: LabMarkerCsvImport.sourceId,
-                        note: nil,
+                        source: sourceId,
+                        note: r.note,
                         referenceText: nil
                     )
                 }
@@ -280,6 +286,13 @@ struct LabBookView: View {
                     msg += " · " + (result.skippedRows == 1
                                     ? String(localized: "1 row skipped")
                                     : String(localized: "\(result.skippedRows) rows skipped"))
+                }
+                // A vendor export's not-measured markers ("--" / "No Data Available") are absent by
+                // design, not malformed — reported apart so a clean import doesn't look broken.
+                if result.notMeasured > 0 {
+                    msg += " · " + (result.notMeasured == 1
+                                    ? String(localized: "1 not measured")
+                                    : String(localized: "\(result.notMeasured) not measured"))
                 }
                 csvSummary = msg
                 csvFailed = false
@@ -497,10 +510,25 @@ extension LabMarkerCategory {
 // MARK: - Shared formatting (decimals from the catalog; UTC day labels)
 
 enum LabBookFormat {
-    /// Format a numeric value with the marker's catalog decimals (default 1 for custom markers).
+    /// Format a numeric value with the marker's catalog decimals. A custom (non-catalog) marker has no
+    /// declared precision, so it is shown at its own precision via `plain` rather than a fixed 1 decimal,
+    /// which rounded plateletcrit 0.27 to "0.3" and urine specific gravity 1.020 to "1.0".
     static func value(_ v: Double, key: String) -> String {
-        let decimals = MarkerCatalog.definition(for: key)?.decimals ?? 1
+        guard v.isFinite else { return "—" }
+        guard let decimals = MarkerCatalog.definition(for: key)?.decimals else { return plain(v) }
         return decimals == 0 ? String(Int(v.rounded())) : String(format: "%.\(decimals)f", v)
+    }
+
+    /// Up to 3 decimals with trailing zeros dropped ("0.27", "1.02", "140"), always with a "." separator
+    /// whatever the device locale (`String(format:)` without a locale is POSIX). A value that rounds to
+    /// zero prints "0", never "-0"; a non-finite value prints "—". Twin: `LabValueFormat.plain` (Android);
+    /// both are pinned by the same expected strings in `LabBookFormatTests` / `LabValueFormatTest`.
+    static func plain(_ v: Double) -> String {
+        guard v.isFinite else { return "—" }
+        var s = String(format: "%.3f", v)
+        while s.hasSuffix("0") { s.removeLast() }
+        if s.hasSuffix(".") { s.removeLast() }
+        return s == "-0" ? "0" : s
     }
 
     private static let dayFormatter: DateFormatter = {

@@ -100,6 +100,39 @@ final class LabMarkerCsvImportTests: XCTestCase {
         XCTAssertEqual(result.customMarkerKeys, ["custom_magnesium"])
     }
 
+    func testCustomMarkerKeyCanonicalizesNFCAndNFDBeforeSlugging() {
+        // Compare UTF-8 bytes: Swift String equality deliberately treats canonically equivalent
+        // spellings as equal and would mask a decomposed persisted identifier.
+        let expected: [UInt8] = [
+            0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x5f, 0x63, 0x61, 0x66,
+            0xc3, 0xa9, 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72,
+        ]
+        XCTAssertEqual(Array(LabMarkerCsvImport.customKey("Caf\u{e9} Marker").utf8), expected)
+        XCTAssertEqual(Array(LabMarkerCsvImport.customKey("Cafe\u{301} Marker").utf8), expected)
+        XCTAssertEqual(LabMarkerCsvImport.customKey("Apo B"), "custom_apo_b")
+    }
+
+    func testCanonicalEquivalentCustomMarkerRowsShareKeyAndLastRowWins() {
+        let csv = """
+        date,marker,value,unit
+        2026-05-01,Caf\u{e9} Marker,1,mg/L
+        2026-05-01,Cafe\u{301} Marker,2,mg/L
+        """
+        let expected: [UInt8] = [
+            0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x5f, 0x63, 0x61, 0x66,
+            0xc3, 0xa9, 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72,
+        ]
+        let result = LabMarkerCsvImport.parse(text: csv)
+
+        XCTAssertEqual(result.importedReadings, 1)
+        XCTAssertEqual(result.distinctMarkers, 1)
+        XCTAssertEqual(result.rows.count, 1)
+        XCTAssertEqual(result.rows[0].value, 2)
+        XCTAssertEqual(Array(result.rows[0].markerKey.utf8), expected)
+        XCTAssertEqual(result.customMarkerKeys.count, 1)
+        XCTAssertEqual(Array(result.customMarkerKeys[0].utf8), expected)
+    }
+
     // MARK: - Blood pressure pairs (diastolic must never be dropped)
 
     func testCombinedBloodPressureSplitsIntoPair() {
@@ -273,5 +306,35 @@ final class LabMarkerCsvImportTests: XCTestCase {
         XCTAssertEqual(LabMarkerCsvImport.customKey("Magnesium"), "custom_magnesium")
         XCTAssertEqual(LabMarkerCsvImport.customKey("Apo B"), "custom_apo_b")
         XCTAssertEqual(LabMarkerCsvImport.customKey("  ???  "), "")
+    }
+
+    /// A white-cell differential lists each cell type as a count AND a percentage. Both used to
+    /// slug to `custom_lymph`, so on the same day the "%" row overwrote the count row.
+    func testPercentRowDoesNotOverwriteCountRow() {
+        let csv = """
+        date,marker,value,unit
+        2026-05-01,LYMPH,1.9,10^9/L
+        2026-05-01,LYMPH %,31.2,%
+        2026-05-01,BASO,0.03,10^9/L
+        2026-05-01,BASO %,0.5,%
+        """
+        let result = LabMarkerCsvImport.parse(text: csv)
+        XCTAssertEqual(result.importedReadings, 4)
+        XCTAssertEqual(result.customMarkerKeys,
+                       ["custom_baso", "custom_baso_pct", "custom_lymph", "custom_lymph_pct"])
+        XCTAssertEqual(result.rows.first { $0.markerKey == "custom_lymph" }?.value, 1.9)
+        XCTAssertEqual(result.rows.first { $0.markerKey == "custom_lymph_pct" }?.value, 31.2)
+    }
+
+    /// Pinned by oracle: the same literals are asserted by the Android twin
+    /// (LabMarkerCsvImportTest.customKeyIsPinned). The Unicode numeric cases pin #2351 parity.
+    func testCustomKeyIsPinned() {
+        let names = [
+            "LYMPH", "LYMPH %", "LYMPH%", "Lymph (%)", "BASO", "BASO %", "% Neutrophils", "NEUT  %", "a%%b", "%", "Apo B", "Magnesium", "  ???  ", "A - B", "Vitamin D (25-OH)", "Caf\u{e9} Marker", "Cafe\u{301} Marker", "MCHC g/dL", "HbA1c (IFCC)", "eGFR mL/min/1.73m²", "Factor Ⅻ", "Vitamin B₁₂", "①%", "½ dose", "³", "2", "𐄇",
+        ]
+        let expected = [
+            "custom_lymph", "custom_lymph_pct", "custom_lymph_pct", "custom_lymph_pct", "custom_baso", "custom_baso_pct", "custom_pct_neutrophils", "custom_neut_pct", "custom_a_pctpct_b", "custom_pct", "custom_apo_b", "custom_magnesium", "", "custom_a__b", "custom_vitamin_d_25_oh", "custom_café_marker", "custom_café_marker", "custom_mchc_g_dl", "custom_hba1c_ifcc", "custom_egfr_ml_min_1_73m²", "custom_factor_ⅻ", "custom_vitamin_b₁₂", "custom_①_pct", "custom_½_dose", "custom_³", "custom_2", "custom_𐄇",
+        ]
+        XCTAssertEqual(names.map(LabMarkerCsvImport.customKey), expected)
     }
 }

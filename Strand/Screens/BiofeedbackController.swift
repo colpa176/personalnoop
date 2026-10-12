@@ -111,14 +111,8 @@ final class BiofeedbackController: ObservableObject {
 
     private func fireBuzz(loops: Int) {
         guard canBuzz else { return }
-        model.buzz(loops: UInt8(clamping: loops))
-    }
-
-    /// Schedule one cancellable buzz at `offsetMs` from now (the asyncAfter walk, cancellable on stop).
-    private func scheduleBuzz(loops: Int, afterMs: Int) {
-        let item = DispatchWorkItem { [weak self] in self?.fireBuzz(loops: loops) }
-        pending.append(item)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(afterMs), execute: item)
+        // #haptics: biofeedback/resonance cues ride the Breathing toggle (parity with Android's Breathe path).
+        model.buzz(loops: UInt8(clamping: loops), gate: HapticPrefs.breathing)
     }
 
     private func startSecondTimer() {

@@ -67,18 +67,37 @@ object Palette {
     val textSecondary get() = active.textSecondary
     val textTertiary get() = active.textTertiary
 
-    // Text that always sits on a pinned-dark surface, independent of the app's active light/dark scheme.
-    // Mirrors StrandPalette.onDarkSecondary for the liquid hero's source badge.
+    // #1160/#1161: the Liquid hero card surface, now theme-aware — near-black in dark, frosted white in
+    // light so the hero fits in with the other cards; the border flips with it. The hero's own text uses
+    // the flip-able text* tokens now (readable on either fill).
+    val heroFill get() = active.heroFill
+    val heroBorder get() = active.heroBorder
+    // Light-on-dark text for a GENUINELY-always-dark surface (twin of StrandPalette.onDarkSecondary). The
+    // theme-aware hero no longer uses this; kept for any always-dark chrome.
     val onDarkSecondary = Color(0xFFC8CFD8)
 
     // Glow.
     val glowAmbient get() = active.glowAmbient
 
-    // Accent — GOLD brand anchor.
-    val accent get() = active.accent
-    val accentHover get() = active.accentHover
-    val accentMuted get() = active.accentMuted
-    val focusRing get() = active.focusRing
+    // Accent — user-selectable chrome anchor (mint default / WHOOP blue / custom). Chrome ONLY; the
+    // recovery/strain/sleep DATA worlds are never themed by this. Reads AccentPrefs snapshot state so a
+    // change is live. Twin of macOS StrandPalette.accent* branching on AccentColor.
+    val accent get() = when (AccentPrefs.color) {
+        AccentColor.MINT -> active.accent
+        AccentColor.WHOOP_BLUE -> if (isLight) Color(0xFF234F9E) else Color(0xFF60A0E0)
+        AccentColor.CUSTOM -> AccentColor.parseHex(AccentPrefs.customHex, active.accent)
+    }
+    val accentHover get() = when (AccentPrefs.color) {
+        AccentColor.MINT -> active.accentHover
+        AccentColor.WHOOP_BLUE -> if (isLight) Color(0xFF3A6FC0) else Color(0xFF8FBEEC)
+        AccentColor.CUSTOM -> AccentColor.lighten(AccentPrefs.customHex)
+    }
+    val accentMuted get() = when (AccentPrefs.color) {
+        AccentColor.MINT -> active.accentMuted
+        AccentColor.WHOOP_BLUE -> (if (isLight) Color(0xFF234F9E) else Color(0xFF60A0E0)).copy(alpha = 0.18f)
+        AccentColor.CUSTOM -> AccentColor.parseHex(AccentPrefs.customHex, active.accent).copy(alpha = 0.18f)
+    }
+    val focusRing get() = if (AccentPrefs.color == AccentColor.MINT) active.focusRing else accent
     const val disabledOpacity = 0.45f
 
     // Recovery / Charge gradient.
@@ -145,6 +164,17 @@ object Palette {
     val restDeep get() = if (isClassic) classic.restDeep else active.restDeep
     val restBright get() = if (isClassic) classic.restBright else active.restBright
     val restGlow get() = if (isClassic) classic.restColor else active.restGlow
+
+    /**
+     * The Rest family's most legible LINE colour — for strokes that must read on a busy or translucent
+     * surface, such as the body-clock dial's arcs over a custom background image.
+     *
+     * Introduces no new value: it selects the existing token that is the bright blue in each palette. The
+     * families are not parallel — classic's restBright is a PURPLE accent while modern's is the blue, and
+     * classic's restColor is the blue where modern's is a muted steel — so a card naming either token
+     * directly gets the right colour in one palette and the wrong one in the other. Mirrors the Swift twin.
+     */
+    val restLine get() = if (isClassic) restColor else restBright
 
     val stressColor get() = if (isClassic) classic.stressColor else active.stressColor
     val stressDeep get() = if (isClassic) classic.stressDeep else active.stressDeep
@@ -391,11 +421,14 @@ object Metrics {
     val screenPadding = 24.dp
     val tileHeight = 108.dp   // every metric tile is this tall
     val chartHeight = 220.dp
+    val dialogScrollableMaxHeight = 560.dp
     val divider = 1.dp
     val compactChartHeight = chartHeight - 90.dp
+    val chartAxisLabelWidth = 40.dp
     val selectorTopUp = sectionGap - screenRowSpacing
     val iconButton = 36.dp
     val iconSmall = 18.dp
+    val iconTiny = 12.dp
     val selectorPadding = 10.dp
     val selectorSpacing = 8.dp
     val sparkWidthWide = 48.dp   // inline trend beside a tile value — kept compact so the value (which
@@ -419,6 +452,7 @@ object Metrics {
     val legendLineWidth = 14.dp
     val legendLineHeight = 3.dp
     val progressHeight = 10.dp
+    val editorListMaxHeight = 390.dp
 }
 
 // MARK: - Typography (ported from StrandDesign/Typography.swift §9.2)
@@ -489,14 +523,16 @@ object NoopType {
 
 /** Build the Material3 colour scheme from a token set. Dark/light differ only in the builder used
  *  (which sets sensible defaults for the slots we don't override); the NOOP surfaces are all driven
- *  by `Palette.*` directly, so this only feeds Material components (text fields, switches, etc.). */
-private fun noopColorScheme(t: PaletteTokens, dark: Boolean): ColorScheme {
+ *  by `Palette.*` directly, so this only feeds Material components (text fields, switches, etc.).
+ *  Resolve chrome accents through Palette too, so these controls honor the live accent preference.
+ *  NoopTheme installs [t] as Palette.active before building this scheme. */
+internal fun noopColorScheme(t: PaletteTokens, dark: Boolean): ColorScheme {
     val base = if (dark) darkColorScheme() else lightColorScheme()
     return base.copy(
-        primary = t.accent,
+        primary = Palette.accent,
         onPrimary = if (dark) t.surfaceBase else t.goldDeepText,
-        primaryContainer = t.accentMuted,
-        onPrimaryContainer = if (dark) t.accentHover else t.accent,
+        primaryContainer = Palette.accentMuted,
+        onPrimaryContainer = if (dark) Palette.accentHover else Palette.accent,
         secondary = t.metricPurple,
         onSecondary = if (dark) t.surfaceBase else Color(0xFFFFFFFF),
         background = t.surfaceBase,

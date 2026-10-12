@@ -12,7 +12,7 @@ final class WorkoutSourceTests: XCTestCase {
                      avgHr: Int? = nil, maxHr: Int? = nil, strain: Double? = nil) -> WorkoutRow {
         WorkoutRow(startTs: start, endTs: end, sport: sport, source: source,
                    durationS: Double(end - start), energyKcal: nil, avgHr: avgHr, maxHr: maxHr,
-                   strain: strain, distanceM: nil, zonesJSON: nil, notes: nil)
+                   strain: strain, distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)
     }
 
     // MARK: - classify
@@ -83,13 +83,13 @@ final class WorkoutSourceTests: XCTestCase {
         // A live strap session: HR trace, peak, strain, zones, distance, energy all captured.
         WorkoutRow(startTs: start, endTs: end, sport: sport, source: source,
                    durationS: Double(end - start), energyKcal: 600, avgHr: 150, maxHr: 178,
-                   strain: 14.0, distanceM: 10_000, zonesJSON: #"{"z1":10}"#, notes: nil)
+                   strain: 14.0, distanceM: 10_000, zonesJSON: #"{"z1":10}"#, notes: nil, steps: nil)
     }
     private func thinImport(start: Int, end: Int, sport: String, source: String) -> WorkoutRow {
         // A thin Health Connect / Apple import: only duration + calories.
         WorkoutRow(startTs: start, endTs: end, sport: sport, source: source,
                    durationS: Double(end - start), energyKcal: 590, avgHr: nil, maxHr: nil,
-                   strain: nil, distanceM: nil, zonesJSON: nil, notes: nil)
+                   strain: nil, distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)
     }
 
     func testSportKeyFoldsCamelCaseAndSpacing() {
@@ -277,7 +277,62 @@ final class WorkoutSourceTests: XCTestCase {
         XCTAssertNil(WorkoutSource.buildManualRow(start: start, durationMin: 30, sport: "Run", avgHr: nil, energyKcal: 99_999, now: now))
     }
 
+    /// #1067 twin: a start at/before `now` still lets `start + duration` overshoot into the future. End
+    /// exactly at `now` is valid; one second beyond is rejected.
+    func testBuildManualRowRejectsAFutureEndButAllowsEndExactlyAtNow() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)   // 45 min = 2700 s
+        // End exactly at now → valid.
+        XCTAssertNotNil(WorkoutSource.buildManualRow(start: start, durationMin: 45, sport: "Run",
+                                                     avgHr: nil, energyKcal: nil,
+                                                     now: start.addingTimeInterval(2700)))
+        // start ≤ now, but start + duration overshoots now by one second → rejected.
+        XCTAssertNil(WorkoutSource.buildManualRow(start: start, durationMin: 45, sport: "Run",
+                                                  avgHr: nil, energyKcal: nil,
+                                                  now: start.addingTimeInterval(2699)))
+    }
+
+    func testBuildManualRowAcceptsAndBoundsDistance() {
+        // #1195: distance is now a manual field. A valid entry is stored verbatim (metres); 0 and the
+        // 1,000 km ceiling are allowed; negative and beyond are rejected; nil means "no distance".
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let now = start.addingTimeInterval(3600)
+        func build(_ d: Double?) -> WorkoutRow? {
+            WorkoutSource.buildManualRow(start: start, durationMin: 30, sport: "Run",
+                                         avgHr: nil, energyKcal: nil, distanceM: d, now: now)
+        }
+        XCTAssertEqual(build(5_234)?.distanceM, 5_234)
+        XCTAssertNil(build(nil)?.distanceM)
+        XCTAssertNotNil(build(0))
+        XCTAssertNotNil(build(1_000_000))     // exactly 1,000 km
+        XCTAssertNil(build(-1))
+        XCTAssertNil(build(1_000_001))
+    }
+
     // MARK: - preservingCaptured
+
+    func testPreservingCapturedTakesDistanceFromTheRebuiltRowNotOld() {
+        // #1195: distance is a sheet field now, so an edit's value wins over the old row's captured
+        // distance (the sheet pre-fills from old, so an untouched field still round-trips it), while
+        // maxHr/strain stay carried. A cleared field clears, not resurrects.
+        let old = fullRow(start: 100, end: 3700, sport: "Running", source: "manual", dist: 10_000, maxHr: 175)
+        let edited = fullRow(start: 100, end: 3700, sport: "Running", source: "manual", dist: 12_500)
+        let merged = WorkoutSource.preservingCaptured(edited, from: old)
+        XCTAssertEqual(merged.distanceM, 12_500)   // edited distance wins
+        XCTAssertEqual(merged.maxHr, 175)          // maxHr still carried from old
+        let cleared = fullRow(start: 100, end: 3700, sport: "Running", source: "manual", dist: nil)
+        XCTAssertNil(WorkoutSource.preservingCaptured(cleared, from: old).distanceM)
+    }
+
+    /// #1444: per-session steps (#1058) has NO sheet field, so an edit rebuilds the row without it and
+    /// the merged row used to come back with `steps` nil — silently wiping a value the user never saw
+    /// and never touched, just by renaming the sport. Kotlin twin:
+    /// `preservingCaptured_carriesStepsFromOld`.
+    func testPreservingCapturedCarriesStepsFromOld() {
+        let old = fullRow(start: 100, end: 3700, sport: "Running", source: "manual", steps: 4_200)
+        let edited = fullRow(start: 100, end: 3700, sport: "Trail Running", source: "manual")
+        XCTAssertNil(edited.steps, "the sheet cannot supply steps, so the rebuilt row starts without it")
+        XCTAssertEqual(WorkoutSource.preservingCaptured(edited, from: old).steps, 4_200)
+    }
 
     func testPreservingCapturedCarriesUnexposedFieldsOnEdit() {
         // The sheet rebuilds a row from its 5 inputs; an edit must keep the original's captured
@@ -301,10 +356,11 @@ final class WorkoutSourceTests: XCTestCase {
 
     private func fullRow(start: Int, end: Int, sport: String, source: String,
                          avgHr: Int? = nil, kcal: Double? = nil, dist: Double? = nil,
-                         strain: Double? = nil, maxHr: Int? = nil, notes: String? = nil) -> WorkoutRow {
+                         strain: Double? = nil, maxHr: Int? = nil, notes: String? = nil,
+                         steps: Int? = nil) -> WorkoutRow {
         WorkoutRow(startTs: start, endTs: end, sport: sport, source: source,
                    durationS: Double(end - start), energyKcal: kcal, avgHr: avgHr, maxHr: maxHr,
-                   strain: strain, distanceM: dist, zonesJSON: nil, notes: notes)
+                   strain: strain, distanceM: dist, zonesJSON: nil, notes: notes, steps: steps)
     }
 
     func testFilterInactiveWhenEmptyPassesEverythingUntouched() {
@@ -376,6 +432,21 @@ final class WorkoutSourceTests: XCTestCase {
         XCTAssertEqual(m?.avgHr, 138)
     }
 
+    /// #1444: steps is cumulative per session, exactly like distance, so a merge must SUM it rather
+    /// than drop it. It was dropped until making the field explicit forced the question. Kotlin twin:
+    /// `merge_sumsStepsLikeDistance`.
+    func testMergeSumsStepsLikeDistance() {
+        let a = fullRow(start: 1000, end: 4600, sport: "Running", source: "manual",
+                        dist: 10_000, steps: 6_200)
+        let b = fullRow(start: 5000, end: 7400, sport: "Running", source: "manual",
+                        dist: 5_000, steps: 3_100)
+        XCTAssertEqual(WorkoutMerge.merge([a, b])?.steps, 9_300)
+        // Nothing carried steps -> nil, never a fake 0 (same rule energy and distance follow).
+        let c = fullRow(start: 1000, end: 4600, sport: "Running", source: "manual")
+        let d = fullRow(start: 5000, end: 7400, sport: "Running", source: "manual")
+        XCTAssertNil(WorkoutMerge.merge([c, d])?.steps)
+    }
+
     func testMergeWeightsOnlyRowsWithHr() {
         // One row has no avg HR — it must NOT drag the weighted mean toward zero.
         let a = fullRow(start: 1000, end: 4600, sport: "Cycling", source: "manual", avgHr: 140)
@@ -415,4 +486,106 @@ final class WorkoutSourceTests: XCTestCase {
         XCTAssertNil(m?.distanceM)
         XCTAssertNil(m?.avgHr)
     }
+    // MARK: - buildManualRowFromSpan (#2034)
+
+    /// #2034: entering a manual workout by its start and END, not only by a duration.
+    ///
+    /// The row has always been stored as `startTs`/`endTs`, so the span is the shape the storage already
+    /// speaks and the duration was the lossy intermediate. Mirrors Android `ManualWorkoutSpanTest` except
+    /// for its overflow case, which has no safe twin here: Kotlin guards a Long addition, while the
+    /// equivalent Swift input has to be built as a Date, and `Int(Double)` TRAPS on a value that large
+    /// rather than returning nil. The whole-minute bounds either side of it are already pinned by
+    /// `testBuildManualRowRejectsBadInput`.
+    func testSpanBuilderKeepsTheExactEndItIsGiven() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let start = now.addingTimeInterval(-7_200)
+        // 45m17s. The duration path cannot express this: it would store 45m00s and silently shorten the
+        // session by 17 seconds. This is the whole point of the span form.
+        let end = start.addingTimeInterval(45 * 60 + 17)
+        let r = WorkoutSource.buildManualRowFromSpan(start: start, end: end, sport: "Run",
+                                                     avgHr: nil, energyKcal: nil, now: now)
+        XCTAssertNotNil(r)
+        XCTAssertEqual(r?.startTs, Int(start.timeIntervalSince1970))
+        XCTAssertEqual(r?.endTs, Int(end.timeIntervalSince1970))
+        XCTAssertEqual(r?.durationS, Double(45 * 60 + 17))
+    }
+
+    func testDurationFrontDoorStillProducesTheIdenticalRow() {
+        // The delegation invariant. If these ever diverge, the auto-detected nudge and the sheet would
+        // write different rows for the same session.
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let start = now.addingTimeInterval(-7_200)
+        let viaDuration = WorkoutSource.buildManualRow(start: start, durationMin: 45, sport: "Run",
+                                                       avgHr: 140, energyKcal: 400, distanceM: 8_000,
+                                                       now: now)
+        let viaSpan = WorkoutSource.buildManualRowFromSpan(start: start,
+                                                           end: start.addingTimeInterval(45 * 60),
+                                                           sport: "Run", avgHr: 140, energyKcal: 400,
+                                                           distanceM: 8_000, now: now)
+        XCTAssertNotNil(viaDuration)
+        XCTAssertEqual(viaDuration, viaSpan)
+    }
+
+    func testSpanBuilderRejectsAnEndAtOrBeforeTheStart() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let start = now.addingTimeInterval(-7_200)
+        XCTAssertNil(WorkoutSource.buildManualRowFromSpan(start: start, end: start, sport: "Run",
+                                                          avgHr: nil, energyKcal: nil, now: now))
+        XCTAssertNil(WorkoutSource.buildManualRowFromSpan(start: start,
+                                                          end: start.addingTimeInterval(-1), sport: "Run",
+                                                          avgHr: nil, energyKcal: nil, now: now))
+    }
+
+    func testSpanBuilderRejectsASpanOverTwentyFourHours() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let cap = TimeInterval(WorkoutSource.maxManualSpanSeconds)
+        let start = now.addingTimeInterval(-cap - 60)
+        XCTAssertNotNil(WorkoutSource.buildManualRowFromSpan(start: start,
+                                                             end: start.addingTimeInterval(cap),
+                                                             sport: "Run", avgHr: nil, energyKcal: nil,
+                                                             now: now))
+        XCTAssertNil(WorkoutSource.buildManualRowFromSpan(start: start,
+                                                          end: start.addingTimeInterval(cap + 1),
+                                                          sport: "Run", avgHr: nil, energyKcal: nil,
+                                                          now: now))
+    }
+
+    func testSpanBuilderAllowsAnEndExactlyAtNowButNotOneSecondPast() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let start = now.addingTimeInterval(-7_200)
+        XCTAssertNotNil(WorkoutSource.buildManualRowFromSpan(start: start, end: now, sport: "Run",
+                                                             avgHr: nil, energyKcal: nil, now: now))
+        XCTAssertNil(WorkoutSource.buildManualRowFromSpan(start: start,
+                                                          end: now.addingTimeInterval(1), sport: "Run",
+                                                          avgHr: nil, energyKcal: nil, now: now))
+    }
+
+    func testSpanDurationMinRoundsForDisplayOnly() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertEqual(WorkoutSource.spanDurationMin(start: start,
+                                                     end: start.addingTimeInterval(45 * 60)), 45)
+        // 45m17s reads as 45, 45m45s reads as 46. The stored end is untouched either way.
+        XCTAssertEqual(WorkoutSource.spanDurationMin(start: start,
+                                                     end: start.addingTimeInterval(45 * 60 + 17)), 45)
+        XCTAssertEqual(WorkoutSource.spanDurationMin(start: start,
+                                                     end: start.addingTimeInterval(45 * 60 + 45)), 46)
+    }
+
+    func testEndForDurationIsTheInverseOfWholeMinutes() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let end = WorkoutSource.endForDuration(start: start, durationMin: 45)
+        XCTAssertEqual(end, start.addingTimeInterval(45 * 60))
+        XCTAssertEqual(WorkoutSource.spanDurationMin(start: start, end: end), 45)
+    }
+
+    func testMovingTheStartCarriesTheEndAndKeepsTheLength() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let end = start.addingTimeInterval(45 * 60 + 17)
+        let newStart = start.addingTimeInterval(-3_600)
+        let newEnd = WorkoutSource.endAfterStartMove(oldStart: start, oldEnd: end, newStart: newStart)
+        XCTAssertEqual(newEnd, newStart.addingTimeInterval(45 * 60 + 17))
+        // The length is what survives, including the seconds a duration field cannot show.
+        XCTAssertEqual(newEnd.timeIntervalSince(newStart), end.timeIntervalSince(start))
+    }
+
 }

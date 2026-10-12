@@ -33,7 +33,22 @@ class DeviceRegistry(
     )
 
     /** All paired devices, oldest first. */
-    suspend fun all(): List<PairedDeviceRow> = dao.pairedDevices()
+    suspend fun all(): List<PairedDeviceRow> =
+        dao.pairedDevices().map { honestWhoopCapabilities(it) }
+
+    /**
+     * #548: calibrated SpO₂ % is never produced from a live WHOOP path — drop a stale registry bit so
+     * Devices / day-owner UI never advertise a capability AnalyticsEngine will not fill. Twin of the
+     * Swift `DeviceRegistryStore.decode` strip.
+     */
+    private fun honestWhoopCapabilities(row: PairedDeviceRow): PairedDeviceRow {
+        val isWhoop = row.brand.equals("WHOOP", ignoreCase = true)
+            || row.id == "my-whoop"
+            || row.id.startsWith("whoop-")
+        if (!isWhoop) return row
+        val stripped = WhoopLiveCapabilities.stripSpo2Token(row.capabilities)
+        return if (stripped == row.capabilities) row else row.copy(capabilities = stripped)
+    }
 
     /** The single active device id, or null if none. */
     suspend fun activeDeviceId(): String? = dao.activeDeviceId()
@@ -74,39 +89,84 @@ class DeviceRegistry(
             } else {
                 dao.upsertPairedDevice(active.copy(id = serialId))
             }
-            dao.reKeyHr(activeId, serialId); dao.deleteHrFor(activeId)
-            dao.reKeyRr(activeId, serialId); dao.deleteRrFor(activeId)
-            dao.reKeySpo2(activeId, serialId); dao.deleteSpo2For(activeId)
-            dao.reKeySkinTemp(activeId, serialId); dao.deleteSkinTempFor(activeId)
-            dao.reKeyResp(activeId, serialId); dao.deleteRespFor(activeId)
-            dao.reKeyGravity(activeId, serialId); dao.deleteGravityFor(activeId)
-            dao.reKeySteps(activeId, serialId); dao.deleteStepsFor(activeId)
-            dao.reKeyPpgHr(activeId, serialId); dao.deletePpgHrFor(activeId)
-            dao.reKeyPpgWaveform(activeId, serialId); dao.deletePpgWaveformFor(activeId)
-            dao.reKeyRawImu(activeId, serialId); dao.deleteRawImuFor(activeId)
-            dao.reKeyV18Aux(activeId, serialId); dao.deleteV18AuxFor(activeId)
-            dao.reKeyEvents(activeId, serialId); dao.deleteEventsFor(activeId)
-            dao.reKeyBattery(activeId, serialId); dao.deleteBatteryFor(activeId)
-            dao.reKeyDailyMetrics(activeId, serialId); dao.deleteDailyMetricsFor(activeId)
-            dao.reKeySleepSessions(activeId, serialId); dao.deleteSleepSessionsFor(activeId)
-            dao.reKeyJournal(activeId, serialId); dao.deleteJournalFor(activeId)
-            dao.reKeyWorkouts(activeId, serialId); dao.deleteWorkoutsFor(activeId)
-            dao.reKeyAppleDaily(activeId, serialId); dao.deleteAppleDailyFor(activeId)
-            dao.reKeyMetricSeries(activeId, serialId); dao.deleteMetricSeriesFor(activeId)
-            dao.reKeyDayOwnership(activeId, serialId); dao.deleteDayOwnershipFor(activeId)
-            dao.reKeySleepStates(activeId, serialId); dao.deleteSleepStatesFor(activeId)
-            dao.reKeyLabMarkers(activeId, serialId); dao.deleteLabMarkersFor(activeId)
-            dao.reKeyLiveSessions(activeId, serialId); dao.deleteLiveSessionsFor(activeId)
-            dao.reKeyDismissedWorkouts(activeId, serialId); dao.deleteDismissedWorkoutsFor(activeId)
-            dao.reKeyDismissedSleeps(activeId, serialId); dao.deleteDismissedSleepsFor(activeId)
+            // BOTH id shapes. Every strap also owns a COMPUTED sibling keyed `<deviceId>-noop` (see
+            // WhoopRepository.computedDeviceId) holding scored days, legacy detected workouts and metric
+            // series. That id never equals activeId, so re-keying only the pairing's
+            // own id left the computed history stranded under an id nothing reads again while the next
+            // scoring pass wrote under `<serialId>-noop` — the orphaned history this adoption exists to
+            // prevent, displaced onto the computed half. A ring has no computed sibling, which is why the
+            // shipped Oura path never surfaced it.
+            reKeyDeviceScopedRows(activeId, serialId)
+            reKeyDeviceScopedRows(activeId + COMPUTED_SUFFIX, serialId + COMPUTED_SUFFIX)
             dao.deletePairedDeviceRow(activeId)
             dao.deleteDeviceRow(activeId)
             true
         }
     }
 
+    /** Stamp a device as seen right now — a real connect or disconnect, not every inbound packet, which
+     *  would be a write per second for no more truth. Twin of Swift `DeviceRegistry.touchLastSeen`. (#1527) */
+    suspend fun touchLastSeen(id: String, now: Long = System.currentTimeMillis() / 1000) =
+        dao.touchLastSeen(id, now)
+
+    /** Suffix of the COMPUTED sibling every device id owns; twin of `WhoopRepository.computedDeviceId`
+     *  and the Swift `DeviceRegistryStore.computedSuffix`. */
+    private val COMPUTED_SUFFIX = "-noop"
+
+    /** Move every device-scoped row from [from] onto [to], canonical winning a PK clash, then clear the
+     *  source. Registry rows are deliberately NOT touched here: a computed sibling has none, so the
+     *  pairedDevice/device deletions stay with the caller and run once, for the real pairing only. */
+    private suspend fun reKeyDeviceScopedRows(from: String, to: String) {
+        dao.reKeyHr(from, to); dao.deleteHrFor(from)
+        dao.reKeyRr(from, to); dao.deleteRrFor(from)
+        dao.reKeySpo2(from, to); dao.deleteSpo2For(from)
+        dao.reKeySkinTemp(from, to); dao.deleteSkinTempFor(from)
+        dao.reKeyResp(from, to); dao.deleteRespFor(from)
+        dao.reKeyGravity(from, to); dao.deleteGravityFor(from)
+        dao.reKeySteps(from, to); dao.deleteStepsFor(from)
+        dao.reKeyPpgHr(from, to); dao.deletePpgHrFor(from)
+        dao.reKeyPpgWaveform(from, to); dao.deletePpgWaveformFor(from)
+        dao.reKeyV18Aux(from, to); dao.deleteV18AuxFor(from)
+        dao.reKeyEvents(from, to); dao.deleteEventsFor(from)
+        dao.reKeyBattery(from, to); dao.deleteBatteryFor(from)
+        dao.reKeyDailyMetrics(from, to); dao.deleteDailyMetricsFor(from)
+        dao.reKeySleepSessions(from, to); dao.deleteSleepSessionsFor(from)
+        dao.reKeyJournal(from, to); dao.deleteJournalFor(from)
+        dao.reKeyWorkouts(from, to); dao.deleteWorkoutsFor(from)
+        dao.reKeyAppleDaily(from, to); dao.deleteAppleDailyFor(from)
+        dao.reKeyAppleStepHour(from, to); dao.deleteAppleStepHoursFor(from)
+        dao.reKeyMetricSeries(from, to); dao.deleteMetricSeriesFor(from)
+        dao.reKeyDayOwnership(from, to); dao.deleteDayOwnershipFor(from)
+        dao.reKeySleepStates(from, to); dao.deleteSleepStatesFor(from)
+        dao.reKeyLabMarkers(from, to); dao.deleteLabMarkersFor(from)
+        dao.reKeyLiveSessions(from, to); dao.deleteLiveSessionsFor(from)
+        dao.reKeyDismissedWorkouts(from, to); dao.deleteDismissedWorkoutsFor(from)
+        dao.reKeyDismissedSleeps(from, to); dao.deleteDismissedSleepsFor(from)
+        dao.reKeyLiftExercises(from, to); dao.deleteLiftExercisesFor(from)
+        dao.reKeyLiftPrograms(from, to); dao.deleteLiftProgramsFor(from)
+        dao.reKeyLiftProgramItems(from, to); dao.deleteLiftProgramItemsFor(from)
+        dao.reKeyLiftSessions(from, to); dao.deleteLiftSessionsFor(from)
+        dao.reKeyLiftSets(from, to); dao.deleteLiftSetsFor(from)
+    }
+
     /** Archive a device — keeps its row and samples (invariant I4). */
     suspend fun archive(id: String) = dao.archiveDevice(id)
+
+    /**
+     * Permanently FORGET a device: wipe all of its recorded data AND remove its registry entry (both the
+     * `pairedDevice` row the Devices screen lists and its `device` provenance row), so a duplicate/stale
+     * strap can be purged entirely instead of lingering in the archived "Removed" list forever (#1193).
+     * Twin of the Swift `DeviceRegistry.forget`. The data wipe runs first (its own transaction, via
+     * [deleteDeviceData]), then the small registry-row deletes — registry entry vs. recordings are separate
+     * ops, exactly as [adoptSerialIdentity] treats them.
+     */
+    suspend fun forget(id: String) {
+        deleteDeviceData(id)
+        transactor.run {
+            dao.deletePairedDeviceRow(id)
+            dao.deleteDeviceRow(id)
+        }
+    }
 
     /** Update the model label for a device. Mirrors the Swift store's `setModel`. */
     suspend fun setModel(id: String, model: String) = dao.setModel(id, model)
@@ -151,7 +211,6 @@ class DeviceRegistry(
             dao.deleteStepsFor(id)
             dao.deletePpgHrFor(id)
             dao.deletePpgWaveformFor(id)
-            dao.deleteRawImuFor(id)   // #423
             dao.deleteV18AuxFor(id)
             dao.deleteEventsFor(id)
             dao.deleteBatteryFor(id)
@@ -160,6 +219,7 @@ class DeviceRegistry(
             dao.deleteJournalFor(id)
             dao.deleteWorkoutsFor(id)
             dao.deleteAppleDailyFor(id)
+            dao.deleteAppleStepHoursFor(id)
             dao.deleteMetricSeriesFor(id)
             dao.deleteDayOwnershipFor(id)
             dao.deleteScoreInputProvenanceFor(id)
@@ -168,6 +228,11 @@ class DeviceRegistry(
             dao.deleteLiveSessionsFor(id)
             dao.deleteDismissedWorkoutsFor(id)
             dao.deleteDismissedSleepsFor(id)
+            dao.deleteLiftExercisesFor(id)
+            dao.deleteLiftProgramsFor(id)
+            dao.deleteLiftProgramItemsFor(id)
+            dao.deleteLiftSessionsFor(id)
+            dao.deleteLiftSetsFor(id)
         }
     }
 
@@ -176,5 +241,13 @@ class DeviceRegistry(
         dao.setDayOwner(DayOwnershipRow(day = day, deviceId = deviceId, locked = locked))
 
     /** The owner override for a day, or null if none. */
-    suspend fun dayOwner(day: String): DayOwnershipRow? = dao.dayOwner(day)
+    suspend fun dayOwner(day: String): DayOwnershipRow? {
+        // Timed here rather than at the call site, matching the other per-day probes: the resolver that
+        // drives these sits inside `analyzeRecentOnCpu`, which has no ratchet margin for a stopwatch.
+        // See StoreProbeTally. Instrumentation only.
+        val started = System.nanoTime()
+        val row = dao.dayOwner(day)
+        com.noop.analytics.StoreProbeTally.recordDayOwner(System.nanoTime() - started)
+        return row
+    }
 }

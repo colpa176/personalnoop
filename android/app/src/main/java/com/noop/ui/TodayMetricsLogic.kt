@@ -1,5 +1,8 @@
 package com.noop.ui
 
+import androidx.annotation.StringRes
+import com.noop.R
+import com.noop.analytics.ProfileWeightSync
 import com.noop.data.AppleDaily
 import com.noop.data.WorkoutRow
 
@@ -14,11 +17,13 @@ import com.noop.data.WorkoutRow
  * windows coincide with Today, which reads fine - both mean "everything so far". Only offered on the
  * CURRENT day: a past day has no "now", so it always shows the full calendar day, exactly as before.
  */
-internal enum class HrWindow(val label: String, val hours: Int) {
+internal enum class HrWindow(@StringRes val labelRes: Int, val hours: Int) {
     // Declaration order IS the pill order: Today (the whole loaded day) anchors the wide end, then
     // strictly most -> least hours. TODAY stays ordinal 0 so the rememberSaveable default is the full day.
-    TODAY("Today", 0),
-    H24("24h", 24), H12("12h", 12), H6("6h", 6), H3("3h", 3), H1("1h", 1);
+    TODAY(R.string.today_hr_window_today, 0),
+    H24(R.string.today_hr_window_24h, 24), H12(R.string.today_hr_window_12h, 12),
+    H6(R.string.today_hr_window_6h, 6), H3(R.string.today_hr_window_3h, 3),
+    H1(R.string.today_hr_window_1h, 1);
 
     /** Earliest bucket timestamp (unix seconds) this window renders, anchored at `now`. TODAY = no
      *  narrowing. Anchoring at the wall clock (not the newest banked bucket) keeps the card honest: a
@@ -54,18 +59,30 @@ internal fun lastWorkoutsFeed(rows: List<WorkoutRow>): List<WorkoutRow> =
 internal const val METRICS_COLLAPSED_CAP = 6
 
 /** The Weight tile's display string and an honest caption. */
-internal data class WeightTileText(val value: String, val caption: String?)
+internal enum class WeightCaption(@StringRes val labelRes: Int) {
+    LATEST(R.string.today_weight_latest),
+    FROM_PROFILE(R.string.today_weight_from_profile),
+}
+
+internal data class WeightTileText(val value: String, val caption: WeightCaption?)
 
 /**
  * The newest body weight across the two Apple-side sources (apple-health + health-connect), or null
  * when neither carries one. Days are ISO `yyyy-MM-dd`, which sorts chronologically, so the lexically
  * greatest day with a non-null `weightKg` is the most recent, no date parsing needed. (#107)
+ *
+ * With "Use weight from Health Connect" ON, [healthConnectOnly] drops the Apple Health rows: the profile
+ * then holds the newest Health Connect weight, and a newer Apple Health file must not let the tile name
+ * a different weight than the one the analytics use. Both go through [ProfileWeightSync.newest].
  */
-internal fun latestWeightKg(apple: List<AppleDaily>, healthConnect: List<AppleDaily>): Double? =
-    (apple + healthConnect)
-        .filter { it.weightKg != null }
-        .maxByOrNull { it.day }
-        ?.weightKg
+internal fun latestWeightKg(
+    apple: List<AppleDaily>,
+    healthConnect: List<AppleDaily>,
+    healthConnectOnly: Boolean = false,
+): Double? {
+    val rows = if (healthConnectOnly) healthConnect else apple + healthConnect
+    return ProfileWeightSync.newest(HealthConnectWeightSync.weightReadings(rows))?.kg
+}
 
 /**
  * Steps for [dayKey] from the imported Apple Health / Health Connect daily aggregates, or null when
@@ -89,7 +106,7 @@ internal fun stepsForDay(apple: List<AppleDaily>, healthConnect: List<AppleDaily
  */
 internal fun weightTile(latestWeightKg: Double?, profileWeightKg: Double, system: UnitSystem): WeightTileText =
     if (latestWeightKg != null) {
-        WeightTileText(UnitFormatter.massFromKilograms(latestWeightKg, system), "latest")
+        WeightTileText(UnitFormatter.massFromKilograms(latestWeightKg, system), WeightCaption.LATEST)
     } else {
-        WeightTileText(UnitFormatter.massFromKilograms(profileWeightKg, system), "from profile")
+        WeightTileText(UnitFormatter.massFromKilograms(profileWeightKg, system), WeightCaption.FROM_PROFILE)
     }

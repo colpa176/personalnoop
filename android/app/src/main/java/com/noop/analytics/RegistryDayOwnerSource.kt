@@ -10,18 +10,17 @@ import com.noop.protocol.DeviceFamily
  * with the per-day owner-resolution inputs so a day is scored from exactly ONE device (invariant I2),
  * without giving the pure-JVM engine a Room dependency.
  *
- * Priorities mirror the Swift IntelligenceEngine.resolveDayOwner exactly:
- *   0 = the active strap, 1 = other live (BLE/historyBLE) straps, 2 = imports (cloud/file). Lower wins.
- * Archived devices are excluded. With only the seeded active 'my-whoop' row paired (the default and
- * every single-WHOOP install), the sole candidate is priority 0, so the engine resolves to "my-whoop"
- * for every day and the reads stay byte-identical to the single-source path.
+ * Priorities mirror the Swift IntelligenceEngine.resolveDayOwner for current sources, with priority 4
+ * reserved for archived devices. Archived rows remain read-only historical candidates so removing and
+ * later re-adding a strap cannot erase its earlier physiological boundary/coverage; every current live,
+ * import, and activity source still wins an overlap. With only the seeded active 'my-whoop' row paired
+ * (the default and every single-WHOOP install), the sole candidate is priority 0, so reads stay identical.
  */
 class RegistryDayOwnerSource(private val registry: DeviceRegistry) : IntelligenceEngine.DayOwnerSource {
 
     override suspend fun candidatePriorities(): List<Pair<String, Int>> {
         val activeId = registry.activeDeviceId()
         return registry.all()
-            .filter { it.status != DeviceStatus.archived.name }
             .map { d ->
                 val isImport = d.sourceKind == SourceKind.cloudImport.name ||
                     d.sourceKind == SourceKind.fileImport.name
@@ -30,6 +29,7 @@ class RegistryDayOwnerSource(private val registry: DeviceRegistry) : Intelligenc
                 // wins a day nothing else covers. Mirrors Swift IntelligenceEngine.resolveDayOwner.
                 val priority = when {
                     d.id == activeId -> 0
+                    d.status == DeviceStatus.archived.name -> 4
                     d.sourceKind == SourceKind.activityFile.name -> 3
                     isImport -> 2
                     else -> 1
@@ -50,10 +50,30 @@ class RegistryDayOwnerSource(private val registry: DeviceRegistry) : Intelligenc
     override suspend fun activeWriteId(): String? = registry.activeDeviceId()
 
     // #938: resolve the strap family that wrote [deviceId]'s rows from its registry model. The model-label
-    // → family mapping (and the WHOOP5 fallback for unknowns) lives in DeviceFamily.forRegistryModel (#171).
+    // → family mapping (and the WHOOP5 fallback for unknowns) lives in DeviceFamily.forRegistryDevice (#171, #1086).
     // Mirrors the Swift IntelligenceEngine.skinTempFamily(forOwner:devices:).
     override suspend fun skinTempFamily(deviceId: String): DeviceFamily {
-        val model = registry.all().firstOrNull { it.id == deviceId }?.model
-        return DeviceFamily.forRegistryModel(model)
+        val d = registry.all().firstOrNull { it.id == deviceId }
+        // Non-WHOOP device (null) shares the non-4.0 temp scale, so coalesce to WHOOP5 — same conversion
+        // as before; brand-awareness just stops it claiming to be a WHOOP (#1086).
+        return DeviceFamily.forRegistryDevice(d?.model, d?.brand) ?: DeviceFamily.WHOOP5
+    }
+
+    // #1005: the UN-coalesced registered WHOOP family (null for a non-WHOOP owner), for the reuse-cache
+    // eligibility gate. Same registry lookup as skinTempFamily but WITHOUT the WHOOP5 fallback, so a ring /
+    // import / unknown owner resolves to null and is never cached. Mirrors the Swift reuse gate's inline
+    // DeviceFamily.forRegistryDevice(model:brand:).
+    override suspend fun registeredWhoopFamily(deviceId: String): DeviceFamily? {
+        val d = registry.all().firstOrNull { it.id == deviceId }
+        return DeviceFamily.forRegistryDevice(d?.model, d?.brand)
+    }
+
+    // #1467: the worn-gate timestamp tolerance for this owner (0 for WHOOP, byte-identical). Same
+    // registry lookup skinTempFamily uses; deliberately its own small helper rather than folding into
+    // DeviceFamily, which has no Oura case (#1086) and a tolerance-in-seconds isn't a temperature-scale
+    // concern. Mirrors the Swift IntelligenceEngine.skinTempWornToleranceSec(forOwner:devices:).
+    override suspend fun skinTempWornToleranceSec(deviceId: String): Long {
+        val d = registry.all().firstOrNull { it.id == deviceId }
+        return if (d?.brand == "Oura") AnalyticsEngine.DEFAULT_OURA_WORN_TOLERANCE_SEC else 0
     }
 }

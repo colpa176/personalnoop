@@ -66,18 +66,14 @@ import kotlin.math.roundToInt
 //                            "heads-up". On-device estimate — not a diagnosis.
 //
 // DESIGN-SYSTEM ONLY: NoopCard + Palette/DomainTheme tokens, NoopType, Metrics, StatePill.
-// No raw hex, no ad-hoc cards. Privacy-forward copy (this data is incapable of leaving the
-// device, said on every sensitive surface). Cards take VALUES not stores, so a slip stays
-// local and the engines remain testable + I/O-free. Wave-3 wiring noted at the foot.
+// No raw hex, no ad-hoc cards. Privacy-forward copy names the user-exported backup exception
+// on every sensitive surface. Cards take VALUES not stores, so a slip stays local and the
+// engines remain testable + I/O-free. Wave-3 wiring noted at the foot.
 
 // MARK: - Shared chrome
 
-/** The standing privacy promise repeated on every sensitive skin-temp surface. */
-private const val SKIN_TEMP_PRIVACY_LINE =
-    "This stays on your device. It is never uploaded, never synced, never shared."
-
 @Composable
-private fun PrivacyNote(text: String = SKIN_TEMP_PRIVACY_LINE) {
+private fun PrivacyNote(text: String = uiString(com.noop.R.string.cycle_tracker_privacy)) {
     Row(
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -160,8 +156,7 @@ fun CycleAwarenessCard(
                 Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Icon(Icons.Filled.CalendarMonth, contentDescription = null, tint = hue, modifier = Modifier.size(16.dp))
                     Text(
-                        uiString(R.string.l10n_skin_temp_cards_screen_a_period_is_likely_between_prettyday_bc501b32, prettyDay(w.earliestDay)) +
-                            "${prettyDay(w.latestDay)} (a window, not a fixed date).",
+                        uiString(R.string.l10n_skin_temp_cards_screen_a_period_is_likely_between_prettyday_bc501b32, prettyDay(w.earliestDay), prettyDay(w.latestDay)),
                         style = NoopType.subhead,
                         color = Palette.textSecondary,
                     )
@@ -209,9 +204,7 @@ fun CycleAwarenessOptInCard(onEnable: () -> Unit) {
                 Text(uiString(R.string.l10n_skin_temp_cards_screen_cycle_awareness_ffb94783), style = NoopType.headline, color = Palette.textPrimary)
             }
             Text(
-                uiString(R.string.l10n_skin_temp_cards_screen_noop_can_read_a_coarse_menstrual_c79e4b85) +
-                    "entirely on your device. It is awareness only: not contraception, not a fertility " +
-                    "predictor, not a medical service.",
+                uiString(R.string.l10n_skin_temp_cards_screen_noop_can_read_a_coarse_menstrual_c79e4b85),
                 style = NoopType.subhead,
                 color = Palette.textSecondary,
             )
@@ -263,9 +256,7 @@ fun BodyClockCard(
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Overline("Plan · ${plan.estimatedDays}-day shift")
                     Text(
-                        uiString(R.string.l10n_skin_temp_cards_screen_day_1_bright_light_clockstring_firstday_43b5fe87, clockString(firstDay.brightLightStartHour)) +
-                            "${clockString(firstDay.brightLightEndHour)}, lights-out around " +
-                            "${clockString(firstDay.targetSleepHour)}.",
+                        uiString(R.string.l10n_skin_temp_cards_screen_day_1_bright_light_clockstring_firstday_43b5fe87, clockString(firstDay.brightLightStartHour), clockString(firstDay.brightLightEndHour), clockString(firstDay.targetSleepHour)),
                         style = NoopType.subhead,
                         color = Palette.textSecondary,
                     )
@@ -389,18 +380,21 @@ private fun WhyRow(label: String, values: List<String>, tint: Color) {
 // MARK: - Derived copy / presentation (mirror the Swift card exactly)
 
 private fun cyclePhaseTitle(phase: CyclePhaseEngine.Phase): String = when (phase) {
-    CyclePhaseEngine.Phase.FOLLICULAR -> "Follicular"
-    CyclePhaseEngine.Phase.PERI_OVULATORY -> "Mid-cycle shift"
-    CyclePhaseEngine.Phase.LUTEAL -> "Luteal"
-    CyclePhaseEngine.Phase.UNKNOWN -> "No clear pattern"
-    CyclePhaseEngine.Phase.LEARNING -> "Learning your pattern"
+    CyclePhaseEngine.Phase.FOLLICULAR -> uiString(R.string.cycle_phase_follicular)
+    CyclePhaseEngine.Phase.PERI_OVULATORY -> uiString(R.string.cycle_phase_mid_cycle)
+    CyclePhaseEngine.Phase.LUTEAL -> uiString(R.string.cycle_phase_luteal)
+    CyclePhaseEngine.Phase.UNKNOWN -> uiString(R.string.cycle_phase_unclear)
+    CyclePhaseEngine.Phase.LEARNING -> uiString(R.string.cycle_phase_learning)
 }
 
 /** "~day 18–22" — always a RANGE, never a single point. */
 private fun cycleDayText(r: CyclePhaseEngine.Result): String? {
     val lo = r.cycleDayLow ?: return null
     val hi = r.cycleDayHigh ?: return null
-    return if (lo == hi) "· ~day $lo" else "· ~day $lo - $hi"
+    // Localized (uiString resolves via the app's resources — safe outside composition). Was a hardcoded
+    // interpolation, so the label shipped English regardless of locale; the audit misses it because this
+    // isn't a @Composable. Twin of the iOS `· ~day %lld` / `· ~day %lld–%lld` catalog entries.
+    return if (lo == hi) uiString(R.string.cycle_day_single, lo) else uiString(R.string.cycle_day_range, lo, hi)
 }
 
 private fun cycleConfidenceLabel(c: CyclePhaseEngine.Confidence): String = when (c) {

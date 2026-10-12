@@ -910,6 +910,8 @@ private struct OverlayChart: View {
 
     var body: some View {
         let model = currentModel
+        // Computed once so the marks and their label format agree about which days are shown.
+        let axisDays = ChartAxisDays.spanning(model.plots.map(\.date))
         Chart(model.plots) { p in
             LineMark(
                 x: .value("Date", p.date),
@@ -966,10 +968,14 @@ private struct OverlayChart: View {
                 }
             }
         }
+        // Day-aligned marks, not a requested count. `.automatic(desiredCount:)` picks the stride that
+        // best fits the count, and over a short window (this chart offers W) that stride goes sub-day, so
+        // two marks land in one calendar day and print the same date on top of itself.
         .chartXAxis {
-            AxisMarks(values: .automatic(desiredCount: 5)) { _ in
+            AxisMarks(values: axisDays) { _ in
                 AxisGridLine().foregroundStyle(StrandPalette.hairline.opacity(0.4))
-                AxisValueLabel().foregroundStyle(StrandPalette.textTertiary)
+                AxisValueLabel(format: ChartAxisDays.labelFormat(for: axisDays))
+                    .foregroundStyle(StrandPalette.textTertiary)
                     .font(StrandFont.footnote)
             }
         }
@@ -1085,7 +1091,10 @@ private struct MultiTooltip: View {
     /// Shared formatter; was rebuilt from scratch on every hover frame.
     private static let dateLabelFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
+        // Device locale (not en_US_POSIX) so the DISPLAYED weekday/month names translate — the crosshair
+        // parser above still uses en_US_POSIX for stable yyyy-MM-dd parsing. Same pattern + device locale
+        // as the Android twin so both localize consistently.
+        f.locale = Locale.autoupdatingCurrent
         f.dateFormat = "EEE d MMM yyyy"
         return f
     }()
@@ -1111,15 +1120,7 @@ private struct MultiTooltip: View {
             }
         }
         .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(StrandPalette.surfaceOverlay)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(StrandPalette.hairline, lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.4), radius: 10, y: 6)
+        .background(NoopPanelSurface(cornerRadius: 10, elevated: true))
         .frame(width: tooltipWidth, alignment: .leading)
         .position(x: clampedX, y: tooltipHeight / 2 + 8)
         .allowsHitTesting(false)

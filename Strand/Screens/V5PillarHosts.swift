@@ -58,12 +58,15 @@ struct RhythmHost: View {
 
     @State private var night: RhythmScreener.NightRhythmSummary?
     @State private var windows: [RhythmScreener.WindowResult] = []
+    /// #1360: why the night is empty, so the empty state reads truthfully. `.gatheringData` until `load`
+    /// diagnoses it (or when there simply isn't enough data yet — the honest "try again" default).
+    @State private var emptyReason: RhythmEmptyState = .gatheringData
     @State private var loaded = false
 
     private var consentGiven: Bool { enabled && RhythmConsent.isAccepted(acceptedVersion) }
 
     var body: some View {
-        RhythmView(night: night, windows: windows, onClose: onClose)
+        RhythmView(night: night, windows: windows, emptyReason: emptyReason, onClose: onClose)
             // Only compute once consent is given (the view shows the gate otherwise) AND on fresh data.
             .task(id: "\(consentGiven)|\(repo.refreshSeq)") {
                 guard consentGiven, !loaded else { return }
@@ -75,19 +78,15 @@ struct RhythmHost: View {
     /// Read the most recent banked sleep session, pull its R-R + gravity, split into ~5-minute windows,
     /// gate each on stillness + resting rate, and screen it. Descriptive stats only — never a verdict.
     private func load() async {
-        guard let store = await repo.storeHandle(),
-              let lastSleep = (await repo.allSleepSessions(days: 14)).last else { return }
+        guard let lastSleep = (await repo.allSleepSessions(days: 14)).last else { return }
         let lo = lastSleep.effectiveStartTs
         let hi = lastSleep.endTs
         guard hi > lo else { return }
-        let rr = (try? await store.rrIntervals(deviceId: repo.deviceId, from: lo, to: hi, limit: 200_000)) ?? []
-        // BLE-only users have their night under the computed source; fall back to it when the imported
-        // device yields nothing.
-        let rrRows = rr.isEmpty
-            ? ((try? await store.rrIntervals(deviceId: repo.deviceId + "-noop", from: lo, to: hi, limit: 200_000)) ?? [])
-            : rr
+        // The selected night can belong to a previous/archived strap. Resolve the same all-WHOOP worn
+        // timeline used by Sleep rather than pinning its raw physiology to whichever strap is active now.
+        let rrRows = await repo.rrIntervals(from: lo, to: hi, limit: 200_000)
         guard !rrRows.isEmpty else { return }
-        let grav = (try? await store.gravitySamples(deviceId: repo.deviceId, from: lo, to: hi, limit: 200_000)) ?? []
+        let grav = await repo.gravitySamplesUnion(from: lo, to: hi, limit: 200_000)
 
         // Window the night into 5-minute slices; a slice is "still" when its gravity variance is small.
         let windowSec = 5 * 60
@@ -106,6 +105,14 @@ struct RhythmHost: View {
         }
         windows = results
         night = RhythmScreener.summarizeNight(results)
+        // #1360: diagnose an empty night honestly. `hadMotionSignal` = the strap wrote ANY gravity sample
+        // (a ring writes none, #804); `beatsAreBanked` is measured over the whole night's stored R-R from
+        // the record timestamps (never the interval values), so it also detects the banked-capture class.
+        emptyReason = RhythmScreener.classifyEmptyState(
+            windows: results,
+            hadMotionSignal: !grav.isEmpty,
+            beatsAreBanked: RhythmScreener.nightBeatsAreBanked(
+                rrMs: rrRows.map { Double($0.rrMs) }, tsSec: rrRows.map { $0.ts }))
     }
 
     /// A window is "still" when its accelerometer magnitude varies little (a resting wrist). A coarse,

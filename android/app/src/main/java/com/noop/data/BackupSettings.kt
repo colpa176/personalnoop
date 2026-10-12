@@ -1,6 +1,7 @@
 package com.noop.data
 
 import android.content.Context
+import com.noop.ui.HostedCardPrefs
 import com.noop.ui.NoopPrefs
 import com.noop.ui.ProfileStore
 import com.noop.ui.UnitPrefs
@@ -39,10 +40,12 @@ object BackupSettingsCodec {
      * (platform-neutral) names. Mirrors the Apple `BackupSettings.whitelist` exactly.
      *
      * Profile: the body metrics that power HR zones / calories / recovery baselines, plus the manual
-     * HR-max override (`profile.hrMax`, 0 = auto/Tanaka). Display: the metric/imperial system, the
-     * separate temperature override ("" = match the system), and the Effort axis (#268). Deliberately
+     * HR-max override (`profile.hrMax`, 0 = auto/Tanaka). Display: the body and exercise-distance
+     * systems, separate temperature override ("" = follow body), and the Effort axis (#268). Deliberately
      * EXCLUDED: step calibration (per-strap, not per-person), the steps-engine fitted outputs
-     * (derived), and every noop.* toggle that is device- or install-specific.
+     * (derived), and every noop.* toggle that is device- or install-specific. That includes the
+     * Android-only "Use weight from Health Connect" toggle and its sync day (`ProfileStore`): a restore
+     * needs its own Health Connect grant, and the synced weight itself travels as `profile.weightKg`.
      */
     val WHITELIST: Map<String, Kind> = linkedMapOf(
         "profile.age" to Kind.INT,
@@ -51,9 +54,25 @@ object BackupSettingsCodec {
         "profile.heightCm" to Kind.DOUBLE,
         "profile.waistCm" to Kind.DOUBLE,
         "profile.hrMax" to Kind.INT,
+        "profile.hrZoneThresholds" to Kind.STRING,
         "units.system" to Kind.STRING,
+        "units.distance" to Kind.STRING,
         "units.temperature" to Kind.STRING,
+        "units.skinTempDisplay" to Kind.STRING,   // #1846, carried like the other display units
         "effort.scale" to Kind.STRING,
+        "dayCycle.mode" to Kind.STRING,
+        // The ONE layout pref carried (#today-hosted-cards): the Trends/Sleep cards the user chose to host
+        // in Today, a JSON [String] of ids. Unlike section order, this is a deliberate composition the user
+        // built and expects across a restore. Its POSITION (the addedCards slot in today.sectionOrder) is
+        // not carried, so on restore the set + internal order return but the section sits at its default.
+        HostedCardPrefs.KEY_SELECTION to Kind.STRING,
+        // #1361: the user's own custom journal BEHAVIOURS (a newline-joined list of names). The journal
+        // EFFECTS ride the DB backup, but the behaviour DEFINITIONS live only in prefs, so a restore left
+        // the entries referencing behaviours the logging catalog no longer offered. Platform-neutral key;
+        // the same newline value is bridged out of the catalog on both platforms.
+        // SCOPE: NAMES only — the wire carries no kind/group, so a numeric custom behaviour restores as a
+        // plain .bool toggle (identical on both platforms; historical entries keep their DB numericValue).
+        "journal.customBehaviors" to Kind.STRING,
     )
 
     /**
@@ -110,6 +129,16 @@ object BackupSettingsCodec {
  */
 object BackupSettingsBridge {
 
+    /** Journal-catalog storage keys in `noop_prefs` (#1361). The v2 items blob is the LIVE store; the
+     *  legacy custom/hidden keys are read ONCE by `JournalCatalog.loadJournalCatalogItems` to migrate into
+     *  v2, then never again. So export pulls custom names out of the v2 blob (parsed raw here to avoid a
+     *  data→ui dependency — the JSON shape mirrors `JournalCatalog.encodeJournalCatalog`), and restore
+     *  writes the names to the legacy custom key and CLEARS the v2 blob so the next load re-migrates them
+     *  (a restore requires an app restart, #57). Must match `JournalCatalog`. Mirrors the iOS bridge. */
+    private const val JOURNAL_CATALOG_V2_PREF = "noop.journalCatalogV2"
+    private const val JOURNAL_LEGACY_CUSTOM_PREF = "noop.journalCustomQuestions"
+    private const val JOURNAL_LEGACY_HIDDEN_PREF = "noop.journalHiddenQuestions"
+
     /** The whitelisted, user-SET settings of this device as the `settings.json` string, or null. */
     fun snapshotJson(context: Context): String? {
         val values = LinkedHashMap<String, Any>()
@@ -118,11 +147,37 @@ object BackupSettingsBridge {
         if (noop.contains(NoopPrefs.KEY_UNIT_SYSTEM)) {
             noop.getString(NoopPrefs.KEY_UNIT_SYSTEM, null)?.let { values["units.system"] = it }
         }
+        if (noop.contains(NoopPrefs.KEY_DISTANCE_UNIT_SYSTEM)) {
+            noop.getString(NoopPrefs.KEY_DISTANCE_UNIT_SYSTEM, null)?.let { values["units.distance"] = it }
+        }
         if (noop.contains(NoopPrefs.KEY_TEMPERATURE_UNIT)) {
             noop.getString(NoopPrefs.KEY_TEMPERATURE_UNIT, null)?.let { values["units.temperature"] = it }
         }
+        // #1846: carried like the other display units. The whitelist entry alone does NOTHING — export and
+        // import are both explicit per key here, so a whitelisted-but-unwired pref silently never restores.
+        if (noop.contains(NoopPrefs.KEY_SKIN_TEMP_DISPLAY)) {
+            noop.getString(NoopPrefs.KEY_SKIN_TEMP_DISPLAY, null)?.let { values["units.skinTempDisplay"] = it }
+        }
         if (noop.contains(UnitPrefs.KEY_EFFORT_SCALE)) {
             noop.getString(UnitPrefs.KEY_EFFORT_SCALE, null)?.let { values["effort.scale"] = it }
+        }
+        if (noop.contains(NoopPrefs.KEY_DAY_CYCLE_MODE)) {
+            noop.getString(NoopPrefs.KEY_DAY_CYCLE_MODE, null)?.let { values["dayCycle.mode"] = it }
+        }
+        if (noop.contains(HostedCardPrefs.KEY_SELECTION)) {
+            noop.getString(HostedCardPrefs.KEY_SELECTION, null)?.let { values[HostedCardPrefs.KEY_SELECTION] = it }
+        }
+        // #1361: custom journal behaviours from the LIVE v2 catalog blob (the legacy key is read-once-
+        // then-stale). Parse raw to avoid a data→ui dependency; shape mirrors JournalCatalog.
+        noop.getString(JOURNAL_CATALOG_V2_PREF, null)?.let { blob ->
+            val names = runCatching {
+                val arr = org.json.JSONArray(blob)
+                (0 until arr.length()).mapNotNull { i ->
+                    arr.optJSONObject(i)?.takeIf { it.optBoolean("custom", false) }
+                        ?.optString("canonical", "")?.takeIf { it.isNotEmpty() }
+                }
+            }.getOrDefault(emptyList())
+            if (names.isNotEmpty()) values["journal.customBehaviors"] = names.joinToString("\n")
         }
         return BackupSettingsCodec.encode(values)
     }
@@ -141,12 +196,28 @@ object BackupSettingsBridge {
 
         val editor = NoopPrefs.of(context).edit()
         (values["units.system"] as? String)?.let { editor.putString(NoopPrefs.KEY_UNIT_SYSTEM, it) }
+        (values["units.distance"] as? String)?.let { editor.putString(NoopPrefs.KEY_DISTANCE_UNIT_SYSTEM, it) }
         (values["units.temperature"] as? String)?.let { raw ->
-            // "" is the Apple side's "match the length/mass system"; here that state is key-absent.
+            // "" is the Apple side's "follow body measurements"; here that state is key-absent.
             if (raw.isEmpty()) editor.remove(NoopPrefs.KEY_TEMPERATURE_UNIT)
             else editor.putString(NoopPrefs.KEY_TEMPERATURE_UNIT, raw)
         }
+        (values["units.skinTempDisplay"] as? String)?.let { raw ->
+            // Absent/"" is "lead with a temperature", stored as key-absent — same convention as the
+            // temperature override above, and what an older backup without this key restores to.
+            if (raw.isEmpty()) editor.remove(NoopPrefs.KEY_SKIN_TEMP_DISPLAY)
+            else editor.putString(NoopPrefs.KEY_SKIN_TEMP_DISPLAY, raw)
+        }
         (values["effort.scale"] as? String)?.let { editor.putString(UnitPrefs.KEY_EFFORT_SCALE, it) }
+        (values["dayCycle.mode"] as? String)?.let { editor.putString(NoopPrefs.KEY_DAY_CYCLE_MODE, it) }
+        (values[HostedCardPrefs.KEY_SELECTION] as? String)?.let { editor.putString(HostedCardPrefs.KEY_SELECTION, it) }
+        // #1361: restore custom behaviours — write the names to the legacy custom key, clear stale hidden,
+        // and drop the v2 blob so the next catalog load re-migrates them (restart-gated, #57). Mirrors iOS.
+        (values["journal.customBehaviors"] as? String)?.let { joined ->
+            editor.putString(JOURNAL_LEGACY_CUSTOM_PREF, joined)
+            editor.remove(JOURNAL_LEGACY_HIDDEN_PREF)
+            editor.remove(JOURNAL_CATALOG_V2_PREF)
+        }
         editor.apply()
     }
 }

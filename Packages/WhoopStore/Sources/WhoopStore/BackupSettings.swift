@@ -34,12 +34,18 @@ public enum BackupSettings {
     /// (platform-neutral) names. Mirrored exactly by Android's `BackupSettingsCodec.WHITELIST`.
     ///
     /// Profile: the body metrics that power HR zones / calories / recovery baselines, plus the manual
-    /// HR-max override (`profile.hrMax`, 0 = auto/Tanaka). Display: the metric/imperial system, the
-    /// separate temperature override ("" = match the system), and the Effort axis (#268) — the three
-    /// display prefs that exist with identical semantics on both platforms. Deliberately EXCLUDED:
+    /// HR-max override (`profile.hrMax`, 0 = auto/Tanaka). Display: the body and exercise-distance
+    /// systems, separate temperature override ("" = follow body), and Effort axis (#268). Deliberately EXCLUDED:
     /// step calibration (per-strap, not per-person), the avatar blob (bulky, and not "settings"),
     /// steps-engine fitted outputs (derived), and every noop.* toggle that is device- or
-    /// install-specific.
+    /// install-specific — INCLUDING the Today/Sleep section order, Key-Metrics and dashboard-card
+    /// selections, which stay per-install.
+    ///
+    /// The ONE layout pref that IS carried is `today.hostedCards` (#today-hosted-cards): the Trends/Sleep
+    /// cards the user chose to host in Today. Unlike section order, this is a deliberate composition the
+    /// user built and expects to keep across a restore; it is a JSON `[String]` (rides the String kind).
+    /// The hosted cards' POSITION (the `addedCards` section slot in `today.sectionOrder`) is not carried,
+    /// so on restore the set + internal order return but the section sits at its default position.
     public static let whitelist: [String: Kind] = [
         "profile.age": .int,
         "profile.sex": .string,
@@ -47,9 +53,20 @@ public enum BackupSettings {
         "profile.heightCm": .double,
         "profile.waistCm": .double,
         "profile.hrMax": .int,
+        "profile.hrZoneThresholds": .string,
         "units.system": .string,
+        "units.distance": .string,
         "units.temperature": .string,
         "effort.scale": .string,
+        "dayCycle.mode": .string,
+        "today.hostedCards": .string,
+        // #1361: the user's own custom journal BEHAVIOURS (newline-joined names). Deliberately NOT in
+        // `appleDefaultsKey` below — it isn't a flat UserDefaults key (customs are derived from the
+        // catalog items blob), so the app layer (`DataBackup`) bridges this one on export and restore.
+        // Byte-identical newline value to the Android bridge.
+        // SCOPE: NAMES only — the wire carries no kind/group, so a numeric custom behaviour restores as a
+        // plain .bool toggle (identical on both platforms; historical entries keep their DB numericValue).
+        "journal.customBehaviors": .string,
     ]
 
     /// Canonical JSON key → this platform's UserDefaults key. Identity everywhere except
@@ -62,9 +79,13 @@ public enum BackupSettings {
         "profile.heightCm": "profile.heightCm",
         "profile.waistCm": "profile.waistCm",
         "profile.hrMax": "profile.hrMaxOverride",
+        "profile.hrZoneThresholds": "profile.hrZoneThresholds",
         "units.system": "units.system",
+        "units.distance": "units.distance",
         "units.temperature": "units.temperature",
         "effort.scale": "effort.scale",
+        "dayCycle.mode": "noop.dayCycleMode",
+        "today.hostedCards": "today.hostedCards",
     ]
 
     // MARK: - Snapshot / apply (UserDefaults boundary)
@@ -159,6 +180,11 @@ public enum BackupSettings {
     }
 
     private static func isBoolean(_ n: NSNumber) -> Bool {
+#if canImport(Darwin)
         CFGetTypeID(n) == CFBooleanGetTypeID()
+#else
+        // corelibs Foundation boxes JSON booleans with the Objective-C `c` type encoding.
+        String(cString: n.objCType) == "c"
+#endif
     }
 }

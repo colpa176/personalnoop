@@ -1,6 +1,7 @@
 package com.noop.ingest
 
 import com.noop.analytics.LabMarkerCategory
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -108,6 +109,39 @@ class LabMarkerCsvImportTest {
         assertEquals(LabMarkerCategory.OTHER, row.category)
         assertTrue(row.isCustomMarker)
         assertEquals(listOf("custom_magnesium"), result.customMarkerKeys)
+    }
+
+    @Test fun customMarkerKeyCanonicalizesNfcAndNfdBeforeSlugging() {
+        val expected = byteArrayOf(
+            0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x5f, 0x63, 0x61, 0x66,
+            0xc3.toByte(), 0xa9.toByte(), 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72,
+        )
+        assertArrayEquals(expected, LabMarkerCsvImport.customKey("Caf\u00e9 Marker").toByteArray())
+        assertArrayEquals(expected, LabMarkerCsvImport.customKey("Cafe\u0301 Marker").toByteArray())
+        assertEquals("custom_apo_b", LabMarkerCsvImport.customKey("Apo B"))
+    }
+
+    @Test fun canonicalEquivalentCustomMarkerRowsShareKeyAndLastRowWins() {
+        val nfc = "Caf\u00e9 Marker"
+        val nfd = "Cafe\u0301 Marker"
+        val csv = """
+            date,marker,value,unit
+            2026-05-01,$nfc,1,mg/L
+            2026-05-01,$nfd,2,mg/L
+        """.trimIndent()
+        val expected = byteArrayOf(
+            0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x5f, 0x63, 0x61, 0x66,
+            0xc3.toByte(), 0xa9.toByte(), 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72,
+        )
+        val result = LabMarkerCsvImport.parse(csv)
+
+        assertEquals(1, result.importedReadings)
+        assertEquals(1, result.distinctMarkers)
+        assertEquals(1, result.rows.size)
+        assertEquals(2.0, result.rows[0].value, 1e-9)
+        assertArrayEquals(expected, result.rows[0].markerKey.toByteArray())
+        assertEquals(1, result.customMarkerKeys.size)
+        assertArrayEquals(expected, result.customMarkerKeys[0].toByteArray())
     }
 
     // MARK: - Blood pressure pairs (diastolic must never be dropped)
@@ -286,5 +320,42 @@ class LabMarkerCsvImportTest {
         assertEquals("custom_magnesium", LabMarkerCsvImport.customKey("Magnesium"))
         assertEquals("custom_apo_b", LabMarkerCsvImport.customKey("Apo B"))
         assertEquals("", LabMarkerCsvImport.customKey("  ???  "))
+    }
+
+    /**
+     * A white-cell differential lists each cell type as a count AND a percentage. Both used to
+     * slug to `custom_lymph`, so on the same day the "%" row overwrote the count row.
+     */
+    @Test fun percentRowDoesNotOverwriteCountRow() {
+        val csv = """
+            date,marker,value,unit
+            2026-05-01,LYMPH,1.9,10^9/L
+            2026-05-01,LYMPH %,31.2,%
+            2026-05-01,BASO,0.03,10^9/L
+            2026-05-01,BASO %,0.5,%
+        """.trimIndent()
+        val result = LabMarkerCsvImport.parse(csv)
+        assertEquals(4, result.importedReadings)
+        assertEquals(
+            listOf("custom_baso", "custom_baso_pct", "custom_lymph", "custom_lymph_pct"),
+            result.customMarkerKeys,
+        )
+        assertEquals(1.9, result.rows.first { it.markerKey == "custom_lymph" }.value, 1e-9)
+        assertEquals(31.2, result.rows.first { it.markerKey == "custom_lymph_pct" }.value, 1e-9)
+    }
+
+    /**
+     * Expected literals are the verbatim stdout of Swift `LabMarkerCsvImport.customKey` compiled
+     * standalone over [names] (the Swift suite pins the same list). The Unicode numeric cases
+     * guard the Android/Swift category boundary from #2351.
+     */
+    @Test fun customKeyIsPinned() {
+        val names = listOf(
+            "LYMPH", "LYMPH %", "LYMPH%", "Lymph (%)", "BASO", "BASO %", "% Neutrophils", "NEUT  %", "a%%b", "%", "Apo B", "Magnesium", "  ???  ", "A - B", "Vitamin D (25-OH)", "Caf\u00e9 Marker", "Cafe\u0301 Marker", "MCHC g/dL", "HbA1c (IFCC)", "eGFR mL/min/1.73m²", "Factor Ⅻ", "Vitamin B₁₂", "①%", "½ dose", "³", "2", "𐄇",
+        )
+        val expected = listOf(
+            "custom_lymph", "custom_lymph_pct", "custom_lymph_pct", "custom_lymph_pct", "custom_baso", "custom_baso_pct", "custom_pct_neutrophils", "custom_neut_pct", "custom_a_pctpct_b", "custom_pct", "custom_apo_b", "custom_magnesium", "", "custom_a__b", "custom_vitamin_d_25_oh", "custom_café_marker", "custom_café_marker", "custom_mchc_g_dl", "custom_hba1c_ifcc", "custom_egfr_ml_min_1_73m²", "custom_factor_ⅻ", "custom_vitamin_b₁₂", "custom_①_pct", "custom_½_dose", "custom_³", "custom_2", "custom_𐄇",
+        )
+        assertEquals(expected, names.map { LabMarkerCsvImport.customKey(it) })
     }
 }

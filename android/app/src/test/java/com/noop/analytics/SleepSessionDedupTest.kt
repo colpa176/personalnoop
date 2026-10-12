@@ -104,6 +104,35 @@ class SleepSessionDedupTest {
         assertEquals(listOf(long.startTs), result.kept.map { it.startTs })
     }
 
+    // ── Heal witness: the computed bank-recency witness must not reach a provided device's rows ──
+
+    @Test
+    fun healWitness_isHandedOnlyToTheComputedId() {
+        val kept = setOf(midnight - 2 * 3600L, midnight + 15 * 3600L)
+        assertEquals(kept, SleepSessionDedup.healWitness("my-whoop-noop", "my-whoop-noop", kept))
+        assertEquals(emptySet<Long>(), SleepSessionDedup.healWitness("oura-Y12", "my-whoop-noop", kept))
+        assertEquals(emptySet<Long>(), SleepSessionDedup.healWitness("oura-Y12", "my-whoop-noop", emptySet()))
+    }
+
+    @Test
+    fun ringSweep_keepsTheFullerReserveBankedWhileThePassWasInFlight() {
+        // 09-19/20 (iOS 11.8.0): the pass READ the ring's 22:20 → 03:57 row, the OS suspended it, and by
+        // the time its heal ran the ring had re-served the night out to 08:21. The read row's startTs is in
+        // keptStarts (the pass banked it verbatim under computedId). Handed to the ring's own sweep as the
+        // witness, it outranked the full night and the heal deleted 598 min in favour of 337 — the wake
+        // time the user saw was 04:48. With healWitness the ring id gets no witness: longest wins.
+        val read = session(midnight - 2 * 3600L + 53, midnight + 3 * 3600L + 57 * 60) // 337 min
+        val full = session(midnight - 2 * 3600L + 231, midnight + 8 * 3600L + 21 * 60) // 598 min
+        val keptStarts = setOf(read.startTs)
+        val ringWitness = SleepSessionDedup.healWitness("oura-Y12", "my-whoop-noop", keptStarts)
+        val healed = SleepSessionDedup.dedupe(listOf(read, full), freshStarts = ringWitness)
+        assertEquals("the fuller re-serve survives the heal", listOf(full.startTs), healed.kept.map { it.startTs })
+        assertEquals(listOf(read.startTs), healed.dropped.map { it.startTs })
+        // The regression, pinned so it cannot creep back: the leaked witness keeps the stale read row.
+        val leaked = SleepSessionDedup.dedupe(listOf(read, full), freshStarts = keptStarts)
+        assertEquals(listOf(read.startTs), leaked.kept.map { it.startTs })
+    }
+
     @Test
     fun userEditedSession_isNeverDropped() {
         // A hand-corrected night outranks everything, including a fresh re-detection.
@@ -131,5 +160,250 @@ class SleepSessionDedupTest {
         assertTrue(SleepSessionDedup.dedupe(emptyList()).kept.isEmpty())
         val one = session(midnight, midnight + 3600L)
         assertEquals(listOf(one.startTs), SleepSessionDedup.dedupe(listOf(one)).kept.map { it.startTs })
+    }
+
+    // ── #1284 residual 3: a non-overlapping pre-onset fragment collapses; a real nap does not ────────
+
+    @Test
+    fun oura1284_preOnsetFragment_collapsesDespiteNoOverlap() {
+        // The anchored night 22:00 -> 06:00, and the Oura SleepNet pre-onset fragment ending 69 s before
+        // the night starts (measured on 08-10/11) — a 40 min piece with NO overlap with the night.
+        val night = session(midnight - 2 * 3600L, midnight + 6 * 3600L)
+        val fragEnd = (midnight - 2 * 3600L) - 69L
+        val fragment = session(fragEnd - 40 * 60L, fragEnd)
+        assertTrue("a 69 s edge gap is one interrupted night", SleepSessionDedup.isDuplicate(fragment, night))
+        val result = SleepSessionDedup.dedupe(listOf(fragment, night), freshStarts = setOf(night.startTs))
+        assertEquals("fragment + night collapse to one", 1, result.kept.size)
+        assertEquals("the fuller anchored night survives", night.startTs, result.kept.first().startTs)
+    }
+
+    @Test
+    fun oura1284_realNap_staysSeparate() {
+        // A genuine afternoon nap hours before the night is never near-adjacent.
+        val nap = session(midnight - 9 * 3600L, midnight - 8 * 3600L)
+        val night = session(midnight - 2 * 3600L, midnight + 6 * 3600L)
+        assertTrue(!SleepSessionDedup.isDuplicate(nap, night))
+        assertEquals(2, SleepSessionDedup.dedupe(listOf(nap, night)).kept.size)
+    }
+
+    @Test
+    fun oura1284_gapBeyondNearAdjacent_staysSeparate() {
+        // Two disjoint sessions 20 min apart (> the 15 min near-adjacent bar) are not merged.
+        val a = session(midnight - 3 * 3600L, midnight - 2 * 3600L)
+        val b = session(midnight - 2 * 3600L + 20 * 60L, midnight + 4 * 3600L)
+        assertTrue(!SleepSessionDedup.isDuplicate(a, b))
+        assertEquals(2, SleepSessionDedup.dedupe(listOf(a, b)).kept.size)
+    }
+
+    // ── #1284 residual 3 (cont.): the overlap==0 cliff, and the adjacent-nap guard ───────────────
+
+    @Test
+    fun oura1284_grazingFragment_collapsesAcrossTheOverlapSeam() {
+        // 08-13/14: a 26 min re-decode fragment whose backward lay overshot the onset, so it GRAZES the
+        // 390 min anchored night by 121 s. The old rule collapsed a fragment ending 69 s SHORT but not one
+        // grazing 121 s IN — a discontinuity at overlap==0. The fragment (6.7% of the night) now collapses.
+        val night = session(midnight, midnight + 390 * 60L)
+        val fragEnd = midnight + 121L
+        val fragment = session(fragEnd - 26 * 60L, fragEnd) // 26 min, 121 s into the night
+        assertEquals(121L, SleepSessionDedup.overlapSeconds(fragment, night))
+        assertTrue(SleepSessionDedup.isDuplicate(fragment, night))
+        val result = SleepSessionDedup.dedupe(listOf(fragment, night), freshStarts = setOf(night.startTs))
+        assertEquals(listOf(night.startTs), result.kept.map { it.startTs })
+    }
+
+    @Test
+    fun oura1284_adjacentNapsOfComparableLength_areKept() {
+        // The guard against over-collapse: two GENUINE consecutive naps (20 min then 33 min, a 471 s gap,
+        // seen in the oura-import corpus) are comparable in length — the shorter is 61% of the longer, far
+        // above the fragment ratio — so they must NOT merge, even though the gap is within the near bar.
+        val nap1 = session(midnight, midnight + 20 * 60L)
+        val nap2 = session(midnight + 20 * 60L + 471L, midnight + 20 * 60L + 471L + 33 * 60L)
+        assertTrue(SleepSessionDedup.edgeGapSeconds(nap1, nap2) <= SleepSessionDedup.NEAR_ADJACENT_SECONDS)
+        assertTrue(!SleepSessionDedup.isDuplicate(nap1, nap2))
+        assertEquals(2, SleepSessionDedup.dedupe(listOf(nap1, nap2)).kept.size)
+    }
+
+    @Test
+    fun oura1284_multiplePhantomFragments_allCollapseToTheNight() {
+        // 08-14/15: one night re-decoded into several short phantom copies at drifting offsets. Every
+        // phantom is a fragment of the night, so all collapse to it regardless of how they relate to EACH
+        // other — closing the non-transitive, sort-order-dependent survivor set the cliff produced.
+        val night = session(midnight, midnight + 390 * 60L)
+        val phantomA = session(midnight - 24 * 60L, midnight + 2 * 60L) // grazes in by 2 min
+        val phantomB = session(midnight + 12 * 60L, midnight + 38 * 60L) // fully inside the head
+        val phantomC = session(midnight + 27 * 60L, midnight + 53 * 60L) // fully inside the head
+        for (order in listOf(
+            listOf(night, phantomA, phantomB, phantomC),
+            listOf(phantomC, phantomA, night, phantomB),
+        )) {
+            val result = SleepSessionDedup.dedupe(order, freshStarts = setOf(night.startTs))
+            assertEquals(listOf(night.startTs), result.kept.map { it.startTs })
+        }
+    }
+
+    // ── #1284 residual 3: survivor selection (mode-2 partial drain · mode-1 identical re-anchors) ──
+
+    @Test
+    fun oura1284_partialDrain_keepsTheFullerOverlappingDecode() {
+        // Mode 2 (08-13/14): a full 494 min decode and a 234 min partial (nested inside it) are the same
+        // night; the FULLER one must survive (rank rule 3, longest duration) so a partial re-drain never
+        // clobbers a complete night — the completeness adjudication the generation-side keying will lean on.
+        val full = session(midnight, midnight + 494 * 60L)
+        val partial = session(midnight + 242L, midnight + 242L + 234 * 60L) // nested in full
+        assertTrue(SleepSessionDedup.isDuplicate(full, partial))
+        val result = SleepSessionDedup.dedupe(listOf(partial, full)) // no freshStarts → longest-wins decides
+        assertEquals(listOf(full.startTs), result.kept.map { it.startTs })
+        assertEquals(listOf(partial.startTs), result.dropped.map { it.startTs })
+    }
+
+    // ── #1284 residual 3: generation-side onset keying (keyedStart · planBank) ────────────────────
+
+    @Test
+    fun keyedStart_collapsesOnsetJitterToOneBucket() {
+        val a = SleepSessionDedup.keyedStart(midnight + 55L)
+        val b = SleepSessionDedup.keyedStart(midnight + 76L) // +21 s
+        assertEquals(a, b)
+        assertEquals(0L, a % SleepSessionDedup.ONSET_KEY_GRID_SECONDS)
+    }
+
+    @Test
+    fun planBank_supersedesAShorterStoredCopy() {
+        val candidate = session(midnight, midnight + 494 * 60L)
+        val stored = session(midnight + 60L, midnight + 60L + 234 * 60L)
+        val plan = SleepSessionDedup.planBank(candidate, listOf(stored))
+        assertTrue(plan.bank)
+        assertEquals(listOf(stored.startTs), plan.supersededStarts)
+    }
+
+    @Test
+    fun planBank_suppressesAPartialAgainstAFullerStoredNight() {
+        val stored = session(midnight, midnight + 494 * 60L)
+        val candidate = session(midnight + 60L, midnight + 60L + 234 * 60L)
+        val plan = SleepSessionDedup.planBank(candidate, listOf(stored))
+        assertTrue(!plan.bank)
+        assertTrue(plan.supersededStarts.isEmpty())
+    }
+
+    @Test
+    fun planBank_laterWakingReAnchorSupersedesTheEarlier() {
+        val stored = session(midnight, midnight + 368 * 60L)
+        val candidate = session(midnight + 15 * 60L, midnight + 15 * 60L + 368 * 60L)
+        val plan = SleepSessionDedup.planBank(candidate, listOf(stored))
+        assertTrue(plan.bank)
+        assertEquals(listOf(stored.startTs), plan.supersededStarts)
+    }
+
+    @Test
+    fun planBank_freshNightWithNoStoredMatchBanksClean() {
+        val candidate = session(midnight, midnight + 400 * 60L)
+        val lastNight = session(midnight - 24 * 3600L, midnight - 16 * 3600L)
+        val plan = SleepSessionDedup.planBank(candidate, listOf(lastNight))
+        assertTrue(plan.bank)
+        assertTrue(plan.supersededStarts.isEmpty())
+    }
+
+    @Test
+    fun planBank_identicalReserveIsANoOp() {
+        val stored = session(midnight, midnight + 400 * 60L)
+        val candidate = session(midnight, midnight + 400 * 60L)
+        assertTrue(!SleepSessionDedup.planBank(candidate, listOf(stored)).bank)
+    }
+
+    @Test
+    fun keyedStart_roundsHalfUpAndClampsGrid() {
+        assertEquals(1020L, SleepSessionDedup.keyedStart(1000L, 60L))
+        assertEquals(1020L, SleepSessionDedup.keyedStart(990L, 60L))   // +30 rounds up
+        assertEquals(960L, SleepSessionDedup.keyedStart(989L, 60L))    // just under → down
+        assertEquals(1234L, SleepSessionDedup.keyedStart(1234L, 0L))   // grid clamp >=1 = identity
+    }
+
+    // Item 22, 2026-09-12: a real captured negative-duration nap. Two written codes span
+    // 14:24:17->14:26:17 (mapped), but the closest-matched 0x49 window's onset landed at ~14:41:xx —
+    // ~16 min AFTER mapped.endTs — because codesWithTimes's own clip-would-empty fallback had
+    // silently returned the unclipped burst. The unguarded keyedStart call rounded that onset to
+    // exactly 14:42:00 and wrote it as startTs, 943 s after endTs. safeKeyedStart must refuse the
+    // rekey here and return null (keep mapped.startTs unchanged).
+    @Test
+    fun safeKeyedStart_refusesTheItem22NegativeDurationRegression() {
+        val mappedStart = 1_789_215_857L   // 14:24:17 local — matches the captured stagesJSON
+        val mappedEnd = 1_789_215_977L     // 14:26:17 local
+        val mismatchedOnset = 1_789_216_910L   // ~14:41:50 — the mis-paired window's onset, after endTs
+        assertEquals(null, SleepSessionDedup.safeKeyedStart(mismatchedOnset, mappedStart, mappedEnd))
+    }
+
+    // The ordinary, intended case: the assembler's clip genuinely bound, so the onset sits at or just
+    // before the first surviving code — safeKeyedStart should key startTs to the rounded onset.
+    @Test
+    fun safeKeyedStart_appliesTheRekeyWhenTheClipGenuinelyBound() {
+        val onset = 1_789_215_800L   // precedes mapped.startTs, as a bound clip guarantees
+        val mappedStart = 1_789_215_857L
+        val mappedEnd = 1_789_215_977L
+        val keyed = SleepSessionDedup.safeKeyedStart(onset, mappedStart, mappedEnd)
+        assertEquals(SleepSessionDedup.keyedStart(onset), keyed)
+        assertTrue(keyed!! < mappedEnd)
+    }
+
+    // A second, smaller-magnitude failure mode safeKeyedStart also has to catch: the onset passes the
+    // first guard (onset <= mappedStartTs, so the clip genuinely bound), but 30 s grid-rounding pushes
+    // it to or past endTs on a very short (20 s) session — refuse rather than mint a
+    // zero/negative-duration session.
+    @Test
+    fun safeKeyedStart_refusesWhenRoundingWouldReachOrPassEndTs() {
+        val mappedStart = 1_000_000L
+        val mappedEnd = 1_000_020L   // 20 s session
+        val onset = 999_995L   // <= mappedStart (clip bound), but keyedStart(999_995, 60) = 1_000_020 == endTs
+        assertEquals(mappedEnd, SleepSessionDedup.keyedStart(onset))
+        assertEquals(null, SleepSessionDedup.safeKeyedStart(onset, mappedStart, mappedEnd))
+    }
+
+    @Test
+    fun planBank_sameBucketFullerStoredRow_suppressesAPartialReserve() {
+        // F1 regression: a partial re-drain at the SAME keyed PK as a fuller banked night must be suppressed.
+        val fuller = session(midnight, midnight + 494 * 60L)
+        val partial = session(midnight, midnight + 234 * 60L)
+        assertTrue(!SleepSessionDedup.planBank(partial, listOf(fuller)).bank)
+    }
+
+    @Test
+    fun planBank_sameBucketFullerCandidate_banksWithoutSelfDeleting() {
+        val stored = session(midnight, midnight + 234 * 60L)
+        val candidate = session(midnight, midnight + 494 * 60L)
+        val plan = SleepSessionDedup.planBank(candidate, listOf(stored))
+        assertTrue(plan.bank)
+        assertTrue(plan.supersededStarts.isEmpty())
+    }
+
+    @Test
+    fun planBank_supersedesOtherKeyRowsButNotItsOwn() {
+        val candidate = session(midnight, midnight + 494 * 60L)
+        val sameKeyPartial = session(midnight, midnight + 200 * 60L)
+        val otherKeyFrag = session(midnight - 120L, midnight - 120L + 180 * 60L)
+        val plan = SleepSessionDedup.planBank(candidate, listOf(sameKeyPartial, otherKeyFrag))
+        assertTrue(plan.bank)
+        assertEquals(listOf(otherKeyFrag.startTs), plan.supersededStarts)
+    }
+
+    @Test
+    fun planBank_neverClobbersAUserEditedNight() {
+        // Data safety: a hand-corrected night outranks any fresh ring persist (even a fuller one), so the
+        // candidate is suppressed and the edited row is never replaced OR deleted.
+        val edited = session(midnight, midnight + 400 * 60L, edited = true)
+        val candidate = session(midnight + 30L, midnight + 30L + 420 * 60L)
+        val plan = SleepSessionDedup.planBank(candidate, listOf(edited))
+        assertTrue(!plan.bank)
+        assertTrue(plan.supersededStarts.isEmpty())
+    }
+
+    @Test
+    fun oura1284_identicalReAnchors_resolveByLatestEnd() {
+        // Mode 1 (08-16): one rigid block re-anchored at several onsets — same duration, same shape, only the
+        // END chases wall-clock. Duration can't adjudicate, so the tie-break (latest endTs) picks the row
+        // whose wake edge is latest — the one that matched WHOOP's wake. Pins that load-bearing order.
+        val r1 = session(midnight, midnight + 368 * 60L)
+        val r2 = session(midnight + 15 * 60L, midnight + 15 * 60L + 368 * 60L)
+        val r3 = session(midnight + 30 * 60L, midnight + 30 * 60L + 368 * 60L) // latest end
+        val result = SleepSessionDedup.dedupe(listOf(r2, r3, r1))
+        assertEquals(listOf(r3.startTs), result.kept.map { it.startTs })
+        assertEquals(2, result.dropped.size)
     }
 }

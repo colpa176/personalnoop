@@ -133,7 +133,7 @@ enum ChargeBreakdownFormat {
     /// The recalibration epoch as a short display day ("19 Jul"), or nil when none is set. Pure — the
     /// caller supplies the epoch (`Baselines.hrvBaselineEpoch()`), so this stays testable. Locale-aware
     /// via `DateFormatter.setLocalizedDateFormatFromTemplate`, so the day/month order follows the user.
-    static func recalibrationDay(epoch: Double, locale: Locale = .current) -> String? {
+    static func recalibrationDay(epoch: Double, locale: Locale = AppLanguage.activeLocale) -> String? {
         guard epoch > 0 else { return nil }
         let fmt = DateFormatter()
         fmt.locale = locale
@@ -202,6 +202,47 @@ enum ChargeBreakdownFormat {
     /// VoiceOver plain string (title + detail).
     static var chargeDeepWindowGapAccessibility: String {
         "\(chargeDeepWindowGapTitle). \(chargeDeepWindowGapDetail)"
+    }
+
+    // MARK: - Legacy WHOOP 5 R-R units gap (#1505)
+
+    /// The short title for a night the WHOOP 5 unit policy has to leave unscored.
+    static let chargeLegacyRRGapTitle = String(localized: "Earlier beats cannot be scored")
+
+    /// The explanatory detail. It names the cause and stops there, deliberately: the beats are already
+    /// on the phone and the strap has long since trimmed that night from its own flash, so there is no
+    /// honest "do this and it comes back" step to offer. What it CAN promise is that the night is not
+    /// lost from history and that the problem does not continue, and it says both.
+    static let chargeLegacyRRGapDetail = String(localized: "This night was recorded before NOOP labelled which WHOOP 5 transport each heartbeat came from, so its intervals mix two different units with nothing stored to tell them apart. The night stays in your history, and nights recorded from now on score normally.")
+
+    /// VoiceOver plain string (title + detail).
+    static var chargeLegacyRRGapAccessibility: String {
+        "\(chargeLegacyRRGapTitle). \(chargeLegacyRRGapDetail)"
+    }
+}
+
+/// The same legacy R-R explanation on classic and Liquid Today.
+struct ChargeLegacyRRGapNote: View {
+    var body: some View {
+        NoopCard(padding: 14, tint: StrandPalette.chargeColor) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(StrandPalette.chargeColor)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(ChargeBreakdownFormat.chargeLegacyRRGapTitle)
+                        .font(StrandFont.headline)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Text(ChargeBreakdownFormat.chargeLegacyRRGapDetail)
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(ChargeBreakdownFormat.chargeLegacyRRGapAccessibility)
     }
 }
 

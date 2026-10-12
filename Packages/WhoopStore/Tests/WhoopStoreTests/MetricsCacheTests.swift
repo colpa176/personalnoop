@@ -21,6 +21,17 @@ final class MetricsCacheTests: XCTestCase {
 
     // MARK: - sleep sessions
 
+    /// The same session as it reads back from `deviceId`. `sleepSessions` stamps the device it read the
+    /// row from, and a hand-built session carries no provenance, so a whole-value expectation has to
+    /// state it. The write takes its device from the `upsertSleepSessions` argument, never from this
+    /// field, so a session's `deviceId` is an output of the read and not an input to the write.
+    private func readBack(_ s: CachedSleepSession, from deviceId: String) -> CachedSleepSession {
+        CachedSleepSession(startTs: s.startTs, endTs: s.endTs, efficiency: s.efficiency,
+                           restingHr: s.restingHr, avgHrv: s.avgHrv, stagesJSON: s.stagesJSON,
+                           userEdited: s.userEdited, startTsAdjusted: s.startTsAdjusted,
+                           stagingSparse: s.stagingSparse, deviceId: deviceId)
+    }
+
     func testSleepSessionUpsertReadAndIdempotency() async throws {
         let store = try await WhoopStore.inMemory()
         let s = CachedSleepSession(startTs: 1000, endTs: 5000, efficiency: 0.92,
@@ -30,17 +41,117 @@ final class MetricsCacheTests: XCTestCase {
 
         var rows = try await store.sleepSessions(deviceId: "devA", from: 0, to: 100_000, limit: 100)
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0], s)
+        XCTAssertEqual(rows[0], readBack(s, from: "devA"))
 
-        // Re-upsert the same natural key with updated values → no duplicate, value updated.
+        // Re-upsert the same natural key with updated values, stages covering their (shorter) new span
+        // just as fully as before → no duplicate, value updated (an ordinary refresh, not a regression).
         let s2 = CachedSleepSession(startTs: 1000, endTs: 6000, efficiency: 0.95,
-                                    restingHr: 50, avgHrv: 70.0, stagesJSON: nil)
+                                    restingHr: 50, avgHrv: 70.0,
+                                    stagesJSON: "[{\"start\":1000,\"end\":6000,\"stage\":\"light\"}]")
         try await store.upsertSleepSessions([s2], deviceId: "devA")
         rows = try await store.sleepSessions(deviceId: "devA", from: 0, to: 100_000, limit: 100)
         XCTAssertEqual(rows.count, 1, "same (deviceId,startTs) must not duplicate")
         XCTAssertEqual(rows[0].endTs, 6000)
         XCTAssertEqual(rows[0].efficiency, 0.95)
-        XCTAssertNil(rows[0].stagesJSON)
+        XCTAssertEqual(rows[0].stagesJSON, s2.stagesJSON)
+    }
+
+    /// A candidate whose stage timeline is LESS complete than what's already stored for the same
+    /// (deviceId, startTs) must be dropped whole — a device serving the same night's hypnogram twice (a
+    /// reconnect mid-day, a resumed drain) must never have its later, thinner decode clobber an earlier,
+    /// fuller one. Reproduces the exact shape of a real incident: a full-night hypnogram (96 segments,
+    /// fully covering its span) overwritten by a 5-segment tail slice covering only ~10% of the same
+    /// claimed span.
+    func testUpsertSleepSessionsDropsALessCompleteCandidate() async throws {
+        let store = try await WhoopStore.inMemory()
+        let full = CachedSleepSession(startTs: 1_000_000, endTs: 1_032_531, efficiency: 0.886,
+                                      restingHr: 50, avgHrv: 60,
+                                      stagesJSON: "[{\"start\":1000000,\"end\":1032531,\"stage\":\"light\"}]")
+        try await store.upsertSleepSessions([full], deviceId: "oura-ring")
+
+        // Same night, same key, but the "candidate" only covers the tail ~10% of the claimed span —
+        // holed, per HypnogramCoverage — with a bogus efficiency recomputed off just that slice.
+        let holedTail = CachedSleepSession(startTs: 1_000_000, endTs: 1_032_532, efficiency: 0.99,
+                                           restingHr: 48, avgHrv: 58,
+                                           stagesJSON: "[{\"start\":1029411,\"end\":1032532,\"stage\":\"rem\"}]")
+        try await store.upsertSleepSessions([holedTail], deviceId: "oura-ring")
+
+        let rows = try await store.sleepSessions(deviceId: "oura-ring", from: 0, to: 2_000_000, limit: 100)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0], readBack(full, from: "oura-ring"),
+                       "the fuller, previously-stored night must survive untouched")
+    }
+
+    /// The mirror case: a candidate that IMPROVES on a holed stored row (fills in more of the same span)
+    /// must still win — the guard compares richness, it does not freeze the row forever.
+    func testUpsertSleepSessionsAcceptsAMoreCompleteCandidate() async throws {
+        let store = try await WhoopStore.inMemory()
+        let holed = CachedSleepSession(startTs: 1_000_000, endTs: 1_032_531, efficiency: 0.5,
+                                       restingHr: 50, avgHrv: 60,
+                                       stagesJSON: "[{\"start\":1000000,\"end\":1004000,\"stage\":\"light\"}]")
+        try await store.upsertSleepSessions([holed], deviceId: "oura-ring")
+
+        let full = CachedSleepSession(startTs: 1_000_000, endTs: 1_032_531, efficiency: 0.886,
+                                      restingHr: 48, avgHrv: 58,
+                                      stagesJSON: "[{\"start\":1000000,\"end\":1032531,\"stage\":\"light\"}]")
+        try await store.upsertSleepSessions([full], deviceId: "oura-ring")
+
+        let rows = try await store.sleepSessions(deviceId: "oura-ring", from: 0, to: 2_000_000, limit: 100)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0], readBack(full, from: "oura-ring"),
+                       "a candidate that covers more of the night must still win")
+    }
+
+    /// The completeness guard must never engage for a user-edited row — `applySleepEdit`'s bounds/stages
+    /// are the dedicated correction path, and `upsertSleepSessions` already protects them unconditionally
+    /// regardless of richness. (Guards against the new check accidentally widening what "protected" means.)
+    func testUpsertSleepSessionsGuardNeverOverridesUserEditedProtection() async throws {
+        let store = try await WhoopStore.inMemory()
+        let full = CachedSleepSession(startTs: 1_000_000, endTs: 1_032_531, efficiency: 0.886,
+                                      restingHr: 50, avgHrv: 60,
+                                      stagesJSON: "[{\"start\":1000000,\"end\":1032531,\"stage\":\"light\"}]")
+        try await store.upsertSleepSessions([full], deviceId: "oura-ring")
+        _ = try await store.applySleepEdit(deviceId: "oura-ring", detectedStartTs: 1_000_000,
+                                           newStartTs: 1_000_000, newEndTs: 1_032_531,
+                                           stagesJSON: "[{\"start\":1000000,\"end\":1032531,\"stage\":\"deep\"}]")
+
+        // A richer-still re-decode arrives; the user's edit must still win untouched.
+        let richer = CachedSleepSession(startTs: 1_000_000, endTs: 1_032_531, efficiency: 0.9,
+                                        restingHr: 47, avgHrv: 57,
+                                        stagesJSON: "[{\"start\":1000000,\"end\":1016000,\"stage\":\"light\"}," +
+                                                    "{\"start\":1016000,\"end\":1032531,\"stage\":\"rem\"}]")
+        try await store.upsertSleepSessions([richer], deviceId: "oura-ring")
+
+        let rows = try await store.sleepSessions(deviceId: "oura-ring", from: 0, to: 2_000_000, limit: 100)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertTrue(rows[0].userEdited)
+        XCTAssertEqual(rows[0].stagesJSON, "[{\"start\":1000000,\"end\":1032531,\"stage\":\"deep\"}]")
+    }
+
+    /// #345: the persisted sparse-coverage flag survives write→read, REFRESHES on a recompute (excluded
+    /// wins on conflict, since it's derived from the day's motion), and stays nil for an unknown/imported
+    /// night. This is what lets the Sleep tab caption a possibly-under-detected night.
+    func testSleepSessionStagingSparseRoundTrips() async throws {
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertSleepSessions([
+            CachedSleepSession(startTs: 2000, endTs: 6000, efficiency: 0.8, restingHr: 55, avgHrv: 60,
+                               stagesJSON: nil, stagingSparse: true)], deviceId: "devB")
+        var rows = try await store.sleepSessions(deviceId: "devB", from: 0, to: 100_000, limit: 100)
+        XCTAssertEqual(rows.first?.stagingSparse, true)
+
+        // A recompute refreshes it (not preserved like userEdited fields).
+        try await store.upsertSleepSessions([
+            CachedSleepSession(startTs: 2000, endTs: 6000, efficiency: 0.8, restingHr: 55, avgHrv: 60,
+                               stagesJSON: nil, stagingSparse: false)], deviceId: "devB")
+        rows = try await store.sleepSessions(deviceId: "devB", from: 0, to: 100_000, limit: 100)
+        XCTAssertEqual(rows.first?.stagingSparse, false, "recompute refreshes stagingSparse")
+
+        // An unknown/imported night (default nil) is never flagged.
+        try await store.upsertSleepSessions([
+            CachedSleepSession(startTs: 9000, endTs: 12_000, efficiency: nil, restingHr: nil,
+                               avgHrv: nil, stagesJSON: nil)], deviceId: "devB")
+        rows = try await store.sleepSessions(deviceId: "devB", from: 0, to: 100_000, limit: 100)
+        XCTAssertNil(rows.first { $0.startTs == 9000 }?.stagingSparse)
     }
 
     func testSleepSessionRangeFilter() async throws {
@@ -483,6 +594,63 @@ final class MetricsCacheTests: XCTestCase {
         let bareRow = try XCTUnwrap(bareRows.first)
         XCTAssertNil(bareRow.steps)
         XCTAssertNil(bareRow.activeKcalEst)
+    }
+
+    // MARK: - v31 nightly SDNN column (avgSdnn, alongside avgHrv=RMSSD)
+
+    func testV31AvgSdnnColumnPresent() async throws {
+        let store = try await WhoopStore.inMemory()
+        let cols = try await store.columnNamesForTest(table: "dailyMetric")
+        XCTAssertTrue(cols.contains("avgSdnn"), "dailyMetric missing v31 avgSdnn column")
+    }
+
+    func testV31AvgSdnnRoundTrip() async throws {
+        let store = try await WhoopStore.inMemory()
+        // avgHrv carries RMSSD; avgSdnn carries the whole-night SDNN — distinct values on the same row.
+        let d = DailyMetric(day: "2026-05-29", totalSleepMin: 415, efficiency: 0.9,
+                            deepMin: 88, remMin: 108, lightMin: 219, disturbances: 2,
+                            restingHr: 50, avgHrv: 62.0, recovery: 0.73, strain: 10.5,
+                            exerciseCount: 1, spo2Pct: 96.2, skinTempDevC: 0.0, respRateBpm: 14.7,
+                            steps: 7_900, activeKcalEst: 2_180.0, avgSdnn: 88.4)
+        try await store.upsertDailyMetrics([d], deviceId: "devA")
+
+        let rows = try await store.dailyMetrics(deviceId: "devA", from: "2026-05-01", to: "2026-05-31")
+        XCTAssertEqual(rows.count, 1)
+        let row = try XCTUnwrap(rows.first)
+        XCTAssertEqual(try XCTUnwrap(row.avgHrv), 62.0, accuracy: 0.001, "RMSSD must survive intact")
+        XCTAssertEqual(try XCTUnwrap(row.avgSdnn), 88.4, accuracy: 0.001, "SDNN must persist distinctly")
+
+        // Omitting avgSdnn keeps it nil (defaulted init — old call sites unchanged).
+        let bare = DailyMetric(day: "2026-05-30", totalSleepMin: nil, efficiency: nil,
+                               deepMin: nil, remMin: nil, lightMin: nil, disturbances: nil,
+                               restingHr: nil, avgHrv: 55.0, recovery: nil, strain: nil, exerciseCount: nil)
+        try await store.upsertDailyMetrics([bare], deviceId: "devA")
+        let bareRows = try await store.dailyMetrics(deviceId: "devA", from: "2026-05-30", to: "2026-05-30")
+        let bareRow = try XCTUnwrap(bareRows.first)
+        XCTAssertEqual(try XCTUnwrap(bareRow.avgHrv), 55.0, accuracy: 0.001)
+        XCTAssertNil(bareRow.avgSdnn, "avgSdnn defaults to nil when the source has no whole-night SDNN")
+    }
+
+    func testV31AvgSdnnUpsertUpdates() async throws {
+        let store = try await WhoopStore.inMemory()
+        // Insert with nil SDNN, then re-upsert the same day with SDNN populated (WHOOP backfill path).
+        let d1 = DailyMetric(day: "2026-05-31", totalSleepMin: 400, efficiency: 0.88,
+                             deepMin: 80, remMin: 100, lightMin: 220, disturbances: 3,
+                             restingHr: 54, avgHrv: 60.0, recovery: 0.65, strain: 13.0, exerciseCount: 0)
+        try await store.upsertDailyMetrics([d1], deviceId: "devA")
+        let preRows = try await store.dailyMetrics(deviceId: "devA", from: "2026-05-31", to: "2026-05-31")
+        var row = try XCTUnwrap(preRows.first)
+        XCTAssertNil(row.avgSdnn)
+
+        let d2 = DailyMetric(day: "2026-05-31", totalSleepMin: 400, efficiency: 0.88,
+                             deepMin: 80, remMin: 100, lightMin: 220, disturbances: 3,
+                             restingHr: 54, avgHrv: 60.0, recovery: 0.65, strain: 13.0, exerciseCount: 0,
+                             avgSdnn: 91.2)
+        try await store.upsertDailyMetrics([d2], deviceId: "devA")
+        let rows = try await store.dailyMetrics(deviceId: "devA", from: "2026-05-31", to: "2026-05-31")
+        XCTAssertEqual(rows.count, 1, "upsert must not duplicate")
+        row = try XCTUnwrap(rows.first)
+        XCTAssertEqual(try XCTUnwrap(row.avgSdnn), 91.2, accuracy: 0.001)
     }
 
     // MARK: - read highwater cursor (distinct prefix from upload highwater)

@@ -13,9 +13,29 @@ on:
     branches: [main]
     paths:
       - 'Strand/**'
+      # The app-target TESTS, not just the sources they cover. The `Test Strand` step below runs
+      # StrandTests, but a PR touching only those tests matched nothing here, so it built and ran
+      # nothing: one that failed to compile, or simply failed, merged unverified and went red on the
+      # next unrelated PR that happened to touch `Strand/**`, mis-attributing the breakage to whoever
+      # that was.
+      #
+      # This is the only test directory that needs naming, and the reason is layout rather than
+      # oversight: Android's tests sit under `android/**` and the package suites under `Packages/**`,
+      # both already inside their subject's glob, while StrandTests is a SIBLING of `Strand/` instead
+      # of part of it. `project.yml` does not cover it either — the target takes
+      # `sources: [StrandTests]`, a directory, so adding a test file changes no other tracked path.
+      - 'StrandTests/**'
       - 'StrandiOS/**'
       - 'StrandiOSShared/**'
       - 'StrandiOSWidgets/**'
+      # The watch app and its complications, for the same reason StrandTests is named above: the
+      # NOOPiOS scheme BUILDS them (NOOPiOS embeds NOOPWatch, which embeds NOOPWatchComplications),
+      # but neither directory sits under any glob here, so a PR touching only them matched nothing
+      # and compiled nothing. A broken watch target merged unverified and surfaced on the next PR
+      # that happened to touch Strand/**, pointing at the wrong change. #2227 translated 25
+      # complication strings and got no build at all, which is what surfaced this.
+      - 'NOOPWatch/**'
+      - 'NOOPWatchComplications/**'
       - 'Packages/**'
       - 'project.yml'
       - '.github/workflows/app-build.yml'
@@ -24,6 +44,8 @@ on:
   # `StrandiOSWidgets/` has no other gate at all. Restricted to main, an app-target compile error was only
   # discoverable once it had already been merged into the branch the phone installs from, which is exactly
   # backwards. The `paths` filter and the cancel-in-progress concurrency group keep this cheap.
+  # (Upstream dropped its `push: main` leg to save macOS runner minutes; this fork keeps an every-branch
+  # push leg on purpose, and its paths mirror the pull_request list above.)
   #
   # NOTE: the `cleanup` job below deletes `ci/`-prefixed branches after a run (they are disposable dispatch
   # branches). Do not name a real working branch `ci/…`.
@@ -31,16 +53,28 @@ on:
     branches: ['**']
     paths:
       - 'Strand/**'
+      - 'StrandTests/**'
       - 'StrandiOS/**'
       - 'StrandiOSShared/**'
       - 'StrandiOSWidgets/**'
+      - 'NOOPWatch/**'
+      - 'NOOPWatchComplications/**'
       - 'Packages/**'
       - 'project.yml'
       - '.github/workflows/app-build.yml'
+  # `workflow_dispatch` `pr:` builds a PR's MERGE RESULT (refs/pull/<n>/merge) without pushing a
+  # throwaway `ci/` branch. Leave it blank to build whatever ref you dispatched against, unchanged.
   workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to build as merged into main (blank = build this ref as-is)"
+        required: false
+        default: ""
 
 concurrency:
-  group: app-build-${{ github.ref }}
+  # Keyed on the PR when one is given, so two probes of the SAME pr supersede each other while probes
+  # of different PRs (all dispatched from main) do not cancel one another.
+  group: app-build-${{ inputs.pr && format('pr-{0}', inputs.pr) || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -67,6 +101,34 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # The PR's HEAD, then merge current main below. NOT refs/pull/<n>/merge: GitHub freezes that
+          # ref at the last time the PR merged CLEANLY, so for a conflicting or simply stale PR it is a
+          # merge against an old main and it still resolves. Probing #931 through it would have compiled
+          # main as of 30 July, 30+ commits behind, and reported SUCCESS - a false green, and worse than
+          # the branch it replaced. Merging here is always against main as it is right now.
+          ref: ${{ inputs.pr && format('refs/pull/{0}/head', inputs.pr) || '' }}
+          # QUOTED '0': GitHub expressions treat the number 0 as FALSY, so `inputs.pr && 0 || 1`
+          # silently yields 1 and leaves the clone shallow - the merge below then dies with
+          # "refusing to merge unrelated histories" (exit 128) for EVERY pr, mergeable or not.
+          fetch-depth: ${{ inputs.pr && '0' || '1' }}
+
+      - name: Merge current main
+        if: inputs.pr != ''
+        run: |
+          git fetch --no-tags origin main
+          echo "PR #${{ inputs.pr }} head: $(git log --oneline -1 HEAD)"
+          echo "merging into:  $(git log --oneline -1 FETCH_HEAD)"
+          git -c user.name=ci -c user.email=ci@local merge --no-edit FETCH_HEAD
+
+      - name: Say what is being built
+        run: |
+          if [ -n "${{ inputs.pr }}" ]; then
+            echo "Built: PR #${{ inputs.pr }} merged into current main"
+          else
+            echo "Built: ${GITHUB_REF_NAME} as-is"
+          fi
+          git log --oneline -1
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -93,19 +155,3 @@ jobs:
           -destination 'platform=macOS'
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           test
-
-  # Fork-only housekeeping: on-demand app-build runs are dispatched from disposable `ci/<name>` branches
-  # (a PR's content pushed somewhere the workflow can run). Once the build finishes (pass OR fail —
-  # always()), delete that branch so GitHub's "Compare & pull request" banner doesn't linger after each
-  # run. Guarded to ci/-prefixed BRANCH refs only — a dispatch from main or any real branch is untouched.
-  cleanup:
-    needs: [build]
-    if: ${{ always() && github.ref_type == 'branch' && startsWith(github.ref_name, 'ci/') }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Delete the disposable CI branch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${GITHUB_REF_NAME}" || true

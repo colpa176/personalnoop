@@ -1,3 +1,4 @@
+
 # NOOP — Feature Guide
 
 NOOP is a standalone, fully **offline** companion app for WHOOP straps (4.0 and 5.0). It pairs
@@ -141,24 +142,37 @@ stops the realtime stream (the lightweight standard HR keeps recording).
 
 **Sidebar: Breathe · works visually without a strap; needs a bonded strap for haptic cues.**
 
-`BreathingView.swift` — an **HRV haptic breathing biofeedback** trainer, and NOOP's flagship
-novel feature. Because the strap both *measures* HRV (from R-R intervals) and *buzzes*, NOOP can
-pace your breath with a felt cue and watch your HRV respond in real time.
+`BreathingView.swift` / `BreatheScreen.kt` / `WatchBreatheView.swift` — an **HRV haptic breathing
+biofeedback** trainer (NOOP's flagship novel feature), now also a **content-driven protocol
+catalog**. Because the strap both *measures* HRV (from R-R intervals) and *buzzes*, NOOP can pace
+your breath with a felt cue and watch your HRV respond in real time.
 
-- **Pick a pace**: Relax 4-6 (4 s inhale / 6 s exhale), Coherence 5.5 (equal ~5.5 breaths/min),
-  or Box 4-4.
-- **Start a session** — a soft orb expands on the inhale and contracts on the exhale, with your
-  live BPM in its centre. With a strap bonded you feel **one pulse on the inhale, two on the
-  exhale**, so you can breathe with your eyes closed. Without a strap it's visual-only ("Visual
-  only" pill).
-- **Live readouts**: heart rate, a rolling **HRV (RMSSD)** over the last ~30 beats, and the
-  current pace.
-- **Coherence estimate** — a normalized bar (RMSSD mapped 0–120 ms) with a band word (Building /
-  Settling / Coherent / Deep calm). This is an estimate, not a clinical reading — trends across a
-  session matter more than any single number.
-- **Pre/post outcome** — at the end of a session NOOP shows a **before vs after HRV (RMSSD)**
-  read, so you can see how much the breathing actually settled you. An estimate, not a clinical
-  reading.
+- **Pick a pace** from the in-place pill row:
+  - Built-in: Relax 4-6, Coherence 5.5, plus a **catalog** of ANS protocols (Deep, Box 4-4-4-4 with
+    holds, Diaphragmatic, Alternate Nostril, 4-7-8, Buteyko, Tummo, Ujjayi, Bhastrika, Qi Gong,
+    Soma, Coherent 6-6, …) and **Presence Process** tempos (Regular / Mid / Punching Through —
+    consciously connected breathing, no holds).
+  - **Guided** entries (Kapalabhati, Holotropic, Wim Hof, Shamanic) give education + a session timer
+    without an aggressive auto-pacer.
+  - Locked **Resonance** pill still appears after a Resonance sweep.
+- **Session length**: Open (until Stop) or **5 / 10 / 15 min** with auto-stop; defaults follow each
+  protocol's recommended duration (e.g. Presence → 15 min).
+- **ⓘ Protocol info** — background, session hint, and cautions (localized; non-clinical). Presence
+  paces include a short Presence Process / CCB intro.
+- **Start a session** — liquid vessel fills on inhale, holds steady on hold, drains on exhale; live
+  BPM in the centre. Bonded strap: **one pulse on inhale, two on exhale** (holds are silent).
+  Without a strap it's visual-only ("Visual only" pill).
+- **Live readouts**: heart rate, rolling **HRV (RMSSD)**, and stage timing.
+- **Coherence estimate** and **pre/post RMSSD outcome** unchanged (estimates, not clinical).
+- Modes **Resonance** and **Calm me** stay on the existing mode strip.
+
+Pure schedule math lives in `Packages/StrandAnalytics` (`BreathProtocol` / `BreathProtocolCatalog` /
+`BreathProtocolPlayer`) with a Kotlin twin under `com.noop.analytics` — golden-vector tested.
+
+Technique list and timing hints are inspired by publicly documented ANS breath protocols (including
+[Ultrahuman's ANS breath protocols blog](https://www.ultrahuman.com/blog/harness-the-power-of-breath-protocols-for-your-autonomic-nervous-system/));
+NOOP is not affiliated with Ultrahuman. Education copy is original. Presence tempos were measured
+from public Presence Process guide audio.
 
 A "Test buzz" button fires a single pulse (bonded only).
 
@@ -253,7 +267,9 @@ just the most recent (step through earlier nights to compare):
   each as "Xh Ym · NN%", with time-in-bed, efficiency, and onset–wake times.
 - **Night detail** — a uniform tile grid, each with a sparkline and a "vs typical" caption: Sleep
   Performance, Efficiency, Consistency, Hours vs Needed, Restorative (deep + REM share),
-  Respiratory, and Sleep Debt (vs your personal sleep need, floored at 7.5 h).
+  Respiratory, and Sleep Debt. Debt is 55% of the current unmet personalized need, carried into the
+  next night's target; values below 10 minutes read as balanced instead of stacking into an
+  unrepayable 14-night hours bank.
 - **Stages vs typical** — Deep / REM / Light as horizontal bars, last-night minutes with a marker
   at your personal mean, so highs and lows pop.
 - **Asleep duration** — a trailing-30-night hours trend with avg / min / max.
@@ -494,6 +510,23 @@ of history. On-device and approximate — informational only, **not** a diagnosi
   figures read closer to reality.
 - **Units** — choose your preferred measurement units (metric / imperial) across the app.
 - **Strap** — connection status, battery, and Re-scan / Disconnect controls.
+- **Sync (iOS)** — its own section with **Keep screen on while syncing**: opt-in (off by default). Holds
+  the screen awake for as long as a strap history sync runs while NOOP is open, then lets it sleep
+  normally.
+- **Siri & Shortcuts (iOS)** — a **Sync Strap** action ("Sync my NOOP strap") starts the same on-demand
+  history sync as the Sync now button, from Siri, Spotlight, the Shortcuts app, a Back Tap or an
+  automation, **without opening NOOP**. If the strap link is already up (NOOP in the background) the
+  sync starts at once and the reply says so. If NOOP had to be launched for the shortcut and is still
+  connecting, the request is parked and runs the moment the connect handshake settles, and the reply
+  says NOOP is connecting and will sync when ready.
+- **Strap-sync Live Activity (iOS)** — while history syncs, the Lock Screen and Dynamic Island show
+  the same read-out as the Today sync control: Connecting… / Syncing… with the chunk count, the elapsed
+  time, and the strap's connect-time backlog when it reported one; then "Synced · N chunks" or "Sync
+  interrupted" for a few seconds. No progress bar, because the strap never says how much is pending. A
+  sync started from the app or the Sync Strap shortcut shows it; an automatic background sync can only
+  update one that is already showing (iOS does not let a background app start a Live Activity). Its own
+  switch in Settings → Strap ("Strap sync in Dynamic Island", default on), independent of the live
+  heart rate one.
 - **Export for Shortcuts (iOS)** — a **HealthKit-free** path that hands your NOOP metrics to Apple
   Health via the Shortcuts app, so an anonymous build (with no HealthKit entitlement) can still get
   data into Health on your terms.

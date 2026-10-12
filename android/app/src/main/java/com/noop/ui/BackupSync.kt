@@ -164,6 +164,17 @@ object BackupSync {
     /** True when [nowMs] is at least a day past [lastBackupMs] (pure, so the catch-up gate is testable). */
     fun isCatchUpDue(lastBackupMs: Long, nowMs: Long): Boolean = nowMs - lastBackupMs >= DAY_MS
 
+    /** Staleness threshold (3 days). Auto-backup runs a DAILY catch-up, so a *successful* backup older than
+     *  this means the catch-up isn't landing — a lost folder grant, or the app hasn't been opened in a
+     *  while. Twin of Apple `BackupSync.staleThresholdMs`. */
+    const val STALE_MS = 3L * DAY_MS
+
+    /** True when auto-backup should be flagged STALE: the last SUCCESSFUL backup is older than [thresholdMs]
+     *  ([lastBackupMs] == 0, i.e. never backed up while auto is on, also counts). Pure so it's testable with
+     *  literal ms; the caller gates on auto being ON + a chosen folder. Twin of Apple `BackupSync.isBackupStale`. */
+    fun isBackupStale(lastBackupMs: Long, nowMs: Long, thresholdMs: Long = STALE_MS): Boolean =
+        nowMs - lastBackupMs >= thresholdMs
+
     // ── Folder destination I/O (SAF tree via DocumentsContract - no extra dep) ──
 
     /** Create + write one snapshot into the chosen [treeUri]; returns the new file Uri, or null on failure. */
@@ -179,9 +190,19 @@ object BackupSync {
         // exportTo throws on failure; on a partial write delete the half-written doc so prune/latest
         // never picks up a corrupt snapshot.
         return runCatching {
+            // #1014 (write-side): exportTo now verifies the file it just wrote and throws if it is torn,
+            // so the check that used to sit here would be a second full read of the same archive. The
+            // delete below still runs, and now covers every way exportTo can fail rather than only this one.
             DataBackup.exportTo(context, fileUri)
             fileUri
         }.getOrElse {
+            // Deleting here on an UNVERIFIABLE verdict is DELIBERATE, and is the opposite of what the
+            // manual export does with the same verdict. The two contexts want opposite answers: a file
+            // the user chose the location for is theirs to keep and inspect, and they are told so, while
+            // a file in THIS folder silently becomes `latest` in a rotation whose older snapshots are
+            // still intact, with nobody watching to notice it was never confirmed. A snapshot that was
+            // never read back is not one to hand the restore path by default; the next run writes
+            // another.
             runCatching { DocumentsContract.deleteDocument(resolver, fileUri) }
             null
         }

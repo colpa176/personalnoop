@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import SwiftUI
+import StrandAnalytics
 
 /// User profile (age/sex/body metrics/HR-max) persisted in UserDefaults.
 /// Powers HR zones, calories and recovery baselines.
@@ -26,6 +27,13 @@ final class ProfileStore: ObservableObject {
     @Published var waistCm: Double { didSet { d.set(waistCm, forKey: K.waist) } }
     /// 0 = auto-estimate from age.
     @Published var hrMaxOverride: Int { didSet { d.set(hrMaxOverride, forKey: K.hrMax) } }
+    /// Five personalized inclusive zone starts in BPM; empty = conventional %HRmax zones.
+    @Published var hrZoneThresholds: [Int] {
+        didSet {
+            if hrZoneThresholds.isEmpty { d.removeObject(forKey: K.hrZoneThresholds) }
+            else { d.set(hrZoneThresholds.map(String.init).joined(separator: ","), forKey: K.hrZoneThresholds) }
+        }
+    }
     /// Step-calibration divisor (#139/#132): counter ticks per real step for the @57 motion
     /// counter. 1.0 = raw pass-through (default — no behavior change). Clamped 0.5–30.0
     /// (WHOOP 5/MG motion-counter overcount can reach ~24×, so the ceiling has to be high).
@@ -48,6 +56,16 @@ final class ProfileStore: ObservableObject {
     @Published var stepsCalibrationManual: Bool { didSet { d.set(stepsCalibrationManual, forKey: K.stepsManualFlag) } }
     /// User-set manual coefficient. 0 = auto-fit (nil to the engine); > 0 = manual override.
     @Published var stepsManualCoefficient: Double { didSet { d.set(max(0, stepsManualCoefficient), forKey: K.stepsManualCoeff) } }
+    /// #1816: true when the strap has banked ANY motion (gravity samples → `dayMotionIntensity > 0`)
+    /// in the calibration scan window. Written by `IntelligenceEngine` on every analytics pass so it
+    /// tracks a fresh strap's first sync without a separate query. The Today tile reads this to decide
+    /// whether "Need N more days where your phone also counted steps" is the honest caption or a lie:
+    /// a step estimate is `motion * coefficient`, so with the motion half missing neither the estimate
+    /// nor the fit moves however many phone-counted days the user collects. The caption that names only
+    /// the phone half is actively misleading — it sent a field reporter to enter Apple Health steps by
+    /// hand expecting calibration to start, which it cannot without strap motion. Twin of Android's
+    /// `ProfileStore.stepsHasBankedMotion`.
+    @Published var stepsHasBankedMotion: Bool { didSet { d.set(stepsHasBankedMotion, forKey: K.stepsHasMotion) } }
 
     // ── Profile picture (optional, on-device only) ──────────────────────────────────────────────
     /// The user's chosen profile photo as JPEG bytes, or nil for the default SF-Symbol fallback.
@@ -69,6 +87,7 @@ final class ProfileStore: ObservableObject {
         static let legacyAge = "profile.age"
         static let sex = "profile.sex", weight = "profile.weightKg"
         static let height = "profile.heightCm", hrMax = "profile.hrMaxOverride"
+        static let hrZoneThresholds = "profile.hrZoneThresholds"
         static let stepScale = "profile.stepTicksPerStep"
         static let waist = "profile.waistCm"
         static let stepsCoeff = "profile.stepsCalibrationCoefficient"
@@ -76,6 +95,7 @@ final class ProfileStore: ObservableObject {
         static let stepsConfidence = "profile.stepsCalibrationConfidence"
         static let stepsManualFlag = "profile.stepsCalibrationManual"
         static let stepsManualCoeff = "profile.stepsManualCoefficient"
+        static let stepsHasMotion = "profile.stepsHasBankedMotion"
         static let avatar = "profile.avatarImageData"
     }
 
@@ -106,24 +126,20 @@ final class ProfileStore: ObservableObject {
         heightCm = d.object(forKey: K.height) as? Double ?? 178
         waistCm = d.object(forKey: K.waist) as? Double ?? 0
         hrMaxOverride = d.object(forKey: K.hrMax) as? Int ?? 0
+        let storedThresholds = d.string(forKey: K.hrZoneThresholds)?
+            .split(separator: ",").compactMap { Int($0) } ?? []
+        hrZoneThresholds = Self.validZoneThresholds(storedThresholds) ? storedThresholds : []
         stepTicksPerStep = min(max(d.object(forKey: K.stepScale) as? Double ?? 1.0, 0.5), 30.0)
         stepsCalibrationCoefficient = d.object(forKey: K.stepsCoeff) as? Double ?? 0
         stepsCalibrationSampleDays = d.object(forKey: K.stepsSampleDays) as? Int ?? 0
         stepsCalibrationConfidence = d.object(forKey: K.stepsConfidence) as? Double ?? 0
         stepsCalibrationManual = d.object(forKey: K.stepsManualFlag) as? Bool ?? false
         stepsManualCoefficient = max(0, d.object(forKey: K.stepsManualCoeff) as? Double ?? 0)
+        stepsHasBankedMotion = d.object(forKey: K.stepsHasMotion) as? Bool ?? false
         avatarImageData = d.data(forKey: K.avatar)
     }
 
     // MARK: - Profile picture
-
-    /// The profile photo as a SwiftUI `Image`, or nil when none is set (callers fall back to the
-    /// `person.crop.circle` SF Symbol). Bridges the stored JPEG bytes through the platform bitmap
-    /// type (`NSImage`/`UIImage`) via the shared `Image(platformImage:)` initializer.
-    var avatarImage: Image? {
-        guard let data = avatarImageData, let img = PlatformImage(data: data) else { return nil }
-        return Image(platformImage: img)
-    }
 
     /// Whether a profile photo is set.
     var hasAvatar: Bool { avatarImageData != nil }
@@ -168,8 +184,64 @@ final class ProfileStore: ObservableObject {
         dateOfBirth(forAge: 100)...dateOfBirth(forAge: 13)
     }
 
+    /// The effective HRmax an EFFORT score is computed against, resolved exactly as `AnalyticsEngine`
+    /// resolves it: the manual override when one is set, else Tanaka from age, else nil.
+    ///
+    /// Deliberately not `hrMax` below, which answers a different question and differs from this one in
+    /// two ways: it rounds Tanaka to an Int, and for an age-less profile it returns 208 rather than nil.
+    /// A day scored through it would not match the day the engine stored either.
+    ///
+    /// #2460: today's live Effort is computed in the Today views rather than read from the scored day,
+    /// and both of them passed Tanaka here with no reference to the override. Because the ring shows
+    /// `StrainScorer.effectiveEffort(live:stored:)`, which is `max(live, stored)`, and an override is
+    /// normally set BECAUSE the real maximum is above the formula, the Tanaka value was not merely
+    /// different, it was always the larger of the two and so always the one displayed. The setting
+    /// therefore did nothing until the day stopped being today. Both views now read this, so the live
+    /// value and the stored day are scored against one number.
+    var effortHRmax: Double? {
+        if hrMaxOverride > 0 { return Double(hrMaxOverride) }
+        return age > 0 ? StrainScorer.tanakaHRmax(age: Double(age)) : nil
+    }
+
     /// Tanaka estimate unless overridden.
     var hrMax: Int { hrMaxOverride > 0 ? hrMaxOverride : Int((208 - 0.7 * Double(age)).rounded()) }
+
+    /// Personalized zone starts after enforcing the same five-value invariant as `HRZones`.
+    var customHRZoneLowerBounds: [Double]? {
+        guard Self.validZoneThresholds(hrZoneThresholds) else { return nil }
+        return hrZoneThresholds.map(Double.init)
+    }
+
+    /// The single display-zone model used by live HR, workout splits, and haptic coaching.
+    var hrZoneSet: HRZoneSet {
+        HRZones.zones(maxHR: Double(hrMax), customLowerBounds: customHRZoneLowerBounds)
+    }
+
+    var hasCustomHRZones: Bool { customHRZoneLowerBounds != nil }
+
+    /// Enable by seeding the editor with boundaries that classify integer BPM exactly like today's
+    /// conventional percentages; disabling removes the override and immediately restores defaults.
+    func setCustomHRZonesEnabled(_ enabled: Bool) {
+        hrZoneThresholds = enabled ? HRZones.defaultLowerBounds(maxHR: Double(hrMax)) : []
+    }
+
+    /// Move one boundary while preserving strict ordering. Neighbour-aware clamps make it impossible
+    /// for the stepper to create a gap, overlap, or invalid persisted state.
+    func stepHRZoneThreshold(at index: Int, up: Bool) {
+        guard hrZoneThresholds.indices.contains(index) else { return }
+        var next = hrZoneThresholds
+        let floor = index == 0 ? HRZones.customBPMRange.lowerBound : next[index - 1] + 1
+        let ceiling = index == next.count - 1 ? HRZones.customBPMRange.upperBound : next[index + 1] - 1
+        guard floor <= ceiling else { return }   // no room between neighbours -> no-op (parity w/ Kotlin)
+        next[index] = min(max(next[index] + (up ? 1 : -1), floor), ceiling)
+        hrZoneThresholds = next
+    }
+
+    nonisolated static func validZoneThresholds(_ values: [Int]) -> Bool {
+        guard values.count == 5,
+              values.allSatisfy(HRZones.customBPMRange.contains) else { return false }
+        return zip(values, values.dropFirst()).allSatisfy(<)
+    }
 
     /// Whether the cycle-awareness opt-in applies to this profile (#801). Cycle phase is read from the
     /// MENSTRUAL skin-temperature shift, so the opt-in (the Health card + the Automations toggle) is only
@@ -183,6 +255,13 @@ final class ProfileStore: ObservableObject {
     /// (no actor state), so the gate and its tests can call it from any context.
     nonisolated static func cycleAwarenessApplies(sex: String) -> Bool {
         sex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "male"
+    }
+
+    /// Whether the cycle-awareness OFFER should be VISIBLE for a profile: eligible by sex AND not hidden
+    /// by the user's "not for me" opt-out. `hidden` is USER-controlled and never age-derived — a
+    /// respectful hide, not an assumption about menopause. Pure, so the combined gate is unit-testable.
+    nonisolated static func cycleAwarenessVisible(sex: String, hidden: Bool) -> Bool {
+        cycleAwarenessApplies(sex: sex) && !hidden
     }
 
     /// Allowed range for the step-calibration divisor (#132). 5/MG straps overcount by

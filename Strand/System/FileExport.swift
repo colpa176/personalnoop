@@ -55,7 +55,7 @@ enum FileExport {
         // The previous `try?` swallowed write failures, then handed an empty/missing path to the
         // share sheet — the user saw a broken export with no error. Clean up the temp file after the
         // share sheet closes so the temporaryDirectory doesn't accumulate dead exports across runs.
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(suggestedName)
+        let url = NoopScratch.file(suggestedName)
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
         } catch {
@@ -93,15 +93,21 @@ enum FileExport {
     /// panels back-to-back; the bundle is one panel). The caller's text is already redacted by its sink;
     /// the file's bytes are passed through unchanged here. If the source file is absent, falls back to a
     /// single-entry bundle (just the text) so the tap is never a dead end.
+    ///
+    /// #646/#651: reading `src` off disk is staged on a detached task, same as `exportBundle`'s zip build,
+    /// so a multi-MB raw capture doesn't block the main actor before the share sheet / save panel appears.
     @MainActor
     static func exportPair(file src: URL, fileSuggestedName: String,
-                           text: String, textSuggestedName: String) {
-        var entries: [BundleEntry] = [BundleEntry(name: textSuggestedName, data: Data(text.utf8))]
-        if FileManager.default.fileExists(atPath: src.path), let fileData = try? Data(contentsOf: src) {
-            entries.insert(BundleEntry(name: fileSuggestedName, data: fileData), at: 0)
-        }
+                           text: String, textSuggestedName: String) async {
         let zipName = timestampedName("noop-export", ext: "zip")
-        _ = exportBundle(entries: entries, suggestedName: zipName)
+        let entries = await Task.detached(priority: .userInitiated) { () -> [BundleEntry] in
+            var entries: [BundleEntry] = [BundleEntry(name: textSuggestedName, data: Data(text.utf8))]
+            if FileManager.default.fileExists(atPath: src.path), let fileData = try? Data(contentsOf: src) {
+                entries.insert(BundleEntry(name: fileSuggestedName, data: fileData), at: 0)
+            }
+            return entries
+        }.value
+        await exportBundle(entries: entries, suggestedName: zipName)
     }
 
     #if os(iOS)
@@ -125,8 +131,10 @@ enum FileExport {
         let vc = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
         if !cleanup.isEmpty || completion != nil {
             // Fires after the share sheet is dismissed (saved or cancelled). We clean up staged files and
-            // then run `completion` (M1/#812: the Test Centre report opens its prefilled issue here, once
-            // the share sheet is gone, so the in-app SafariVC presents with nothing else on screen).
+            // then run `completion`. That hook existed for the Test Centre report, which opened a prefilled
+            // GitHub issue once the sheet was gone; that step has been removed and nothing passes a
+            // completion today. Kept because it is the only point at which "the sheet has closed" is
+            // observable, which any future caller needing to follow a share will want.
             vc.completionWithItemsHandler = { _, _, _, _ in
                 let fm = FileManager.default
                 for url in cleanup where fm.fileExists(atPath: url.path) {
@@ -159,7 +167,7 @@ enum FileExport {
     /// on macOS, share sheet on iOS) and cleans it up.
     static func zipData(entries: [BundleEntry], baseName: String) -> URL? {
         guard !entries.isEmpty else { return nil }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(baseName).zip")
+        let url = NoopScratch.file("\(baseName).zip")
         try? FileManager.default.removeItem(at: url)
         guard let archive = try? Archive(url: url, accessMode: .create) else { return nil }
         for entry in entries {
@@ -175,11 +183,18 @@ enum FileExport {
     /// Zip `entries` into one `.zip` and hand it to the user (NSSavePanel on macOS, share sheet on iOS).
     /// EVERY entry must already be redacted by the caller (section 5.3); the 20 MB cap (section 5.4) is the
     /// assembler's job before it calls here. Returns the staged / saved zip URL, nil on cancel or failure.
+    ///
+    /// #646/#651: `zipData` (the actual DEFLATE + write) runs off the main actor via a detached task, same
+    /// pattern as `DataBackup.runExport`, so building a multi-entry bundle never beach-balls the UI. Only
+    /// the save panel / share sheet presentation below hops back to the main actor.
     @MainActor @discardableResult
     static func exportBundle(entries: [BundleEntry], suggestedName: String,
-                             completion: (() -> Void)? = nil) -> URL? {
+                             completion: (() -> Void)? = nil) async -> URL? {
         let base = suggestedName.hasSuffix(".zip") ? String(suggestedName.dropLast(4)) : suggestedName
-        guard let staged = zipData(entries: entries, baseName: base) else { completion?(); return nil }
+        let stagingTask = Task.detached(priority: .userInitiated) {
+            zipData(entries: entries, baseName: base)
+        }
+        guard let staged = await stagingTask.value else { completion?(); return nil }
         #if os(macOS)
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggestedName

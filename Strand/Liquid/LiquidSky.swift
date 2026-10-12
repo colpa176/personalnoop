@@ -24,16 +24,31 @@ private func hx(_ hex: UInt32) -> Color {
 /// The ten keyframes mirror the real app's day-cycle scenes (SceneHeroBackground),
 /// as pure gradients rather than painted art.
 let liquidSkyKeys: [LiquidSkyStop] = [
-    .init(h: 0,    top: hx(0x05060f), mid: hx(0x0b0e22), hor: hx(0x1a1440), stars: 1,   warm: 0),
-    .init(h: 5,    top: hx(0x0a0d24), mid: hx(0x1c1a4a), hor: hx(0x4a2a6a), stars: 0.6, warm: 0),
-    .init(h: 6.5,  top: hx(0x1b1b4d), mid: hx(0x4a2f7d), hor: hx(0xb0567a), stars: 0.25, warm: 0.2),
-    .init(h: 8.5,  top: hx(0x2a4a8f), mid: hx(0x7a5aa0), hor: hx(0xf0a060), stars: 0,   warm: 0.6),
-    .init(h: 11,   top: hx(0x2a6ac8), mid: hx(0x5a9ae0), hor: hx(0xa8cef0), stars: 0,   warm: 0.95),
-    .init(h: 14,   top: hx(0x2f74d0), mid: hx(0x66a6e8), hor: hx(0xb8d8f4), stars: 0,   warm: 1),
-    .init(h: 17.5, top: hx(0x3a4a90), mid: hx(0x9a5a80), hor: hx(0xf0924a), stars: 0,   warm: 0.4),
-    .init(h: 19.5, top: hx(0x221c50), mid: hx(0x4a2a70), hor: hx(0x8a4a80), stars: 0.45, warm: 0),
-    .init(h: 22,   top: hx(0x070818), mid: hx(0x141335), hor: hx(0x2a1d55), stars: 1,   warm: 0),
-    .init(h: 24,   top: hx(0x05060f), mid: hx(0x0b0e22), hor: hx(0x1a1440), stars: 1,   warm: 0),
+    .init(h: 0,    top: hx(0x191A1F), mid: hx(0x1D1E23), hor: hx(0x22242B), stars: 0.20, warm: 0),
+    .init(h: 5,    top: hx(0x1A1B20), mid: hx(0x1D1F24), hor: hx(0x23252C), stars: 0.12, warm: 0),
+    .init(h: 6.5,  top: hx(0x1B1C21), mid: hx(0x1F2026), hor: hx(0x25272E), stars: 0.06, warm: 0),
+    .init(h: 8.5,  top: hx(0x1C1D22), mid: hx(0x202229), hor: hx(0x272A31), stars: 0, warm: 0),
+    .init(h: 11,   top: hx(0x1D1E23), mid: hx(0x21232A), hor: hx(0x292C33), stars: 0, warm: 0),
+    .init(h: 14,   top: hx(0x1D1E23), mid: hx(0x22242B), hor: hx(0x292C34), stars: 0, warm: 0),
+    .init(h: 17.5, top: hx(0x1C1D22), mid: hx(0x202229), hor: hx(0x272930), stars: 0, warm: 0),
+    .init(h: 19.5, top: hx(0x1B1C21), mid: hx(0x1F2026), hor: hx(0x24262D), stars: 0.05, warm: 0),
+    .init(h: 22,   top: hx(0x191A1F), mid: hx(0x1D1E23), hor: hx(0x22242B), stars: 0.16, warm: 0),
+    .init(h: 24,   top: hx(0x191A1F), mid: hx(0x1D1E23), hor: hx(0x22242B), stars: 0.20, warm: 0),
+]
+
+/// Light appearance keeps the same time-of-day movement without beginning from the dark-only
+/// keyframes above. The restrained blue-gray atmosphere settles naturally into the light canvas.
+private let liquidLightSkyKeys: [LiquidSkyStop] = [
+    .init(h: 0,    top: hx(0xDCE3ED), mid: hx(0xE5EAF1), hor: hx(0xEEF1F5), stars: 0.08, warm: 0),
+    .init(h: 5,    top: hx(0xDDE5EE), mid: hx(0xE7EBF1), hor: hx(0xEFF2F5), stars: 0.05, warm: 0),
+    .init(h: 6.5,  top: hx(0xE1E8EF), mid: hx(0xE9EDF2), hor: hx(0xF0F2F5), stars: 0.02, warm: 0),
+    .init(h: 8.5,  top: hx(0xE3EBF1), mid: hx(0xEAF0F3), hor: hx(0xF1F3F5), stars: 0, warm: 0),
+    .init(h: 11,   top: hx(0xE1EAF0), mid: hx(0xE9EEF2), hor: hx(0xF1F3F5), stars: 0, warm: 0),
+    .init(h: 14,   top: hx(0xDFE8EF), mid: hx(0xE8EDF2), hor: hx(0xF0F2F5), stars: 0, warm: 0),
+    .init(h: 17.5, top: hx(0xE1E7ED), mid: hx(0xE8ECF1), hor: hx(0xEFF1F4), stars: 0, warm: 0),
+    .init(h: 19.5, top: hx(0xDDE4EC), mid: hx(0xE6EAF0), hor: hx(0xEEF1F4), stars: 0.02, warm: 0),
+    .init(h: 22,   top: hx(0xDAE2EC), mid: hx(0xE4E9F0), hor: hx(0xEDF0F4), stars: 0.06, warm: 0),
+    .init(h: 24,   top: hx(0xDCE3ED), mid: hx(0xE5EAF1), hor: hx(0xEEF1F5), stars: 0.08, warm: 0),
 ]
 
 private func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
@@ -42,10 +57,11 @@ private func lerpColor(_ a: Color, _ b: Color, _ t: Double) -> Color {
     return Color(.sRGB, red: lerp(x.r, y.r, t), green: lerp(x.g, y.g, t), blue: lerp(x.b, y.b, t), opacity: 1)
 }
 
-func liquidSkyAt(_ hour: Double) -> (top: Color, mid: Color, hor: Color, stars: Double, warm: Double) {
+func liquidSkyAt(_ hour: Double, light: Bool = false) -> (top: Color, mid: Color, hor: Color, stars: Double, warm: Double) {
+    let keys = light ? liquidLightSkyKeys : liquidSkyKeys
     var i = 0
-    while i < liquidSkyKeys.count - 2 && liquidSkyKeys[i + 1].h <= hour { i += 1 }
-    let a = liquidSkyKeys[i], b = liquidSkyKeys[i + 1]
+    while i < keys.count - 2 && keys[i + 1].h <= hour { i += 1 }
+    let a = keys[i], b = keys[i + 1]
     let t = max(0, min(1, (hour - a.h) / (b.h - a.h)))
     return (lerpColor(a.top, b.top, t), lerpColor(a.mid, b.mid, t), lerpColor(a.hor, b.hor, t),
             lerp(a.stars, b.stars, t), lerp(a.warm, b.warm, t))
@@ -59,6 +75,37 @@ private let liquidStars: [LiquidStar] = (0..<70).map { _ in
                ph: .random(in: 0..<7), sp: 0.2 + .random(in: 0..<0.5))
 }
 
+/// A star's opacity: the hour's star amount times its depth-scaled base (nearer is brighter) plus its twinkle
+/// (0...1, a sharp flare). Both renders draw with it.
+func liquidStarOpacity(stars: Double, depth: Double, twinkle: Double) -> Double {
+    stars * (0.04 + depth * 0.16 + twinkle * 0.28)
+}
+
+/// Below this opacity a star is not drawn at all.
+let liquidStarMinOpacity = 0.02
+
+/// Whether any star can be drawn at this star amount: the nearest star at the peak of its twinkle reaches
+/// `liquidStarMinOpacity`. Below that the star pass draws nothing, and the sky's frame loop, which exists for the
+/// twinkle, has nothing to animate.
+func liquidSkyHasVisibleStars(_ stars: Double) -> Bool {
+    liquidStarOpacity(stars: stars, depth: 1, twinkle: 1) >= liquidStarMinOpacity
+}
+
+/// The most a star can change a pixel of this sky, in 8-bit levels: white at the nearest star's peak opacity over
+/// the sky's top colour (its darkest band, where white shows most), through that colour's darkest channel.
+///
+/// Drawn is not the same as seen. On the dark sky a star at the 0.02 drawing floor already lifts its pixel ~4.6
+/// levels, but the light sky is near-white: its brightest star, at midnight, lifts a pixel ~1.3 levels.
+func liquidStarPeakLift(hour: Double, light: Bool) -> Double {
+    let sky = liquidSkyAt(hour, light: light)
+    let c = sky.top.liquidComponents()
+    return liquidStarOpacity(stars: sky.stars, depth: 1, twinkle: 1) * (1 - min(c.r, c.g, c.b)) * 255
+}
+
+/// A twinkle that moves no pixel by this many levels is not worth a frame. Measured on Today in light appearance at
+/// 03:00 (iPhone 17 Pro simulator): over 5 s of twinkling, 34 pixels of the upper sky changed, each by 1 level.
+let liquidStarMinLift = 2.0
+
 struct LiquidSky: View {
     /// Hour of day 0...24. Defaults to live time when nil.
     var hour: Double?
@@ -66,21 +113,37 @@ struct LiquidSky: View {
     /// the atmosphere so the sky still reads under a full-height "sky behind cards" backdrop).
     var settleStrength: Double = 1
     @Environment(\.colorScheme) private var scheme
+    /// The call site already swaps in `LiquidSkyStatic` when motion is unwanted, but this view carried
+    /// no gate of its own — a second call site would have been silently ungated. `pausesFrames` makes the
+    /// frame loop stand down from inside, so the gate travels with the view.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var motion = NoopMotionState.shared
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 20.0)) { tl in
-            let now = liquidSeconds(tl.date)
+        // The sky must dissolve into the SAME canvas colour the body uses (theme-aware surfaceBase),
+        // so there is no hard seam where the sky meets the page — light mode made this glaring.
+        let dark = scheme == .dark
+        let settle = Color(.sRGB,
+                           red: dark ? 29.0 / 255.0 : 242.0 / 255.0,
+                           green: dark ? 30.0 / 255.0 : 242.0 / 255.0,
+                           blue: dark ? 35.0 / 255.0 : 247.0 / 255.0,
+                           opacity: 1)
+        if Self.pausesFrames(hour: hour ?? liveHour(), light: !dark, poseStill: motion.poseStill(reduceMotion)) {
+            // One frame, with no timeline behind it: the breath sits at mid-cycle (`now` 0). A timeline built
+            // with `paused: true` is not the same thing. Measured on Today with the stars gone, it made the
+            // render server busier, not quieter: 46 CPU-seconds a minute against 22 while the loop animated
+            // the sky at 20 fps.
             let h = hour ?? liveHour()
-            // The sky must dissolve into the SAME canvas colour the body uses (theme-aware surfaceBase),
-            // so there is no hard seam where the sky meets the page — light mode made this glaring.
-            let dark = scheme == .dark
-            let settle = Color(.sRGB,
-                               red: dark ? 18.0 / 255.0 : 242.0 / 255.0,
-                               green: dark ? 21.0 / 255.0 : 242.0 / 255.0,
-                               blue: dark ? 24.0 / 255.0 : 247.0 / 255.0,
-                               opacity: 1)
             Canvas { ctx, size in
-                render(ctx, size, hour: h, now: now, settle: settle)
+                render(ctx, size, hour: h, now: 0, settle: settle, light: !dark)
+            }
+        } else {
+            TimelineView(.animation(minimumInterval: 1.0 / 20.0)) { tl in
+                let now = liquidSeconds(tl.date)
+                let h = hour ?? liveHour()
+                Canvas { ctx, size in
+                    render(ctx, size, hour: h, now: now, settle: settle, light: !dark)
+                }
             }
         }
     }
@@ -90,9 +153,27 @@ struct LiquidSky: View {
         return Double(c.hour ?? 0) + Double(c.minute ?? 0) / 60
     }
 
+    /// Whether the sky is drawn as one still frame instead of by the 20 fps loop: motion is unwanted, or
+    /// nothing in the picture can visibly move.
+    ///
+    /// The loop exists for the stars' twinkle. The one other time-varying layer, the slow breath of light,
+    /// moves no pixel by more than 2 of 255 levels in light appearance and 5 in dark over its whole ~29 s
+    /// cycle (iPhone 17 Pro simulator, Today, five screenshots 7 s apart). So whenever no star is bright enough to be drawn (dark
+    /// appearance ~7:07–19:10, light ~5:25–20:51), the loop redrew an unchanging sky 20 times a second. The
+    /// still frame is redrawn whenever the hour passed in changes, and the loop comes back with the stars.
+    ///
+    /// In light appearance it does not come back at all: a white star on the near-white sky never lifts a pixel by
+    /// `liquidStarMinLift` levels (see `liquidStarPeakLift`), yet its 20 fps twinkle cost the render server ~18
+    /// CPU-seconds a minute on Today at night. The still frame keeps drawing those stars, unmoving. Dark
+    /// appearance is unchanged: there a drawable star always lifts its pixel more than that.
+    static func pausesFrames(hour: Double, light: Bool, poseStill: Bool) -> Bool {
+        poseStill || !liquidSkyHasVisibleStars(liquidSkyAt(hour, light: light).stars)
+            || liquidStarPeakLift(hour: hour, light: light) < liquidStarMinLift
+    }
+
     private func render(_ base: GraphicsContext, _ size: CGSize, hour: Double, now: Double,
-                        settle: Color) {
-        let S = liquidSkyAt(hour)
+                        settle: Color, light: Bool) {
+        let S = liquidSkyAt(hour, light: light)
         let w = size.width, h = size.height
         var ctx = base
         // the gradient IS the scene
@@ -114,12 +195,11 @@ struct LiquidSky: View {
                                            startPoint: CGPoint(x: 0, y: h * 0.55), endPoint: CGPoint(x: 0, y: h)))
         }
         // stars
-        if S.stars > 0.01 {
+        if liquidSkyHasVisibleStars(S.stars) {
             for s in liquidStars {
-                let baseA = 0.04 + s.z * 0.16
                 let tw = pow(max(0, sin(s.ph + now * s.sp)), 6)
-                let o = S.stars * (baseA + tw * 0.28)
-                if o < 0.02 { continue }
+                let o = liquidStarOpacity(stars: S.stars, depth: s.z, twinkle: tw)
+                if o < liquidStarMinOpacity { continue }
                 let sz = 0.6 + s.z * 0.8
                 ctx.fill(Path(CGRect(x: s.x * w, y: s.y * h, width: sz, height: sz)), with: .color(.white.opacity(o)))
             }
@@ -152,9 +232,15 @@ struct LiquidScaffoldSky: View {
     var height: CGFloat = 240
     @AppStorage(SceneBackgroundPrefs.enabledKey) private var showDayCycleBackground = true
     @AppStorage(SkyBehindCardsPrefs.enabledKey) private var skyBehindCards = true
+    // The custom-background store (#custom-background). A custom image OVERRIDES the sky and always fills
+    // the viewport, so every scaffold that passes `liquidScaffoldSky()` reads the SAME cached image and
+    // draws it identically — seamless across tabs including More.
+    @ObservedObject private var backgroundStore = BackgroundImageStore.shared
 
     var body: some View {
-        if showDayCycleBackground {
+        if backgroundStore.isActive {
+            BackgroundImageBackdrop()
+        } else if showDayCycleBackground {
             LiquidSkyStatic(hour: nil, settleStrength: skyBehindCards ? 0.78 : 1)
                 .frame(maxWidth: .infinity, maxHeight: skyBehindCards ? .infinity : nil)
                 .frame(height: skyBehindCards ? nil : height, alignment: .top)
@@ -183,12 +269,12 @@ struct LiquidSkyStatic: View {
         let h = hour ?? liveHour()
         let dark = scheme == .dark
         let settle = Color(.sRGB,
-                           red: dark ? 18.0 / 255.0 : 242.0 / 255.0,
-                           green: dark ? 21.0 / 255.0 : 242.0 / 255.0,
-                           blue: dark ? 24.0 / 255.0 : 247.0 / 255.0,
+                           red: dark ? 29.0 / 255.0 : 242.0 / 255.0,
+                           green: dark ? 30.0 / 255.0 : 242.0 / 255.0,
+                           blue: dark ? 35.0 / 255.0 : 247.0 / 255.0,
                            opacity: 1)
         Canvas { ctx, size in
-            let S = liquidSkyAt(h)
+            let S = liquidSkyAt(h, light: !dark)
             let w = size.width, hh = size.height
             ctx.fill(Path(CGRect(x: 0, y: 0, width: w, height: hh)),
                      with: .linearGradient(Gradient(stops: [
@@ -196,10 +282,10 @@ struct LiquidSkyStatic: View {
                         .init(color: S.mid, location: 0.5),
                         .init(color: S.hor, location: 0.9)]),
                                            startPoint: CGPoint(x: 0, y: 0), endPoint: CGPoint(x: 0, y: hh)))
-            if S.stars > 0.01 {
+            if liquidSkyHasVisibleStars(S.stars) {
                 for s in liquidStars {
-                    let o = S.stars * (0.04 + s.z * 0.16)
-                    if o < 0.02 { continue }
+                    let o = liquidStarOpacity(stars: S.stars, depth: s.z, twinkle: 0)
+                    if o < liquidStarMinOpacity { continue }
                     let sz = 0.6 + s.z * 0.8
                     ctx.fill(Path(CGRect(x: s.x * w, y: s.y * hh, width: sz, height: sz)),
                              with: .color(.white.opacity(o)))

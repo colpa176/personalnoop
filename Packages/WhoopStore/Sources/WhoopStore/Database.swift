@@ -496,7 +496,12 @@ extension WhoopStore {
                 t.column("fetchedAt", .integer).notNull()    // unix seconds
                 t.primaryKey(["deviceId", "endpoint", "documentId"])
             }
-            // Per-endpoint reads scan (deviceId, endpoint) then walk day in order.
+            // Serves the (deviceId, endpoint) lookup. It no longer serves the ORDER BY: `ouraRaw`
+            // sorts by (fetchedAt, rowid) because page producers leave `day` nil, so an all-nil
+            // `day` made the old `ORDER BY day ASC` degenerate to whatever order SQLite returned.
+            // The trailing `day` column stays useful for day-keyed lookups; the sort happens after
+            // the scan. An index on (deviceId, endpoint, fetchedAt) is the change to make if this
+            // archive ever grows enough for that sort to matter.
             try db.create(index: "idx_ouraRaw_device_endpoint_day",
                           on: "ouraRaw", columns: ["deviceId", "endpoint", "day"])
         }
@@ -538,12 +543,20 @@ extension WhoopStore {
         // That keeps a v26-heavy night to roughly the same order of magnitude as ONE extra per-second
         // stream (≈50 bytes/row), not 24x that. Additive only, a NEW table, no existing row touched.
         //
-        // Retention: no pruning, matching every other durable per-second table (hrSample, spo2Sample, …
-        // are never pruned either) — this is decoded biometric history, not the transient raw outbox.
-        // `PrunePolicy`'s ~50 MB cap governs ONLY `rawBatch` (raw, pre-decode frames kept for re-decode /
-        // re-sync); it is untouched by and unrelated to this table. Growth here is bounded by how much
-        // v26 data a strap actually emits (firmware chooses v26 vs v18 per second, not every night is
-        // v26-heavy), not by an artificial cap.
+        // Retention: CAPPED at `WhoopStore.ppgWaveformRetentionRows` newest rows per device (#1911), swept
+        // amortised on insert exactly like `v18AuxSample`. This table is the ONE exception to "no durable
+        // per-second table is pruned" (hrSample, spo2Sample, … are still never pruned), because it is the
+        // only one storing a blob rather than a scalar: ~120 B/row against ~30 B. It is the worst ROW, not
+        // the biggest table — v26 runs only in optical windows (~28,800 rows/day) where `rrInterval` banks
+        // ~100,000/day, so most of #1911's ~93 MB/day is still unbounded elsewhere. `PrunePolicy`'s
+        // ~50 MB cap governs ONLY `rawBatch` (raw, pre-decode frames kept for re-decode / re-sync); it is
+        // untouched by and unrelated to this table.
+        //
+        // The cap is NEWEST-N-ROWS, not an age-based drop, and that distinction is load-bearing for the
+        // consumer note below: a sporadic wearer's v26 seconds are spread thin over months, so deleting by
+        // wall-clock age would empty the table for exactly the user a future estimator needs most, while
+        // newest-N always leaves a full working set. See `ppgWaveformRetentionRows` for the byte maths and
+        // for why #1911's "diagnostic-only, drop after the hot window" framing was not followed.
         //
         // CONSUMER STATUS — deliberately none, and stated here so nobody has to re-derive it. The writer is
         // live on both platforms (offload + archive replay + the Android capture importer), but the reader
@@ -571,6 +584,9 @@ extension WhoopStore {
         // #423: WHOOP 5/MG raw-IMU offload capture (100 Hz 6-axis). `samples` is a packed i16 LE BLOB of
         // the six wire columns (ax…az,gx…gz). Twin of the Android `rawImuSample` table (MIGRATION_20_21);
         // same column order + PK so a `.noopbak` round-trips byte-for-byte.
+        //
+        // Historical rolling cache. Its opt-in writer retained at most 3,600 one-second rows, but no analytics,
+        // UI or export consumed them. v41 retires those legacy rows after file-backed capture replaces the cache.
         migrator.registerMigration("v28-raw-imu") { db in
             try db.create(table: "rawImuSample") { t in
                 t.column("deviceId", .text).notNull()
@@ -655,6 +671,22 @@ extension WhoopStore {
         // point of this migration is that the data starts accruing NOW so a validated consumer is possible
         // LATER; landing a consumer at the same time would be scoring on evidence that does not exist yet.
         //
+        // CONSUMER STATUS — deliberately none, stated here so nobody has to re-derive it, and in the same
+        // shape as the `ppgWaveformSample` note above (v27). The writers are live on both platforms, but
+        // every `v18AuxSamples` call site on BOTH platforms is a TEST: no analytic, no score, no gate, no
+        // UI, no export reads a row. **Do NOT "clean up" the reader as dead code** — the rows are the point,
+        // and the reader is how they become reachable once a consumer is validated. The same applies to the
+        // four named columns added just below (`gravitySample.dynAccel`, `sleepStateSample.rawByte`,
+        // `skinTempSample.aux1Raw/aux2Raw`): they are SELECTed into their structs, and no consumer touches
+        // the properties, on purpose.
+        //
+        // Why the rows still matter even unread: before this migration these fields were not merely unread,
+        // they were DESTROYED. The strap trims its history the moment an offload is acked, so every one of
+        // them was unrecoverable. This migration converts permanent loss into retained-but-unread, which is
+        // the whole fix and is complete. Fifteen of the slots are unpinned bytes whose names deliberately
+        // assert nothing; wiring them to anything before a census would be exactly the overclaiming this
+        // project has already had to retract. The capture IS the deliverable.
+        //
         // The remaining fifteen v18 slots go to their OWN narrow table rather than fifteen more columns
         // (see `V18AuxCodec` for the wire format and the column-vs-blob tradeoff). Three reasons this is
         // a table and not another column on an existing row:
@@ -695,41 +727,388 @@ extension WhoopStore {
             }
         }
 
-        // v32: durable AI Coach transcript. The coach's chat lived only in `AICoachEngine.messages`, an
-        // in-memory array on a single app-lifetime object, so every relaunch opened a blank transcript and
-        // the "Today's brief" re-fired as if the conversation had never happened.
+        // v32 (#1071): record WHICH sensor channel produced each R-R beat.
         //
-        // One row per TURN, keyed by the turn's own UUID rather than (deviceId, ts): two turns can land in
-        // the same second (a fast local model replies inside one), and a value-based key would silently
-        // drop the second — the data-loss trap the v24 note warns about. `sessionId` is the LOCAL day the
-        // turn was spoken on (`yyyy-MM-dd`), which is what groups a transcript into "sessions" for a
-        // once-a-day coaching app; `ts` orders within and across them.
+        // An Oura ring reports the SAME heartbeats on more than one tag, and every one of them decoded to
+        // `OuraEvent.ibi` and landed here untagged. Measured over one 488-min sleep window: 61,524 beats
+        // stored where the measured HR curve allows 29,800 (2.06x), and sum(rrMs)/wall-clock = 2.17x. The
+        // two are separable after the fact only by the accident that their quantisation grids differ
+        // (0x6E is `byte * 8`, always a multiple of 8; 0x80 is an 11-bit value on the 1 ms grid), and the
+        // 8 ms stream is ABSENT until SpO2 measurement starts and then tracks its duty cycle exactly —
+        // which is what proves these are two channels rather than accumulated re-syncs.
         //
-        // `deviceId` here is the STABLE `CoachConversationStore.coachDeviceId` namespace, never the active
-        // strap id. The transcript is user-authored text, not strap data: a remove+re-add gives the strap a
-        // fresh id (#814) and would otherwise orphan every past conversation.
+        // The damage is to the VARIABILITY statistics, not the level: a duplicated beat train leaves
+        // meanNN (and so resting HR) correct while RMSSD/SDNN are built entirely from successive
+        // differences and collapse. The app's own `hrv diag` line has been reporting it as
+        // `coverage=2.21 rrIntegrity=crossSecondOverCount` with a non-physiological ~200 ms nocturnal SDNN.
         //
-        // Additive, a NEW table, no existing row touched, so an old reader is unaffected. Retention is a
-        // rolling per-device row cap (`WhoopStore.coachTurnRetentionRows`) applied on append, so a
-        // long-lived chat is bounded on disk the same way it is bounded in memory.
+        // NOT a de-duplication: both rows are real measurements of the same beat by different optics, and
+        // the second channel is the obvious future cross-check on the first. So nothing is deleted and
+        // nothing is rewritten — the column labels the source and `Reads.rrIntervals` filters at READ.
         //
-        // No Android Room twin in this commit: the Kotlin CoachViewModel keeps its in-memory transcript,
-        // so there is no Kotlin writer for this table and nothing for the schemas to disagree about. A
-        // maintainer adding Android persistence should land the matching Room migration then.
-        migrator.registerMigration("v32-coach-conversation") { db in
-            try db.create(table: "coachTurn") { t in
-                t.column("id", .text).primaryKey()          // the turn's UUID (ChatMessage.id)
-                t.column("deviceId", .text).notNull()
-                t.column("sessionId", .text).notNull()      // local day, YYYY-MM-DD
-                t.column("ts", .integer).notNull()          // unix seconds
-                t.column("role", .text).notNull()           // "user" | "assistant"
-                t.column("text", .text).notNull()
+        // Additive nullable column, the v30-rr-ord form: no table rebuild, no existing row touched, and
+        // deliberately NOT in the primary key, which stays (deviceId, ts, rrMs, seq) from v24. Putting it
+        // in the key would make the SAME beat insertable twice under two labels, the data-loss/duplication
+        // regression the v24 note warns about from the other direction.
+        //
+        // Pre-v32 rows stay NULL and are still READ (a WHOOP row is legitimately NULL forever — one beat
+        // source, no channel to name — so a filter that dropped NULL would silently delete every WHOOP
+        // night from scoring). Historical Oura rows therefore keep their old inflated coverage; they were
+        // never labelled, and a backfill would be a guess. For the record, since this is how the defect
+        // was diagnosed: in an existing DB the two channels remain separable by `rrMs % 8`, an 0x6E row
+        // always being a multiple of 8 and an 0x80 row landing there only 1 time in 8 by chance.
+        //
+        // Values are `RRSourceChannel.rawValue` (1 green / 2 spo2 / 3 ibiAmplitude), a DURABLE wire format
+        // shared with Kotlin `RrSourceChannel`. INTEGER rather than a text label because `rrInterval` is
+        // the highest-volume table in the schema (~60k rows a night) and this column rides every one.
+        //
+        // Twin of Room MIGRATION_25_26.
+        migrator.registerMigration("v32-rr-src-channel") { db in
+            try db.alter(table: "rrInterval") { t in
+                t.add(column: "srcChannel", .integer)
             }
-            // Transcript reads walk one device in time order (and prune by the same order).
-            try db.create(index: "idx_coachTurn_device_ts",
-                          on: "coachTurn", columns: ["deviceId", "ts"])
+        }
+        // #1058: per-session step count on a workout. Activity-file imports previously stored steps only
+        // as a whole-day DailyMetric row keyed on (deviceId, day), so a SECOND file for the same day
+        // overwrote the first's steps instead of adding. With steps on the session, the day total is
+        // recomputed as SUM over that day's sessions — additive across files, idempotent on re-import.
+        // Nullable; only foot-sport activity-file sessions populate it (a strap never writes it).
+        migrator.registerMigration("v33-workout-steps") { db in
+            try db.alter(table: "workout") { t in
+                t.add(column: "steps", .integer)
+            }
+        }
+        // #345 follow-up: per-session flag recording that a night was staged on SPARSE motion coverage
+        // (`SleepStager.isGravitySparse`), so the Sleep tab can honestly caption "sleep may be incomplete"
+        // when a sparse night likely under-detected (the "slept 8h, shows 1h" reports). Additive, nullable
+        // (existing rows / imported nights read null = unknown, never flagged); not part of the primary
+        // key. The v13 (`userEdited`) / v14 (`startTsAdjusted`) form. Byte-parity with Room MIGRATION_27_28.
+        migrator.registerMigration("v34-sleep-staging-sparse") { db in
+            // `.integer` (not `.boolean`) so the affinity is INTEGER on BOTH platforms — Room maps Kotlin
+            // Boolean? to INTEGER too — and this column carries no `grdb-boolean-affinity` divergence.
+            // The value is a 0/1 flag; GRDB binds/reads the Swift `Bool?` as 0/1 over an INTEGER column.
+            try db.alter(table: "sleepSession") { t in
+                t.add(column: "stagingSparse", .integer)
+            }
+        }
+        // v35 (#1073): quarantine R-R beats whose timestamp is in the FUTURE. An Oura ring's history
+        // timestamp is occasionally corrupt/misaligned and, before the OuraDriver gate was tightened to
+        // "now", converted to a date years ahead (measured on a live ring: ~1,600 beats stamped 2026→2034)
+        // and was banked — removed from the night it was measured in and queued to poison whichever future
+        // day it lands on. The ingest gate now rejects such samples, but rows already stored have to be
+        // taken out of scoring.
+        //
+        // NOT a delete: these are real heartbeats with a wrong timestamp, so — like the v32 srcChannel
+        // form — the column MARKS them and `Reads.rrIntervals` filters at READ, keeping them inspectable
+        // and recoverable if the ring-time offset is ever characterised (the migration rule warns against
+        // window-wide deletes). `strftime('%s','now')` runs once, at migration time; new rows are gated at
+        // ingest so never land future, and stay NULL. Additive nullable INTEGER, the v32 form: no table
+        // rebuild, no existing key touched, NOT in the primary key.
+        //
+        // Twin of Room MIGRATION_28_29.
+        migrator.registerMigration("v35-rr-future-quarantine") { db in
+            try db.alter(table: "rrInterval") { t in
+                t.add(column: "tsSuspect", .integer)
+            }
+            // CAST so the compare is numeric: `strftime` returns TEXT, and `ts` (INTEGER) > TEXT would
+            // otherwise lean on SQLite's affinity coercion rather than being explicit.
+            try db.execute(sql: "UPDATE rrInterval SET tsSuspect = 1 WHERE ts > CAST(strftime('%s','now') AS INTEGER)")
+        }
+        // v36 (#548): drop calibrated SpO₂ from WHOOP registry capabilities. Live NOOP never fills
+        // spo2Pct from the strap (import-only / experimental @82 candidate); advertising `spo2` made
+        // an empty Blood Oxygen tile look broken. Data-only UPDATE — no schema change. Twin of Room
+        // MIGRATION_29_30. Decode-time strip in DeviceRegistryStore is the belt; this is the suspenders.
+        migrator.registerMigration("v36-whoop-caps-no-spo2") { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT id, capabilities FROM pairedDevice
+                    WHERE brand = 'WHOOP' OR id = 'my-whoop' OR id LIKE 'whoop-%'
+                    """
+            )
+            for row in rows {
+                let id: String = row["id"]
+                let encoded: String = row["capabilities"]
+                let stripped = WhoopLiveCapabilities.stripSpo2Token(fromEncoded: encoded)
+                if stripped != encoded && !stripped.isEmpty {
+                    try db.execute(
+                        sql: "UPDATE pairedDevice SET capabilities = ? WHERE id = ?",
+                        arguments: [stripped, id]
+                    )
+                }
+            }
         }
 
+        // v37: persist nightly SDNN — the 5-min SDNN index (broad-variability twin of avgHrv=RMSSD),
+        // window-matched to a watch's short SDNN rather than the drift-inflated whole-night SD. Additive,
+        // nullable; computed by HRVAnalyzer.sdnnIndex during the nightly analysis.
+        //
+        // Numbered v37: upstream migrations advanced to v36 (`v36-whoop-caps-no-spo2`) while this branch
+        // was open, so this branch-local, never-shipped identifier is renumbered to the next free slot.
+        // Renumbering an unshipped identifier is free (GRDB tracks applied migrations by id, not number);
+        // renaming a SHIPPED one is not, so only this id moves.
+        migrator.registerMigration("v37-daily-avg-sdnn") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "avgSdnn", .double)
+            }
+        }
+        // v38-apple-step-hour: hourly Apple Health step counts. The daily `collect(.stepCount, …)` path
+        // in HealthKitBridge flattens a whole day to one `appleDaily.steps` total, so a dead/absent phone
+        // for part of a day (e.g. the phone died mid-hike) is invisible — steps just read low for the
+        // WHOLE day instead of showing exactly which hours had no recording. HealthKit retains hourly
+        // statistics historically, so this table lets a one-time backfill answer PAST days
+        // retroactively, not just from the day this migration ships. `ts` is the hour-BUCKET START
+        // (unix seconds), aligned to local-clock hour boundaries by the `HKStatisticsCollectionQuery`
+        // anchored at local midnight (see HealthKitBridge); `steps` is the cumulative sum within that
+        // hour. PK (deviceId, ts) mirrors every other per-sample table (hrSample, stepSample, …) and
+        // makes the hourly upsert idempotent. Additive only — a NEW table, no existing row touched, old
+        // readers unaffected.
+        migrator.registerMigration("v38-apple-step-hour") { db in
+            // ifNotExists: forks/sideloads that already carry this table under a different migration
+            // identifier converge cleanly instead of failing the migrator.
+            try db.create(table: "appleStepHour", options: [.ifNotExists]) { t in
+                t.column("deviceId", .text).notNull()   // "apple-health"
+                t.column("ts", .integer).notNull()      // hour-start unix seconds (local-hour aligned by HK)
+                t.column("steps", .integer).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
+        // v39 (#979): keep the v26 per-burst counter beside the waveform it segments. Existing rows stay
+        // nil because the counter was discarded before this migration and cannot be reconstructed.
+        migrator.registerMigration("v39-ppg-burst-index") { db in
+            try db.alter(table: "ppgWaveformSample") { t in
+                t.add(column: "burstIndex", .integer)
+            }
+        }
+        // v40 (#1636): keep the nightly ABSOLUTE skin temperature beside the deviation derived from it.
+        // The engine computed this mean on every pass and discarded it the moment `skinTempDevC` was
+        // taken, so the app could show "+0.5 Δ°C" with no way to learn what it moved from — and a febrile
+        // night reads as a small delta where the absolute reads as a fever. Additive and nullable: old
+        // rows stay nil, and nothing reads it as a gate. Existing nights refill on the next scoring pass
+        // because the value is re-derived from raw `skinTempSample` rows that are still on disk — no
+        // separate backfill, and therefore no second implementation that could disagree with the live one.
+        migrator.registerMigration("v40-daily-skin-temp-absolute") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "skinTempC", .double)
+            }
+        }
+        // Retire the bounded, write-only legacy cache. Session-owned IMU now lives in the file-backed store.
+        migrator.registerMigration("v41-drop-raw-imu-sample") { db in
+            try db.drop(table: "rawImuSample")
+        }
+        // Whether every sleep session that day was staged from heart rate alone (#1801). The Kotlin twin
+        // is `DailyMetric.sleepHrOnly`, added by Room MIGRATION_35_36; the shared schema oracle pins the
+        // two shapes together, so this exists here even while only Android reads it — a column present on
+        // one side and absent on the other is the drift #775 tracks, and stagingSparse set the precedent
+        // for carrying a staging-quality flag on both.
+        migrator.registerMigration("v42-daily-sleep-hr-only") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "sleepHrOnly", .boolean)
+            }
+        }
+        // PRD-K2: persist the Coach conversation on-device so it survives relaunch. One row per chat
+        // turn; `orderIndex` is a monotonically-increasing counter (not `createdAt`, which two
+        // streamed turns can share to the second) so replay order is exact. `provider` isn't filtered
+        // on for v1 (a conversation is a conversation across a provider switch) but is carried so a
+        // future per-provider view/filter doesn't need another migration. Never added to the
+        // `.noopbak` backup whitelist (a separate, deliberate decision — CLAUDE.md's backup contract).
+        migrator.registerMigration("v43-coach-messages") { db in
+            try db.create(table: "coachMessage", options: [.ifNotExists]) { t in
+                t.column("id", .text).primaryKey()
+                t.column("role", .text).notNull()       // "user" | "assistant"
+                t.column("text", .text).notNull()
+                t.column("provider", .text).notNull()
+                t.column("createdAt", .integer).notNull()
+                t.column("orderIndex", .integer).notNull()
+            }
+            // No index: the table is capped at maxStoredMessages (40 rows), so a full scan + sort on
+            // read is negligible and an index buys nothing worth the extra Room<->GRDB parity surface.
+        }
+        // #2019: carry the v26 optical window's ABSOLUTE base code beside its deltas.
+        //
+        // The 25-sample window is one absolute ADC code plus 24 deltas, and only the deltas were read, so
+        // the stored `samples` blob is a derivative and the DC level was thrown away. Nullable and
+        // additive: an existing row keeps its deltas and gets a null base, which is the true statement
+        // about it. A delta series cannot be inverted without the base, so those windows have no
+        // recoverable absolute level and no backfill can invent one. Twin of Room's MIGRATION_37_38.
+        migrator.registerMigration("v44-ppg-waveform-base-code") { db in
+            try db.alter(table: "ppgWaveformSample") { t in
+                t.add(column: "baseCode", .integer)
+            }
+        }
+        // Source promotions change scoring without adding rows. Cover their cache witnesses so
+        // legacy/non-WHOOP installs do not scan the entire R-R table on every analysis tick.
+        migrator.registerMigration("v45-rr-source-index") { db in
+            try db.create(index: "rrInterval_source_suspect", on: "rrInterval", columns: ["srcChannel", "tsSuspect"])
+        }
+        // v46-lift-log: the in-app strength log — saved programs and the sessions run from them.
+        //
+        // NOOP can already IMPORT a lifting history (Hevy CSV / Liftosaur JSON via LiftingImporter), but
+        // that path collapses each workout to a session summary — volume load, set count, top set —
+        // because there has never been anywhere to put an individual set. These five tables are that
+        // place. A logged session still lands in `workout` like any other (so Workouts / Today / Effort
+        // are unchanged); these rows hang beside it and carry the detail the workout row cannot.
+        //
+        // Deliberately NO load/strain column anywhere here: `workout.strain` stays the HR-measured
+        // number the analytics engine computes, and lifting volume is derived on read from the sets
+        // themselves. Nothing in this migration feeds a score.
+        //
+        // Shape notes:
+        //   • Five flat, deviceId-keyed tables joined manually by id — this schema has no foreign keys
+        //     anywhere and does not start here. Every table carries `deviceId` so `deleteAllData`
+        //     (DeviceRegistryStore.deviceScopedTables) clears the whole feature; a child table keyed
+        //     only by its parent's id would silently survive a delete.
+        //   • `id` is a client-generated TEXT identifier so a row can be edited/deleted by id and a
+        //     backup round-trips — the labMarker (v17) idiom.
+        //   • `liftSession` is keyed to its workout row by the same natural key the workout table uses,
+        //     (deviceId, startTs, sport), enforced UNIQUE. One session per workout row, no orphan pairs.
+        //   • Sets are ROWS, not a JSON blob on the session. "What did I lift for this exercise last
+        //     time" is the read the whole feature exists for, and it must be answerable by an index
+        //     rather than by decoding every session ever recorded.
+        //   • Timestamps are unix seconds (Int) like every other table; booleans are `.integer` 0/1,
+        //     never `.boolean` (GRDB declares that BOOLEAN → NUMERIC affinity, which diverges from
+        //     Room's INTEGER — see `grdb-boolean-affinity` in schema_oracle.json).
+        //   • Every create here is `ifNotExists` — tables AND indexes, consistently — so the
+        //     migration is a no-op against a database that already carries the schema (the v38
+        //     idiom). GRDB keys applied migrations by identifier, so a fork carrying these tables
+        //     under a different one converges instead of failing the migrator.
+        //
+        // Pinned in schema_oracle.json as `ios_only` with a stated reason: the Room twin is a follow-up,
+        // not part of this change.
+        migrator.registerMigration("v46-lift-log") { db in
+            // The user's own exercise vocabulary. NOOP ships NO exercise catalogue: an exercise is
+            // whatever the user typed, and it is remembered here the first time they use it so it can
+            // be offered back later with the muscle group they gave it. That consistency is what makes
+            // a per-muscle-group rollup honest — the same name always resolves to the same group,
+            // rather than to whatever was typed on the day.
+            try db.create(table: "liftExercise", options: [.ifNotExists]) { t in
+                t.column("id", .text).primaryKey()
+                t.column("deviceId", .text).notNull()
+                t.column("name", .text).notNull()
+                // Canonical LiftMuscle tokens, never free text — a rollup only means something if
+                // the same muscle always lands in the same bucket. Nullable so an exercise can be
+                // recorded before it has been classified.
+                t.column("primaryMuscle", .text)
+                // Comma-joined LiftMuscle tokens, or NULL. Short, never queried alone, trivially
+                // mirrorable in Room — a join table would be three tables of ceremony for a list of
+                // two or three.
+                t.column("secondaryMuscles", .text)
+                t.column("createdAt", .integer).notNull()   // unix seconds
+                t.column("lastUsedTs", .integer)            // unix seconds; recency for the picker
+            }
+            // One entry per name per device, so recording a name twice updates rather than duplicates.
+            try db.create(index: "idx_liftExercise_natural", on: "liftExercise",
+                          columns: ["deviceId", "name"], options: [.unique, .ifNotExists])
+
+            // A saved program: "Upper A", "Lower A". Held separately from the sessions run from it so
+            // editing a program never rewrites history — a session snapshots the name it ran under.
+            try db.create(table: "liftProgram", options: [.ifNotExists]) { t in
+                t.column("id", .text).primaryKey()
+                t.column("deviceId", .text).notNull()
+                t.column("name", .text).notNull()
+                t.column("note", .text)
+                t.column("createdAt", .integer).notNull()   // unix seconds
+                t.column("updatedAt", .integer).notNull()   // unix seconds; drives most-recent-first
+                t.column("archived", .integer).notNull().defaults(to: 0)  // 0/1, hidden not deleted
+            }
+            // Programs list most-recently-touched first.
+            try db.create(index: "idx_liftProgram_device_updatedAt",
+                          on: "liftProgram", columns: ["deviceId", "updatedAt"], options: [.ifNotExists])
+
+            // One exercise line inside a program: the TARGETS (what you intend to do). The session
+            // records what actually happened. `ord` is the position in the program; deliberately NOT
+            // unique with programId, because reordering two lines would collide mid-swap on a unique
+            // index and the id primary key already guarantees row identity.
+            try db.create(table: "liftProgramItem", options: [.ifNotExists]) { t in
+                t.column("id", .text).primaryKey()
+                t.column("deviceId", .text).notNull()
+                t.column("programId", .text).notNull()
+                t.column("ord", .integer).notNull()
+                t.column("exercise", .text).notNull()
+                // No muscle column here on purpose: `liftExercise` owns an exercise's classification,
+                // and duplicating it on the program line is a second place for it to drift.
+                t.column("targetSets", .integer)
+                t.column("targetRepsLow", .integer)        // rep range low end, e.g. 8 of "8-10"
+                t.column("targetRepsHigh", .integer)       // rep range high end
+                t.column("targetRpe", .double)             // 1-10, the user's own scale
+                // A program line plans a WEIGHT, not just a rep range — it is the number actually
+                // written on a program. Kilograms, like every stored weight; display converts.
+                t.column("targetWeightKg", .double)
+                t.column("restSec", .integer)              // intended rest after each set
+                t.column("note", .text)                    // the user's technique cue, verbatim
+            }
+            try db.create(index: "idx_liftProgramItem_device", on: "liftProgramItem",
+                          columns: ["deviceId"], options: [.ifNotExists])
+            try db.create(index: "idx_liftProgramItem_program_ord", on: "liftProgramItem",
+                          columns: ["programId", "ord"], options: [.ifNotExists])
+
+            // One gym session. (deviceId, startTs, sport) is the workout table's natural key, so this
+            // row and its `workout` row identify each other without a foreign key. `programId` is
+            // nullable: a session can be logged freehand with no program behind it.
+            try db.create(table: "liftSession", options: [.ifNotExists]) { t in
+                t.column("id", .text).primaryKey()
+                t.column("deviceId", .text).notNull()
+                t.column("startTs", .integer).notNull()     // unix seconds; matches workout.startTs
+                t.column("endTs", .integer)                 // nil while the session is still running
+                t.column("sport", .text).notNull()          // matches workout.sport
+                t.column("programId", .text)                // nil for a freehand session
+                t.column("programName", .text)              // snapshot: renaming a program never rewrites history
+                // 0-10 Borg CR10, as rated by the user. Foster's session load is sRPE x duration, so
+                // the rating has to be a number in its own column or the metric cannot be derived at
+                // all. Nullable: a session whose rating was skipped simply has no session load, and a
+                // 0 would read as "effortless" rather than "unrated".
+                t.column("sessionRpe", .double)
+                t.column("note", .text)
+            }
+            // One lift session per workout row, and the index that serves date-ordered history reads.
+            try db.create(index: "idx_liftSession_natural", on: "liftSession",
+                          columns: ["deviceId", "startTs", "sport"], options: [.unique, .ifNotExists])
+
+            // One set. `ord` is the position within the whole session (so the tap-through order is
+            // reconstructible); `setIndex` is 1-based within its exercise (so "set 3 of 4" survives).
+            // `exercise` is denormalised rather than pointing at a program item, because a session must
+            // stay readable after its program is edited or deleted.
+            try db.create(table: "liftSet", options: [.ifNotExists]) { t in
+                t.column("id", .text).primaryKey()
+                t.column("deviceId", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("ord", .integer).notNull()          // order within the session
+                t.column("exercise", .text).notNull()
+                // The classification AS IT WAS when the set was logged, snapshotted like `exercise`
+                // itself. Reclassifying an exercise later is an explicit bulk action, not a silent
+                // rewrite of what past weeks were counted as.
+                t.column("primaryMuscle", .text)
+                t.column("secondaryMuscles", .text)
+                t.column("setIndex", .integer).notNull()     // 1-based within the exercise
+                t.column("weightKg", .double)                // kilograms; display units convert
+                t.column("reps", .integer)
+                t.column("rpe", .double)                     // 1-10 as rated by the user
+                t.column("isWarmup", .integer).notNull().defaults(to: 0)  // 0/1; warmups excluded from volume
+                t.column("startTs", .integer)                // when the set began (unix seconds)
+                t.column("endTs", .integer)                  // when it ended
+                t.column("restSec", .integer)                // rest ACTUALLY taken after this set
+                t.column("note", .text)
+            }
+            // "What did I lift for this exercise last time" — the read the feature exists for.
+            try db.create(index: "idx_liftSet_device_exercise", on: "liftSet",
+                          columns: ["deviceId", "exercise"], options: [.ifNotExists])
+            // Replaying one session in order.
+            try db.create(index: "idx_liftSet_session_ord", on: "liftSet",
+                          columns: ["sessionId", "ord"], options: [.ifNotExists])
+        }
+        // v47 (#2371): mark the WHOOP 5 500 ms fill beats already stored, with the rule `insert` applies to
+        // every new batch (`WhoopStore.whoop5RrFillFlagSQL`). Data only, no schema change, and a MARK in
+        // the v35 form, never a delete: the rows stay on disk. Twin of Room
+        // MIGRATION_40_41.
+        migrator.registerMigration("v47-rr-whoop5-fill") { db in
+            try db.execute(sql: WhoopStore.whoop5RrFillMigrationSQL)
+        }
+
+        // Fork (personalnoop): registered AFTER every upstream migration, under its ORIGINAL identifier.
+        // GRDB tracks applied migrations by name, so a DB that already ran "v33-food-log" (before the
+        // upstream sync) skips it, and a fresh DB creates the table last. Never rename this id: a
+        // renamed migration would re-run `create(table:)` on an existing DB and fail.
+        //
         // v33: manually logged food entries. The nutrition model NOOP already has is DAILY TOTALS in the
         // long-format `metricSeries` table (`NutritionCsvImporter` → source "nutrition-csv", keys
         // calories_in / protein_g / carbs_g / fat_g). That shape cannot hold "chicken breast and rice for
@@ -744,8 +1123,8 @@ extension WhoopStore {
         // the id would make a Cronometer import and a manual entry silently clobber each other's totals
         // for the same day, in whichever order they happened to be written.
         //
-        // `deviceId` is the stable `FoodLogStore.foodDeviceId` namespace — same reasoning as v32, this is
-        // user-authored data that must survive a strap remove+re-add (#814).
+        // `deviceId` is the stable `FoodLogStore.foodDeviceId` namespace: this is user-authored data that
+        // must survive a strap remove+re-add (#814).
         //
         // `kcal` / `proteinG` / `carbsG` / `fatG` are NULLABLE and carry NO DEFAULT. An estimate that
         // could not resolve a macro must stay ABSENT rather than become a fabricated 0 — the same rule
@@ -772,7 +1151,6 @@ extension WhoopStore {
             try db.create(index: "idx_foodLogEntry_device_day_ts",
                           on: "foodLogEntry", columns: ["deviceId", "day", "ts"])
         }
-
         return migrator
     }
 }

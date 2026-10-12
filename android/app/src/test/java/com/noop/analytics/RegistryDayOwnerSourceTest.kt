@@ -44,6 +44,12 @@ class RegistryDayOwnerSourceTest {
             devices[id]?.let { devices[id] = it.copy(model = model) }
         }
         override suspend fun renameDevice(id: String, nickname: String?) {}
+        override suspend fun touchLastSeen(id: String, now: Long) {
+            // #1527, mirrors the query's `AND status != 'archived'`.
+            devices[id]?.let {
+                if (it.status != DeviceStatus.archived.name) devices[id] = it.copy(lastSeenAt = now)
+            }
+        }
         override suspend fun setPeripheralId(id: String, peripheralId: String?) {
             devices[id]?.let { devices[id] = it.copy(peripheralId = peripheralId) }
         }
@@ -60,7 +66,6 @@ class RegistryDayOwnerSourceTest {
         override suspend fun deleteStepsFor(deviceId: String) {}
         override suspend fun deletePpgHrFor(deviceId: String) {}
         override suspend fun deletePpgWaveformFor(deviceId: String) {}
-        override suspend fun deleteRawImuFor(deviceId: String) {}
         override suspend fun deleteV18AuxFor(deviceId: String) {}
         override suspend fun deleteEventsFor(deviceId: String) {}
         override suspend fun deleteBatteryFor(deviceId: String) {}
@@ -69,6 +74,7 @@ class RegistryDayOwnerSourceTest {
         override suspend fun deleteJournalFor(deviceId: String) {}
         override suspend fun deleteWorkoutsFor(deviceId: String) {}
         override suspend fun deleteAppleDailyFor(deviceId: String) {}
+        override suspend fun deleteAppleStepHoursFor(deviceId: String) {}
         override suspend fun deleteMetricSeriesFor(deviceId: String) {}
         override suspend fun deleteDayOwnershipFor(deviceId: String) {}
         override suspend fun deleteScoreInputProvenanceFor(deviceId: String) {}
@@ -77,6 +83,12 @@ class RegistryDayOwnerSourceTest {
         override suspend fun deleteLiveSessionsFor(deviceId: String) {}
         override suspend fun deleteDismissedWorkoutsFor(deviceId: String) {}
         override suspend fun deleteDismissedSleepsFor(deviceId: String) {}
+        override suspend fun deleteLiftExercisesFor(deviceId: String) {}
+        override suspend fun deleteLiftProgramsFor(deviceId: String) {}
+        override suspend fun deleteLiftProgramItemsFor(deviceId: String) {}
+        override suspend fun deleteLiftSessionsFor(deviceId: String) {}
+        override suspend fun deleteLiftSetsFor(deviceId: String) {}
+        override suspend fun deleteLiftSets(ids: List<String>) {}
 
         // #771 adopt-serial re-key: sample-table re-keys are unmodelled here (no per-table storage in
         // this fake), same as the delete*For no-ops above. dayOwnership IS modelled ([owners]), so its
@@ -90,7 +102,6 @@ class RegistryDayOwnerSourceTest {
         override suspend fun reKeySteps(from: String, to: String) {}
         override suspend fun reKeyPpgHr(from: String, to: String) {}
         override suspend fun reKeyPpgWaveform(from: String, to: String) {}
-        override suspend fun reKeyRawImu(from: String, to: String) {}
         override suspend fun reKeyV18Aux(from: String, to: String) {}
         override suspend fun reKeyEvents(from: String, to: String) {}
         override suspend fun reKeyBattery(from: String, to: String) {}
@@ -99,6 +110,7 @@ class RegistryDayOwnerSourceTest {
         override suspend fun reKeyJournal(from: String, to: String) {}
         override suspend fun reKeyWorkouts(from: String, to: String) {}
         override suspend fun reKeyAppleDaily(from: String, to: String) {}
+        override suspend fun reKeyAppleStepHour(from: String, to: String) {}
         override suspend fun reKeyMetricSeries(from: String, to: String) {}
         override suspend fun reKeyDayOwnership(from: String, to: String) {
             for ((day, row) in owners) if (row.deviceId == from) owners[day] = row.copy(deviceId = to)
@@ -108,6 +120,11 @@ class RegistryDayOwnerSourceTest {
         override suspend fun reKeyLiveSessions(from: String, to: String) {}
         override suspend fun reKeyDismissedWorkouts(from: String, to: String) {}
         override suspend fun reKeyDismissedSleeps(from: String, to: String) {}
+        override suspend fun reKeyLiftExercises(from: String, to: String) {}
+        override suspend fun reKeyLiftPrograms(from: String, to: String) {}
+        override suspend fun reKeyLiftProgramItems(from: String, to: String) {}
+        override suspend fun reKeyLiftSessions(from: String, to: String) {}
+        override suspend fun reKeyLiftSets(from: String, to: String) {}
 
         override suspend fun pairedDevice(id: String): PairedDeviceRow? = devices[id]
 
@@ -209,15 +226,17 @@ class RegistryDayOwnerSourceTest {
     }
 
     @Test
-    fun archivedDeviceIsNotACandidate() = runBlocking {
+    fun archivedDeviceRemainsALowestPriorityHistoricalCandidate() = runBlocking {
         val dao = FakeDao().apply {
             devices["my-whoop"] = device("my-whoop", "WHOOP", SourceKind.liveBLE, DeviceStatus.active)
             devices["old"] = device("old", "Polar", SourceKind.liveBLE, DeviceStatus.archived)
         }
         val src = RegistryDayOwnerSource(registry(dao))
-        val ids = src.candidatePriorities().map { it.first }
-        assertEquals(listOf("my-whoop"), ids) // archived 'old' excluded
-        // With only the active strap and it having NO data, there is no owner (honest gap).
-        assertNull(resolveWith(src, "2026-06-15", mapOf("my-whoop" to false)))
+        val priorities = src.candidatePriorities().toMap()
+        assertEquals(0, priorities["my-whoop"])
+        assertEquals(4, priorities["old"])
+        // Archived history fills only an otherwise uncovered day; live/current sources always win.
+        assertEquals("old", resolveWith(src, "2026-06-15", mapOf("my-whoop" to false, "old" to true)))
+        assertEquals("my-whoop", resolveWith(src, "2026-06-15", mapOf("my-whoop" to true, "old" to true)))
     }
 }

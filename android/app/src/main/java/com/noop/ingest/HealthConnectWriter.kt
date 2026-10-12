@@ -1,5 +1,7 @@
 package com.noop.ingest
 
+import kotlinx.coroutines.sync.withLock
+
 import android.content.Context
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
@@ -12,6 +14,8 @@ import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.RespiratoryRateRecord
 import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
+import androidx.health.connect.client.records.Vo2MaxRecord
+import com.noop.data.MetricSeriesRow
 import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.units.Length
 import androidx.health.connect.client.units.Percentage
@@ -88,6 +92,16 @@ object HealthConnectWriter {
         WRITE_RECORDS.map { HealthPermission.getWritePermission(it) }.toSet()
 
     /**
+     * #1677: exports are serialized. Three callers can start one - the post-sync hook in WhoopBleClient
+     * and two in AppViewModel - with no uniqueness guard between them, so two could previously overlap on
+     * the same external store. That is newly consequential now the writer keeps a ledger: both would read
+     * the same `previous`, both would write their own result, and the loser's carried-forward retractions
+     * would be forgotten, orphaning exactly the records this change exists to retract. Serializing also
+     * stops two exports doing the same insert work twice.
+     */
+    private val exportMutex = kotlinx.coroutines.sync.Mutex()
+
+    /**
      * Write the last [WINDOW_DAYS] of computed metrics. Returns a [WritebackResult] — the record
      * count PLUS any per-concern failure categories, so a revoked permission no longer looks like a
      * benign "wrote 0" (#660). Persists the outcome via [recordStatus] for the Data Sources UI.
@@ -97,7 +111,10 @@ object HealthConnectWriter {
      * rows under `whoop-<address>`, so a hardcoded legacy "my-whoop" id reads empty tables and
      * exports nothing.
      */
-    suspend fun write(context: Context, repo: WhoopRepository, deviceId: String): WritebackResult {
+    suspend fun write(context: Context, repo: WhoopRepository, deviceId: String): WritebackResult =
+        exportMutex.withLock { writeLocked(context, repo, deviceId) }
+
+    private suspend fun writeLocked(context: Context, repo: WhoopRepository, deviceId: String): WritebackResult {
         if (HealthConnectClient.getSdkStatus(context) != HealthConnectClient.SDK_AVAILABLE) return WritebackResult.UNAVAILABLE
 
         // Guard the pre-insert work (client acquisition + the day read) the same way the concern inserts
@@ -170,7 +187,12 @@ object HealthConnectWriter {
         }
         runCatching { writeHeartRate(client, context, repo, deviceId, version) }
             .fold({ total += it }, { failures += it.writebackCategory() })
-        runCatching { writeSleep(client, repo, deviceId) }
+        runCatching { writeSleep(client, context, repo, deviceId) }
+            .fold({ total += it }, { failures += it.writebackCategory() })
+        // #1525: separate attempt on purpose. The daily records above go in ONE insertRecords call, so a
+        // missing permission there loses resting HR, HRV, SpO2 and respiratory rate together. On its own,
+        // an ungranted VO2 max permission costs only VO2 max and is categorized like any other failure.
+        runCatching { writeVo2Max(client, repo, deviceId, version) }
             .fold({ total += it }, { failures += it.writebackCategory() })
         val result = WritebackResult(total, failures.distinct())
         recordStatus(context, result)
@@ -206,14 +228,14 @@ object HealthConnectWriter {
         val floor = now - WINDOW_DAYS * 86_400
         val frontier = maxOf(NoopPrefs.hcHrFrontier(context), floor)
 
-        val samples = repo.hrSamples(deviceId, from = frontier + 1, to = now, limit = 200_000)
+        val samples = repo.hrSamplesForDevice(deviceId, from = frontier + 1, to = now, limit = 200_000)
             .map { HealthExportPlan.HrPoint(it.ts, it.bpm) }
         if (samples.isEmpty()) return 0
 
         // Workout + sleep windows where the full-resolution series matters; everything else decimates.
         val windows = buildList {
             repo.workouts(deviceId, frontier, now).forEach { add(HealthExportPlan.Window(it.startTs, it.endTs)) }
-            repo.sleepSessions(deviceId, frontier, now).forEach { add(HealthExportPlan.Window(it.startTs, it.endTs)) }
+            repo.sleepSessionsForDevice(deviceId, frontier, now).forEach { add(HealthExportPlan.Window(it.startTs, it.endTs)) }
         }
 
         val plan = HealthExportPlan.heartRate(samples, windows, frontier)
@@ -252,13 +274,21 @@ object HealthConnectWriter {
      * and the absorbed fragments' old per-fragment records are DELETED (HC upserts by id but never
      * removes an id we stop writing).
      */
-    private suspend fun writeSleep(client: HealthConnectClient, repo: WhoopRepository, deviceId: String): Int {
+    private suspend fun writeSleep(
+        client: HealthConnectClient,
+        context: Context,
+        repo: WhoopRepository,
+        deviceId: String,
+    ): Int {
         val now = System.currentTimeMillis() / 1000
         val floor = now - WINDOW_DAYS * 86_400
         val sessions = repo.sleepSessionsMerged(deviceId, from = floor, to = now)
             .map { HealthExportPlan.SleepInput(it.startTs, it.effectiveStartTs, it.endTs, it.stagesJSON) }
         val offsetSec = (java.util.TimeZone.getDefault().getOffset(now * 1000) / 1000).toLong()
         val plans = HealthExportPlan.sleepSessions(sessions, now, offsetSec)
+        // Deliberately BEFORE the ledger below. "No plans" is not the same statement as "the user has no
+        // sleep": a read that came back empty for any reason would, with retraction enabled, delete every
+        // night this window covers. Saying nothing is the recoverable failure; deleting is not.
         if (plans.isEmpty()) return 0
 
         val zone = ZoneId.systemDefault()
@@ -288,16 +318,119 @@ object HealthConnectWriter {
         // Clear absorbed fragments' old records BEFORE the merged upsert, so a night previously
         // exported as two entries never lingers as one merged + one stale fragment. (#364)
         val absorbed = plans.flatMap { it.absorbedClientIds }
-        if (absorbed.isNotEmpty()) {
+        // #1677: and the ids we wrote on a PREVIOUS export that this one no longer produces. `absorbed`
+        // cannot cover those: it is derived from sleepSession rows still in the database, and the
+        // #1248/#1284 heal deletes a stale row the moment a fuller copy of that night wins. A record
+        // exported mid-sync under the partial night's start then had nothing left pointing at it, so no
+        // later export could correct or remove it — the permanent wrong duration #1677 describes.
+        // Scoped to this export's own window by `staleClientIds`, so a night that merely aged out is
+        // never retracted.
+        val currentIds = plans.map { it.clientId }.toSet()
+        val stale = HealthConnectLedger.staleClientIds(
+            previous = HealthConnectLedger.previouslyWritten(
+                context, deviceId, HealthConnectLedger.SLEEP_PREFIX),
+            current = currentIds,
+            prefix = HealthConnectLedger.SLEEP_PREFIX,
+            windowStartSec = floor,
+            nowSec = now,
+        )
+        val retract = (absorbed + stale).distinct()
+        // Ids whose retraction did NOT land. They stay on the books so the next export tries again -
+        // forgetting one would orphan its record permanently, which is the very failure this fixes.
+        val unretracted = LinkedHashSet<String>()
+        if (retract.isNotEmpty()) {
+            // One call for the common case. If it throws, retry per id: the reporter of #1677 had already
+            // deleted the bad record by hand, and an id that is no longer there must not take the rest of
+            // the batch down with it. `retract` is a handful of entries at most, so the fallback is cheap.
             runCatching {
                 client.deleteRecords(SleepSessionRecord::class,
-                    recordIdsList = emptyList(), clientRecordIdsList = absorbed)
+                    recordIdsList = emptyList(), clientRecordIdsList = retract)
+            }.onFailure {
+                for (one in retract) {
+                    runCatching {
+                        client.deleteRecords(SleepSessionRecord::class,
+                            recordIdsList = emptyList(), clientRecordIdsList = listOf(one))
+                    }.onFailure { unretracted += one }
+                }
             }
         }
+        val written = insertChunked(client, records)
+        // Recorded only AFTER the write lands. Remembering ids we failed to write would make the NEXT
+        // export retract records that never existed - harmless in itself, but it would also drop the ids
+        // that do need retracting from the ledger, quietly restoring the bug this fixes.
+        HealthConnectLedger.remember(
+            context, deviceId, HealthConnectLedger.SLEEP_PREFIX,
+            HealthConnectLedger.ledgerAfterExport(currentIds, unretracted),
+        )
+        return written
+    }
+
+    /**
+     * VO2 max writeback (#1525). NOOP computes this weekly and persists it as the `vo2max_est` metric
+     * series, keyed to the week's Saturday — nothing exported it before, so a value the app already had
+     * never reached Health Connect.
+     *
+     * Read through [WhoopRepository.metricSeriesComputedUnion], which is what that series' own doc says
+     * the weekly computed scores MUST use: it merges the active strap's computed sibling with the
+     * canonical "my-whoop-noop", so a re-added strap does not silently export half its history.
+     *
+     * Declared as MEASUREMENT_METHOD_OTHER rather than HEART_RATE_RATIO. The stored value is whichever
+     * estimator ran — the Nes multivariable regression when a waist is set, the Uth HR-ratio formula
+     * otherwise (#1493) — and the row does not record which. HEART_RATE_RATIO would be true of only one
+     * of them, so the honest label is the general one.
+     *
+     * Timestamped at local noon on the series' day, matching the daily records above.
+     */
+    private suspend fun writeVo2Max(
+        client: HealthConnectClient,
+        repo: WhoopRepository,
+        deviceId: String,
+        version: Long,
+    ): Int {
+        val zone = ZoneId.systemDefault()
+        val cutoff = LocalDate.now().minusDays(WINDOW_DAYS).toString()
+        val today = LocalDate.now().toString()
+        val rows = repo.metricSeriesComputedUnion(deviceId, "vo2max_est", cutoff, today)
+        val records = buildVo2MaxRecords(rows, version, zone)
+        if (records.isEmpty()) return 0
         return insertChunked(client, records)
     }
 
+    /**
+     * Pure: map `vo2max_est` series rows to records, testable without a client — the same split
+     * [buildExerciseRecords] uses below.
+     *
+     * Skips a day whose key will not parse, and any value at or below zero: a stored 0 means the estimator
+     * declined that week, and exporting it would publish "VO2 max: 0" as a fitness reading rather than
+     * saying nothing. Timestamped at local noon on the series' own day, matching the daily records, and
+     * keyed by day in the clientRecordId so a re-export upserts instead of duplicating.
+     */
+    internal fun buildVo2MaxRecords(
+        rows: List<MetricSeriesRow>,
+        version: Long,
+        zone: ZoneId,
+    ): List<Record> = rows.mapNotNull { row ->
+        val date = runCatching { LocalDate.parse(row.day) }.getOrNull() ?: return@mapNotNull null
+        if (row.value <= 0.0) return@mapNotNull null
+        val time = date.atTime(LocalTime.NOON).atZone(zone)
+        Vo2MaxRecord(
+            time = time.toInstant(),
+            zoneOffset = time.offset,
+            vo2MillilitersPerMinuteKilogram = row.value,
+            measurementMethod = Vo2MaxRecord.MEASUREMENT_METHOD_OTHER,
+            metadata = meta("vo2max", row.day, version),
+        )
+    }
+
     // --- Workout (ExerciseSession) writeback (GPS workouts, v1.71) ---
+
+    /**
+     * Write permission for VO2 max (#1525). Deliberately NOT in [WRITE_RECORDS]: that set feeds both the
+     * daily batch and the UI's `containsAll` gate, so adding it there would re-prompt every existing user
+     * and block ALL writeback until they re-granted. Requested alongside the others, but its records are
+     * written in their own attempt, so a decline costs only VO2 max.
+     */
+    val VO2MAX_PERMISSIONS: Set<String> = setOf(HealthPermission.getWritePermission(Vo2MaxRecord::class))
 
     /** Write-permission strings for exercise sessions + distance; union into the writeback request. */
     val EXERCISE_PERMISSIONS: Set<String> = setOf(
@@ -339,5 +472,22 @@ object HealthConnectWriter {
             .fold({ WritebackResult(it, emptyList()) }, { WritebackResult(0, listOf(it.writebackCategory())) })
         recordStatus(context, result)
         return result
+    }
+
+    /** Remove a workout's session + distance records from Health Connect by client-record id (the same ids
+     *  [buildExerciseRecords] assigns: "noop-workout-$startTs" + "-dist"). Used when an edit MOVES the start
+     *  time so the old record doesn't orphan beside the new one — mirroring the iOS delete-before-write.
+     *  Best-effort; a missing record is a no-op. (#1195) */
+    suspend fun deleteExercise(context: Context, startTs: Long) {
+        if (HealthConnectClient.getSdkStatus(context) != HealthConnectClient.SDK_AVAILABLE) return
+        val client = HealthConnectClient.getOrCreate(context)
+        runCatching {
+            client.deleteRecords(ExerciseSessionRecord::class,
+                recordIdsList = emptyList(), clientRecordIdsList = listOf("noop-workout-$startTs"))
+        }
+        runCatching {
+            client.deleteRecords(DistanceRecord::class,
+                recordIdsList = emptyList(), clientRecordIdsList = listOf("noop-workout-dist-$startTs"))
+        }
     }
 }

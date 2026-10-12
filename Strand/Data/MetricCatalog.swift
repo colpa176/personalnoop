@@ -69,10 +69,10 @@ struct MetricDescriptor: Identifiable, Hashable {
         switch unit {
         case "kg":  return UnitFormatter.massFromKilograms(v, system: system)
         case "°C":
-            // #111: a skin-temp DEVIATION (v < 20 °C) scales without the +32 offset; an absolute reading
-            // (WHOOP export, v >= 20 °C) keeps the full C→F. Every other °C metric is absolute.
-            if isSkinTemp && !VitalBands.isAbsoluteSkinTemp(v) {
-                return UnitFormatter.temperatureDeltaFromCelsius(v, unit: temperature, decimals: decimals)
+            // #111 / #622: skin_temp is bimodal — absolute (import) vs ±deviation (live). Use
+            // SkinTempDisplay so deviation units read "Δ°C" / "Δ°F" and stay signed.
+            if isSkinTemp {
+                return SkinTempDisplay.format(v, fahrenheit: temperature == .fahrenheit, decimals: decimals)
             }
             return UnitFormatter.temperatureFromCelsius(v, unit: temperature, decimals: decimals)
         default:    return isEffort ? format(v, effortScale: effortScale) : format(v)
@@ -227,8 +227,14 @@ enum MetricCatalog {
 
     static func inCategory(_ c: String) -> [MetricDescriptor] { all.filter { $0.category == c } }
 
+    /// Explicit fused view for the rolling-average tile, not a replacement for source-specific entries.
+    static let combinedStepsSource = "noop-combined-steps"
+
     static func metric(key: String, source: String) -> MetricDescriptor? {
-        all.first { $0.key == key && $0.source == source }
+        if key == "steps", source == combinedStepsSource {
+            return d("steps", String(localized: "Steps"), "Effort", "", source, "figure.walk", 0, true)
+        }
+        return all.first { $0.key == key && $0.source == source }
     }
 
     /// The source the Today steps tile taps through to, matching the value it displays. Precedence

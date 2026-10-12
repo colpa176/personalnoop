@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import com.noop.push.PushDao
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
@@ -49,10 +50,16 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         LabMarkerRow::class,
         LiveSessionRow::class,
         PpgWaveformSampleEntity::class,
-        RawImuSampleEntity::class,
         V18AuxSampleEntity::class,
+        AppleStepHour::class,
+        CoachMessageRow::class,
+        LiftExerciseRow::class,
+        LiftProgramRow::class,
+        LiftProgramItemRow::class,
+        LiftSessionRow::class,
+        LiftSetEntity::class,
     ],
-    version = 25,
+    version = 41,
     // #775: ON so Room's KSP processor writes the generated schema (every table's exact `CREATE TABLE`,
     // columns in declaration order with affinity/NOT NULL/default, PK and indices) as JSON. That export
     // is what lets a plain JVM test — no device, no Robolectric — read Android's REAL schema and compare
@@ -65,8 +72,14 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 abstract class WhoopDatabase : RoomDatabase() {
     abstract fun whoopDao(): WhoopDao
 
+    /** Read-only, schema-neutral snapshots for the opt-in self-hosted push worker. */
+    fun pushDao(): PushDao = PushDao(this)
+
     companion object {
         const val DB_NAME = "noop_whoop.db"
+        /** Room schema version — MUST equal the `@Database(version = …)` above. Surfaced in the backup
+         *  manifest (#1410) so an export states its schema. Bump both together on a migration. */
+        const val SCHEMA_VERSION = 41
 
         @Volatile
         private var instance: WhoopDatabase? = null
@@ -121,9 +134,10 @@ abstract class WhoopDatabase : RoomDatabase() {
         }
 
         /**
-         * v4 -> v5: ADDITIVE, adds the `dismissedWorkout` table (#107): a durable marker that keeps a
-         * dismissed auto-detected bout hidden after the engine re-derives it. CREATE TABLE only (no
-         * data touched), so existing workouts/history are untouched. The SQL MUST match Room's
+         * v4 -> v5: ADDITIVE, adds the `dismissedWorkout` table (#107): a durable marker for a rejected
+         * detected bout. Generic detected-row reconciliation is retired, but the table remains part of
+         * grandfathered history and suggestion suppression. CREATE TABLE only (no data touched), so existing
+         * workouts/history are untouched. The SQL MUST match Room's
          * generated schema for the [DismissedWorkout] entity exactly, all three PK columns NOT NULL,
          * composite PRIMARY KEY in declaration order. Guarded by MigrationRoundTripTest like the others.
          */
@@ -540,6 +554,12 @@ abstract class WhoopDatabase : RoomDatabase() {
          * BLOB (2 bytes/sample, little-endian i16, [StreamPersistence.packPpgSamples]) rather than 24 scalar
          * rows.
          *
+         * Retention: `ppgWaveformSample` is CAPPED at [WhoopRepository.PPG_WAVEFORM_RETENTION_ROWS] rolling
+         * rows per device (#1911), the same shape `v18AuxSample` uses. The cap is NEWEST-N ROWS and never an
+         * age cutoff: v26 seconds are spread thin over months for a sporadic wearer, so dropping by
+         * wall-clock age would empty the table for exactly the user a future re-analysis needs most, and a
+         * waveform has no aggregate that survives it. Swift twin: the `v27-ppg-waveform` migration note.
+         *
          * CREATE TABLE only (no existing data touched), so already-offloaded raw streams survive. The SQL MUST
          * match Room's generated schema for [PpgWaveformSampleEntity] exactly: deviceId TEXT NOT NULL, ts
          * INTEGER NOT NULL, samples BLOB NOT NULL (all Kotlin non-null, no SQL DEFAULT), composite PRIMARY KEY
@@ -563,9 +583,8 @@ abstract class WhoopDatabase : RoomDatabase() {
             }
         }
 
-        /** #423: the WHOOP 5/MG raw-IMU offload-capture table. Additive; GRDB twin is `v28-raw-imu`
-         *  (Swift's next slot after v27-ppg-waveform), so the migration COUNTS stay aligned. Column order ==
-         *  [RawImuSampleEntity] field order, matching the GRDB schema's t.column(deviceId/ts/samples). */
+        /** Historical #423 rolling cache. Its bounded, write-only rows are retired by MIGRATION_34_35
+         *  after session-owned IMU moves to the file-backed store. */
         internal val RAW_IMU_MIGRATION_SQL: List<String> = listOf(
             "CREATE TABLE IF NOT EXISTS `rawImuSample` (`deviceId` TEXT NOT NULL, " +
                 "`ts` INTEGER NOT NULL, `samples` BLOB NOT NULL, PRIMARY KEY(`deviceId`, `ts`))",
@@ -691,6 +710,425 @@ abstract class WhoopDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * #1071: record WHICH sensor channel produced each R-R beat. Twin of the Swift GRDB migration
+         * `v32-rr-src-channel`.
+         *
+         * An Oura ring reports the SAME heartbeats on more than one tag, and every one of them decoded to
+         * an R-R row and landed here untagged. Measured over one 488-min sleep window: 61,524 beats stored
+         * where the measured HR curve allows 29,800 (2.06x), and sum(rrMs)/wall-clock = 2.17x. The two are
+         * separable after the fact only by the accident that their quantisation grids differ (0x6E is
+         * `byte * 8`, always a multiple of 8; 0x80 is an 11-bit value on the 1 ms grid), and the 8 ms
+         * stream is ABSENT until SpO2 measurement starts and then tracks its duty cycle exactly — which is
+         * what proves these are two channels rather than accumulated re-syncs.
+         *
+         * The damage is to the VARIABILITY statistics, not the level: a duplicated beat train leaves
+         * meanNN (and so resting HR) correct while RMSSD/SDNN are built entirely from successive
+         * differences and collapse. The app's own `hrv diag` line has been reporting it as
+         * `coverage=2.21 rrIntegrity=crossSecondOverCount` with a non-physiological ~200 ms nocturnal SDNN.
+         *
+         * NOT a de-duplication: both rows are real measurements of the same beat by different optics, and
+         * the second channel is the obvious future cross-check on the first. So nothing is deleted and
+         * nothing is rewritten — the column labels the source and [WhoopDao.rrIntervals] filters at READ.
+         *
+         * Additive and nullable, the MIGRATION_3_4 / MIGRATION_23_24 form: no table rebuild, no row
+         * touched, and NOT part of the primary key, which stays (deviceId, ts, rrMs, seq). Putting it in
+         * the key would make the SAME beat insertable twice under two labels — the double-count being
+         * fixed, arrived at from the other direction.
+         *
+         * Existing rows stay NULL and are still READ (a WHOOP row is legitimately NULL forever — one beat
+         * source, no channel to name), so historical Oura rows keep their old inflated coverage. Not
+         * backfillable: the channel was never recorded.
+         *
+         * Values are [com.noop.protocol.RrSourceChannel.code] (1 green / 2 spo2 / 3 ibiAmplitude), a
+         * DURABLE wire format shared with Swift `RRSourceChannel`. INTEGER rather than a text label
+         * because `rrInterval` is the highest-volume table in the schema (~60k rows a night) and this
+         * column rides every one.
+         *
+         * ALTER TABLE appends the column LAST, matching the entity field order (declared after `ord`), so
+         * a migrated schema and a freshly-created one agree.
+         *
+         * Exposed as [RR_SRC_CHANNEL_MIGRATION_SQL] so a plain-JVM unit test can assert its shape without
+         * an emulator, like the migrations above.
+         */
+        internal val RR_SRC_CHANNEL_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `rrInterval` ADD COLUMN `srcChannel` INTEGER",
+        )
+
+        internal val MIGRATION_25_26 = object : Migration(25, 26) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in RR_SRC_CHANNEL_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * v26 -> v27: ADDITIVE, adds `workout.steps` (nullable INTEGER) so an imported activity file can
+         * carry its OWN step count (#1058). Before this, activity-file steps were stored only as a
+         * whole-day `dailyMetric.steps` row keyed on (deviceId, day), so a SECOND file for the same day
+         * overwrote the first's steps instead of adding. With steps on the session, the day total is
+         * recomputed as SUM over that day's sessions — additive across files, idempotent on re-import.
+         *
+         * Additive and nullable, the MIGRATION_3_4 (`workout.routePolyline`) form: no table rebuild, no row
+         * touched, not part of the primary key. ALTER TABLE appends the column LAST, matching the entity
+         * field order (declared after `routePolyline`), so a migrated schema and a freshly-created one
+         * agree. Byte-parity with Swift WhoopStore `v33-workout-steps`.
+         *
+         * Exposed as [WORKOUT_STEPS_MIGRATION_SQL] so a plain-JVM unit test can assert its shape without an
+         * emulator, like the migrations above.
+         */
+        internal val WORKOUT_STEPS_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `workout` ADD COLUMN `steps` INTEGER",
+        )
+
+        internal val MIGRATION_26_27 = object : Migration(26, 27) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in WORKOUT_STEPS_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * v27 -> v28: ADDITIVE, adds `sleepSession.stagingSparse` (nullable INTEGER) so the Sleep tab can
+         * caption a night staged on SPARSE motion coverage as possibly incomplete (#345 — the "slept 8h,
+         * shows 1h" reports). Boolean? -> INTEGER affinity, matching Swift GRDB's `.integer` twin (no
+         * boolean-affinity divergence). Additive, nullable, not part of the PK; the MIGRATION_3_4 form. The
+         * ALTER appends the column LAST, matching the entity field order (declared after `sleepStateJSON`).
+         * Byte-parity with Swift WhoopStore `v34-sleep-staging-sparse`.
+         */
+        internal val SLEEP_STAGING_SPARSE_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `sleepSession` ADD COLUMN `stagingSparse` INTEGER",
+        )
+
+        internal val MIGRATION_27_28 = object : Migration(27, 28) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in SLEEP_STAGING_SPARSE_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * v28 -> v29: ADDITIVE, adds `rrInterval.tsSuspect` (nullable INTEGER) and MARKS every stored beat
+         * whose ts is in the FUTURE (#1073). An Oura ring's history timestamp is occasionally corrupt and,
+         * before the OuraDriver gate was tightened to "now", converted to a date years ahead (measured on a
+         * live ring: ~1,600 beats stamped 2026→2034) and was banked — lost to the night it was measured in
+         * and queued to poison a future day. The ingest gate now rejects such samples; rows already stored
+         * are marked here and `WhoopDao.rrIntervals` filters them at READ.
+         *
+         * NOT a delete: real beats with a wrong timestamp, kept inspectable/recoverable (the migration rule
+         * warns against window-wide deletes). Additive nullable, the srcChannel (`MIGRATION_25_26`) form:
+         * no table rebuild, no row/key touched, ALTER appends the column LAST to match the entity field
+         * order. `strftime('%s','now')` runs once, at migration time; CAST so `ts` (INTEGER) > it is a
+         * numeric compare. New rows are gated at ingest so never land future, staying NULL. Byte-parity
+         * with Swift WhoopStore `v35-rr-future-quarantine`.
+         *
+         * Exposed as [RR_FUTURE_QUARANTINE_MIGRATION_SQL] so a plain-JVM unit test can assert its shape.
+         */
+        internal val RR_FUTURE_QUARANTINE_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `rrInterval` ADD COLUMN `tsSuspect` INTEGER",
+            "UPDATE `rrInterval` SET `tsSuspect` = 1 WHERE `ts` > CAST(strftime('%s','now') AS INTEGER)",
+        )
+
+        internal val MIGRATION_28_29 = object : Migration(28, 29) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in RR_FUTURE_QUARANTINE_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * #548: drop calibrated SpO₂ from WHOOP registry capabilities (import-only metric).
+         * Data-only UPDATE — no schema change. Twin of Swift WhoopStore `v36-whoop-caps-no-spo2`.
+         * Token strip matches [WhoopLiveCapabilities.stripSpo2Token].
+         */
+        internal val MIGRATION_29_30 = object : Migration(29, 30) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val cursor = db.query(
+                    "SELECT `id`, `capabilities` FROM `pairedDevice` " +
+                        "WHERE `brand` = 'WHOOP' OR `id` = 'my-whoop' OR `id` LIKE 'whoop-%'",
+                )
+                cursor.use { c ->
+                    val idIdx = c.getColumnIndex("id")
+                    val capsIdx = c.getColumnIndex("capabilities")
+                    while (c.moveToNext()) {
+                        val id = c.getString(idIdx)
+                        val encoded = c.getString(capsIdx) ?: continue
+                        val stripped = WhoopLiveCapabilities.stripSpo2Token(encoded)
+                        if (stripped != encoded && stripped.isNotEmpty()) {
+                            db.execSQL(
+                                "UPDATE `pairedDevice` SET `capabilities` = ? WHERE `id` = ?",
+                                arrayOf(stripped, id),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        /**
+         * v30 -> v31: ADDITIVE, adds the `appleStepHour` table, the Android twin of the Swift WhoopStore
+         * `v38-apple-step-hour` migration. Hourly Apple-Health step counts: `appleDaily.steps` flattens a
+         * whole day to one total, so a dead/absent phone for part of a day is invisible; this per-hour
+         * table records exactly which hours had a recording. `ts` is the hour-bucket start (unix seconds),
+         * `steps` the cumulative sum within that hour, composite PK (deviceId, ts) so the hourly upsert is
+         * idempotent.
+         *
+         * CREATE TABLE only (no existing data touched), so already-offloaded raw streams survive. The SQL
+         * MUST match Room's generated schema for [AppleStepHour] exactly: deviceId TEXT NOT NULL, ts
+         * INTEGER NOT NULL, steps INTEGER NOT NULL (all Kotlin non-null, no SQL DEFAULT), composite
+         * PRIMARY KEY (deviceId, ts) in declaration order. SCHEMA-ONLY twin: the Apple-Health IMPORT that
+         * fills it is iOS-only (HealthKit has no Android analogue), so Android carries the table for
+         * `.noopbak` byte-parity but no importer writes it — as it already does for [AppleDaily]. No
+         * destructive fallback (see the class doc). Exposed as [APPLE_STEP_HOUR_MIGRATION_SQL] so a
+         * plain-JVM unit test can pin the shape without Robolectric.
+         */
+        internal val APPLE_STEP_HOUR_MIGRATION_SQL: List<String> = listOf(
+            "CREATE TABLE IF NOT EXISTS `appleStepHour` (`deviceId` TEXT NOT NULL, " +
+                "`ts` INTEGER NOT NULL, `steps` INTEGER NOT NULL, PRIMARY KEY(`deviceId`, `ts`))",
+        )
+
+        internal val MIGRATION_30_31 = object : Migration(30, 31) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in APPLE_STEP_HOUR_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * v31 -> v32: append the nullable five-minute SDNN-index column to `dailyMetric`. Existing rows
+         * remain null: avgHrv is RMSSD for native/Health Connect rows and must never be backfilled as SDNN.
+         */
+        internal val DAILY_SDNN_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `dailyMetric` ADD COLUMN `avgSdnn` REAL",
+        )
+
+        internal val MIGRATION_31_32 = object : Migration(31, 32) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in DAILY_SDNN_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /** #979: append the nullable v26 burst counter beside its persisted waveform. */
+        internal val PPG_BURST_INDEX_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `ppgWaveformSample` ADD COLUMN `burstIndex` INTEGER",
+        )
+
+        internal val MIGRATION_32_33 = object : Migration(32, 33) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in PPG_BURST_INDEX_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * #1636: keep the nightly ABSOLUTE skin temperature beside the deviation derived from it.
+         *
+         * The engine computed this mean on every scoring pass and discarded it the moment `skinTempDevC`
+         * was taken, so the app could show "+0.5 Δ°C" with no way to learn what it moved from — and a
+         * febrile night reads as a small delta where the absolute reads as a fever. Nullable and additive:
+         * existing rows stay null and refill on the next scoring pass, because the value is re-derived
+         * from raw `skinTempSample` rows still on disk. No backfill statement, and therefore no second
+         * derivation that could disagree with the live one.
+         *
+         * Twin of the Swift `v40-daily-skin-temp-absolute` GRDB migration.
+         */
+        internal val DAILY_SKIN_TEMP_ABSOLUTE_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `dailyMetric` ADD COLUMN `skinTempC` REAL",
+        )
+
+        internal val MIGRATION_33_34 = object : Migration(33, 34) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in DAILY_SKIN_TEMP_ABSOLUTE_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        internal val MIGRATION_34_35 = object : Migration(34, 35) {
+            override fun migrate(db: SupportSQLiteDatabase) { db.execSQL("DROP TABLE IF EXISTS `rawImuSample`") }
+        }
+
+        /**
+         * v35 -> v36: ADDITIVE, adds `dailyMetric.sleepHrOnly` (nullable INTEGER) so the Recovery Vitals
+         * card can say why HRV and resting HR are blank on a night staged from heart rate alone, rather
+         * than showing a bare "No data" that is indistinguishable from a failed sync (#1801). Nullable
+         * with no default and no backfill: existing rows stay null and read as "not known", which is
+         * honest — the flag is only knowable from a re-score, and a re-score writes it.
+         *
+         * Exposed as a constant so the migration test can pin its SHAPE without Room-testing, the same
+         * way [DAILY_SKIN_TEMP_ABSOLUTE_MIGRATION_SQL] is.
+         */
+        internal val DAILY_SLEEP_HR_ONLY_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `dailyMetric` ADD COLUMN `sleepHrOnly` INTEGER",
+        )
+
+        internal val MIGRATION_35_36 = object : Migration(35, 36) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in DAILY_SLEEP_HR_ONLY_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * #2019: carry the v26 optical window's ABSOLUTE base code beside its deltas.
+         *
+         * The 25-sample window is one absolute ADC code plus 24 deltas, and only the deltas were read,
+         * so the stored `samples` blob is a derivative and the DC level was thrown away. Nullable and
+         * additive: an existing row keeps its deltas and gets a null base, which is the true statement
+         * about it. A delta series cannot be inverted without the base, so those windows have no
+         * recoverable absolute level and no backfill can invent one.
+         */
+        internal val MIGRATION_37_38 = object : Migration(37, 38) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `ppgWaveformSample` ADD COLUMN `baseCode` INTEGER")
+            }
+        }
+
+        /** PRD-K2: persisted Coach conversation history (schema v37). Swift twin: WhoopStore
+         *  Database.swift `v43-coach-messages` migration. Column order matches [CoachMessageRow]
+         *  field declaration order so Room's generated `CREATE TABLE` shape agrees. */
+        internal val MIGRATION_36_37 = object : Migration(36, 37) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS `coachMessage` (
+                        `id` TEXT NOT NULL,
+                        `role` TEXT NOT NULL,
+                        `text` TEXT NOT NULL,
+                        `provider` TEXT NOT NULL,
+                        `createdAt` INTEGER NOT NULL,
+                        `orderIndex` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )"""
+                )
+            }
+        }
+
+        /** Covers the source-promotion cache witnesses. Twin of GRDB v45-rr-source-index. */
+        internal const val RR_SOURCE_INDEX_SQL =
+            "CREATE INDEX IF NOT EXISTS rrInterval_source_suspect ON rrInterval(srcChannel, tsSuspect)"
+
+        internal val MIGRATION_38_39 = object : Migration(38, 39) {
+            override fun migrate(db: SupportSQLiteDatabase) { db.execSQL(RR_SOURCE_INDEX_SQL) }
+        }
+
+        /**
+         * The in-app strength log. Twin of GRDB `v46-lift-log`; see `LiftEntities.kt` for what these
+         * tables hold and for why the Android half is schema-only for now.
+         *
+         * Column order matches the entity declaration order, which matches GRDB's `create(table:)`,
+         * and `SchemaOracleTest` fails on any of the three drifting apart. Every statement is
+         * `IF NOT EXISTS`, matching the GRDB side: a database that already carries these tables
+         * converges rather than throwing.
+         */
+        internal val LIFT_LOG_SQL: List<String> = listOf(
+            """CREATE TABLE IF NOT EXISTS `liftExercise` (
+                `id` TEXT NOT NULL,
+                `deviceId` TEXT NOT NULL,
+                `name` TEXT NOT NULL,
+                `primaryMuscle` TEXT,
+                `secondaryMuscles` TEXT,
+                `createdAt` INTEGER NOT NULL,
+                `lastUsedTs` INTEGER,
+                PRIMARY KEY(`id`)
+            )""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS `idx_liftExercise_natural` ON `liftExercise` (`deviceId`, `name`)",
+            """CREATE TABLE IF NOT EXISTS `liftProgram` (
+                `id` TEXT NOT NULL,
+                `deviceId` TEXT NOT NULL,
+                `name` TEXT NOT NULL,
+                `note` TEXT,
+                `createdAt` INTEGER NOT NULL,
+                `updatedAt` INTEGER NOT NULL,
+                `archived` INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(`id`)
+            )""",
+            "CREATE INDEX IF NOT EXISTS `idx_liftProgram_device_updatedAt` ON `liftProgram` (`deviceId`, `updatedAt`)",
+            """CREATE TABLE IF NOT EXISTS `liftProgramItem` (
+                `id` TEXT NOT NULL,
+                `deviceId` TEXT NOT NULL,
+                `programId` TEXT NOT NULL,
+                `ord` INTEGER NOT NULL,
+                `exercise` TEXT NOT NULL,
+                `targetSets` INTEGER,
+                `targetRepsLow` INTEGER,
+                `targetRepsHigh` INTEGER,
+                `targetRpe` REAL,
+                `targetWeightKg` REAL,
+                `restSec` INTEGER,
+                `note` TEXT,
+                PRIMARY KEY(`id`)
+            )""",
+            "CREATE INDEX IF NOT EXISTS `idx_liftProgramItem_device` ON `liftProgramItem` (`deviceId`)",
+            "CREATE INDEX IF NOT EXISTS `idx_liftProgramItem_program_ord` ON `liftProgramItem` (`programId`, `ord`)",
+            """CREATE TABLE IF NOT EXISTS `liftSession` (
+                `id` TEXT NOT NULL,
+                `deviceId` TEXT NOT NULL,
+                `startTs` INTEGER NOT NULL,
+                `endTs` INTEGER,
+                `sport` TEXT NOT NULL,
+                `programId` TEXT,
+                `programName` TEXT,
+                `sessionRpe` REAL,
+                `note` TEXT,
+                PRIMARY KEY(`id`)
+            )""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS `idx_liftSession_natural` ON `liftSession` (`deviceId`, `startTs`, `sport`)",
+            """CREATE TABLE IF NOT EXISTS `liftSet` (
+                `id` TEXT NOT NULL,
+                `deviceId` TEXT NOT NULL,
+                `sessionId` TEXT NOT NULL,
+                `ord` INTEGER NOT NULL,
+                `exercise` TEXT NOT NULL,
+                `primaryMuscle` TEXT,
+                `secondaryMuscles` TEXT,
+                `setIndex` INTEGER NOT NULL,
+                `weightKg` REAL,
+                `reps` INTEGER,
+                `rpe` REAL,
+                `isWarmup` INTEGER NOT NULL DEFAULT 0,
+                `startTs` INTEGER,
+                `endTs` INTEGER,
+                `restSec` INTEGER,
+                `note` TEXT,
+                PRIMARY KEY(`id`)
+            )""",
+            "CREATE INDEX IF NOT EXISTS `idx_liftSet_device_exercise` ON `liftSet` (`deviceId`, `exercise`)",
+            "CREATE INDEX IF NOT EXISTS `idx_liftSet_session_ord` ON `liftSet` (`sessionId`, `ord`)",
+        )
+
+        internal val MIGRATION_39_40 = object : Migration(39, 40) {
+            override fun migrate(db: SupportSQLiteDatabase) { LIFT_LOG_SQL.forEach(db::execSQL) }
+        }
+
+        /**
+         * v40 -> v41 (#2371): mark the WHOOP 5 500 ms fill beats already stored, with the rule the insert path
+         * applies to every new batch ([WHOOP5_RR_FILL_FLAG_SQL]). Data only, no schema change, and a MARK in
+         * the v29 form, never a delete. Twin of the GRDB `v47-rr-whoop5-fill`.
+         */
+        internal val MIGRATION_40_41 = object : Migration(40, 41) {
+            override fun migrate(db: SupportSQLiteDatabase) { db.execSQL(WHOOP5_RR_FILL_MIGRATION_SQL) }
+        }
+
+        /**
+         * Every migration the builder registers, as a VALUE rather than an argument list.
+         *
+         * It was previously spelled inline in `addMigrations(...)`, which meant nothing could check it. A
+         * migration could be written, tested and still left out of the chain: the focused tests assert a
+         * migration's SQL and its start/end versions, not that it is registered. Sabotaging the chain —
+         * removing an entry — left the whole suite green, and removing an OLDER entry did too, so this was
+         * a property of the suite rather than of any one change.
+         *
+         * The consequence is bounded but real. There is deliberately no destructive fallback (see the
+         * builder), so a hole makes Room throw on upgrade rather than silently rebuild — a loud failure for
+         * every existing user on the version that ships it, and with `exportSchema=false` nothing catches
+         * it beforehand. Guarded by WhoopDatabaseMigrationChainTest.
+         *
+         * Starts at 2 -> 3 on purpose: v1 predates this regime and has no upgrade path, which is why the
+         * test asserts NO HOLES up to [SCHEMA_VERSION] rather than coverage from 1.
+         */
+        internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
+            MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
+            MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
+            MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
+            MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18,
+            MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21, MIGRATION_21_22,
+            MIGRATION_22_23, MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
+            MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29, MIGRATION_29_30,
+            MIGRATION_30_31, MIGRATION_31_32, MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35, MIGRATION_35_36,
+            MIGRATION_36_37, MIGRATION_37_38, MIGRATION_38_39, MIGRATION_39_40, MIGRATION_40_41,
+        )
+
         private fun build(appContext: Context): WhoopDatabase =
             Room.databaseBuilder(appContext, WhoopDatabase::class.java, DB_NAME)
                 // #1014: replace ONLY the corruption handling of the default open-helper. The
@@ -701,19 +1139,13 @@ abstract class WhoopDatabase : RoomDatabase() {
                 // Real additive migration, NO destructive fallback (see the class doc): with
                 // exportSchema=false a silent rebuild would lose already-acked, non-resendable strap
                 // history on any schema mismatch. Room throws loudly instead; CI guards the SQL.
-                .addMigrations(
-                    MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
-                    MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
-                    MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                    MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18,
-                    MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21, MIGRATION_21_22,
-                    MIGRATION_22_23, MIGRATION_23_24, MIGRATION_24_25,
-                )
+                .addMigrations(*ALL_MIGRATIONS)
                 // #1037: a FRESH install builds the schema straight at the current version and runs NO
                 // migrations, so the MIGRATION_7_8 "my-whoop" registry seed never fires and the WHOOP,
                 // though paired and streaming fine, never appears in the Devices list. Seed the canonical
                 // row on create too (same idempotent INSERT OR IGNORE as the migration) so a first-ever
                 // install still lists its WHOOP. iOS/GRDB re-runs migrations on a fresh DB, so it never hit this.
+                // #548: no calibrated SpO₂ in the seed (import-only).
                 .addCallback(object : RoomDatabase.Callback() {
                     override fun onCreate(db: SupportSQLiteDatabase) {
                         val now = System.currentTimeMillis() / 1000
@@ -722,7 +1154,7 @@ abstract class WhoopDatabase : RoomDatabase() {
                                 "(`id`, `brand`, `model`, `nickname`, `sourceKind`, `capabilities`, " +
                                 "`status`, `addedAt`, `lastSeenAt`) VALUES " +
                                 "('my-whoop', 'WHOOP', 'WHOOP', NULL, 'liveBLE', " +
-                                "'hr,hrv,spo2,skinTemp,sleep,strainLoad', 'active', $now, $now)",
+                                "'${WhoopLiveCapabilities.encoded("WHOOP")}', 'active', $now, $now)",
                         )
                     }
                 })

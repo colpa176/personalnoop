@@ -41,15 +41,20 @@ public struct LabMarkerCsvRow: Sendable, Equatable {
     public var unit: String
     /// True when the marker name didn't match the catalog and imported as a custom marker.
     public var isCustomMarker: Bool
+    /// Optional free-text note carried VERBATIM from the source (e.g. a vendor's own status
+    /// column, source-attributed). nil for the generic (date,marker,value,unit) importer, which
+    /// never annotates. Maps to `LabMarker.note`.
+    public var note: String?
 
     public init(markerKey: String, category: LabMarkerCategory, day: String,
-                value: Double, unit: String, isCustomMarker: Bool) {
+                value: Double, unit: String, isCustomMarker: Bool, note: String? = nil) {
         self.markerKey = markerKey
         self.category = category
         self.day = day
         self.value = value
         self.unit = unit
         self.isCustomMarker = isCustomMarker
+        self.note = note
     }
 }
 
@@ -71,9 +76,14 @@ public struct LabMarkerCsvResult: Sendable, Equatable {
     public var truncated: Bool
     /// True when the file was rejected outright for exceeding the byte cap.
     public var fileTooLarge: Bool
+    /// Rows a vendor export marked as NOT MEASURED (e.g. WHOOP's "--" / "No Data Available").
+    /// Counted SEPARATELY from `skippedRows` so a clean import of a normal export doesn't look
+    /// broken. Always 0 for the generic importer.
+    public var notMeasured: Int
 
     public init(rows: [LabMarkerCsvRow], skippedRows: Int, customMarkerKeys: [String],
-                earliestDay: String?, latestDay: String?, truncated: Bool, fileTooLarge: Bool) {
+                earliestDay: String?, latestDay: String?, truncated: Bool, fileTooLarge: Bool,
+                notMeasured: Int = 0) {
         self.rows = rows
         self.skippedRows = skippedRows
         self.customMarkerKeys = customMarkerKeys
@@ -81,6 +91,7 @@ public struct LabMarkerCsvResult: Sendable, Equatable {
         self.latestDay = latestDay
         self.truncated = truncated
         self.fileTooLarge = fileTooLarge
+        self.notMeasured = notMeasured
     }
 
     /// Number of readings imported.
@@ -332,14 +343,32 @@ public enum LabMarkerCsvImport {
 
     /// The `custom_<slug>` key for an unrecognised marker name. MUST stay byte-identical
     /// to the manual editor's `MarkerUnits.slug` (Strand/Screens/MarkerEditorView.swift)
-    /// so a CSV custom marker folds onto a hand-added one. Returns "" for a name with no
-    /// usable characters.
-    static func customKey(_ name: String) -> String {
-        let lowered = name.trimmingCharacters(in: .whitespaces).lowercased()
-        let mapped = lowered.map { ch -> Character in
-            (ch.isLetter || ch.isNumber) ? ch : "_"
+    /// so a CSV custom marker folds onto a hand-added one (the editor delegates here). Returns
+    /// "" for a name with no usable characters.
+    ///
+    /// "%" becomes its own `pct` token: a lab export lists a white-cell differential as both a
+    /// count and a percentage ("LYMPH" 1.9 and "LYMPH %" 31.2), and mapping "%" to "_" like any
+    /// other punctuation gave both `custom_lymph`, so the second row of the day overwrote the
+    /// first. The token is joined to a letter/digit neighbour by one "_" (a non-alphanumeric
+    /// neighbour already maps to "_"), so "LYMPH %", "LYMPH%" and "Lymph (%)" all give
+    /// `custom_lymph_pct`. Names without "%" keep the keys they always had. Twin: `customKey`
+    /// in android/app/src/main/java/com/noop/ingest/LabMarkerCsvImport.kt.
+    public static func customKey(_ name: String) -> String {
+        let lowered = Array(name.precomposedStringWithCanonicalMapping
+            .trimmingCharacters(in: .whitespaces).lowercased())
+        // Kotlin twin: `LabMarkerCsvImport.isWordChar`.
+        func isWordChar(_ ch: Character) -> Bool { ch.isLetter || ch.isNumber }
+        var mapped = ""
+        for (i, ch) in lowered.enumerated() {
+            if ch == "%" {
+                if i > 0, isWordChar(lowered[i - 1]) { mapped += "_" }
+                mapped += "pct"
+                if i + 1 < lowered.count, isWordChar(lowered[i + 1]) { mapped += "_" }
+            } else {
+                mapped.append(isWordChar(ch) ? ch : "_")
+            }
         }
-        let collapsed = String(mapped).replacingOccurrences(of: "__", with: "_")
+        let collapsed = mapped.replacingOccurrences(of: "__", with: "_")
         let trimmed = collapsed.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
         guard !trimmed.isEmpty else { return "" }
         return "custom_" + trimmed
@@ -376,8 +405,9 @@ public enum LabMarkerCsvImport {
     }
 
     /// Parse one bare numeric token with the comma rules — the token must be exactly
-    /// a number, nothing more.
-    private static func numberToken(_ t: String) -> Double? {
+    /// a number, nothing more. `internal` so the WHOOP biomarker parser can split a packed
+    /// "value unit" cell with the same grammar.
+    static func numberToken(_ t: String) -> Double? {
         if let d = finiteDouble(t) { return d }
         // One decimal comma ("5,2" / "12,345" is ambiguous: 3 digits after a single
         // comma reads as a thousands group, anything else as a decimal comma).
@@ -460,7 +490,8 @@ public enum LabMarkerCsvImport {
 
     /// "yyyy-MM-dd" when the components form a real calendar date, else nil.
     /// Pure math (leap-aware), no Foundation calendar — byte-identical to the Kotlin twin.
-    private static func validDay(year: Int, month: Int, day: Int) -> String? {
+    /// `internal` so the WHOOP biomarker parser can build a date from an M/D/YY (2-digit-year) cell.
+    static func validDay(year: Int, month: Int, day: Int) -> String? {
         guard (1...12).contains(month), day >= 1, day <= daysInMonth(year, month) else { return nil }
         return String(format: "%04d-%02d-%02d", year, month, day)
     }

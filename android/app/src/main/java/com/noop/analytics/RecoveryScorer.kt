@@ -127,141 +127,130 @@ object RecoveryScorer {
     /** Sleep-performance scale (±2 z spans the normal range). */
     const val sleepPerfScale: Double = 0.12
 
-    /** Rolling-mean HR window (seconds) for the resting-HR estimate. */
-    const val restingHRWindowS: Int = 5 * 60
+    // ───────────────────────────────────────────────────────────────────────────────────────────
+    // Parasympathetic-saturation guard (Charge): DETECTED AND LOGGED, NOT APPLIED
+    // Kotlin twin of the Swift guard in StrandAnalytics/RecoveryScorer.swift.
+    // ───────────────────────────────────────────────────────────────────────────────────────────
+    //
+    // A low nightly HRV is normally a fatigue signal, so the HRV term (wHRV = 0.55, the dominant
+    // driver) pulls Charge DOWN. There is a CANDIDATE benign pattern the raw z-score may mis-read:
+    // parasympathetic (vagal) saturation. In a very fit or very relaxed state the RMSSD-HRV response
+    // can saturate and read LOW while resting HR reads LOW too, and the two DECOUPLE. On such a night
+    // the dominant HRV penalty tanks Charge even though the person is well rested.
+    //
+    // The candidate discriminator is the SIGN of the resting-HR term versus the HRV term. recovery()
+    // builds the HRV term as (hrv - mu)/sigma (NEGATIVE when HRV is below baseline = the penalty) and
+    // the RHR term as (mu - rhr)/sigma (POSITIVE when resting HR is below baseline = recovery-good). In
+    // a normally-coupled autonomic response a low HRV travels WITH a HIGH resting HR (sympathetic
+    // drive), so both terms point the SAME way (down). When instead the HRV term points "bad" while the
+    // resting-HR term points "good", the expected HRV<->RHR coupling has broken.
+    //
+    // ── WHY THE EASING IS COMPUTED BUT DELIBERATELY NOT APPLIED ─────────────────────────────────
+    //
+    // This code DETECTS the signature and REPORTS the easing it would apply, but recovery() does NOT
+    // consume it: the Charge number is byte-identical to pre-guard behaviour. Two reasons, both
+    // currently unresolved:
+    //
+    //   1. VALIDATION GAP. The real-data validation behind this guard recorded ZERO firings over ~2
+    //      weeks. That is evidence the gate does not OVER-fire; it is NOT evidence that the easing is
+    //      the right size, or right at all, on a real saturation night, because no real saturation
+    //      night was ever observed. Every night that would actually move Charge is covered by
+    //      synthetic fixtures only (see RecoverySaturationGuardTest).
+    //   2. CONTESTED PREMISE. Low HRV + low resting HR is ALSO a reported signature of parasympathetic
+    //      (non-functional) OVERREACHING, which is genuinely maladaptive. From the HRV/RHR pair alone,
+    //      benign saturation and overreaching are not distinguishable, and they want OPPOSITE Charge
+    //      corrections. Easing the penalty on an overreaching night would hide a real problem.
+    //
+    // So the guard ships INSTRUMENT-FIRST: detection is live and surfaces in the Charge trace (the
+    // "charge saturation active ... wouldRaiseCharge=N" line) and in the RecoveryDrivers HRV verdict,
+    // so real low-HRV + low-RHR nights accumulate and can be checked against ground truth. Enabling the
+    // easing is a follow-up gated on confirmed real firings, not on the synthetic fixtures.
+    //
+    // TO ENABLE LATER: feed [ParasympatheticSaturation.easedHrvZ] into the HRV term at the marked call
+    // site in recovery(), and flip the tests that currently pin the score as UNCHANGED.
+
+    /** Personal-sigma units BOTH the low-HRV arm and the low-resting-HR arm must clear before the guard
+     *  engages. 0.5 sigma keeps it OFF marginal / noise nights. Mirrors Swift `RecoveryScorer.satEnterZ`. */
+    const val satEnterZ: Double = 0.5
+
+    /** Personal-sigma units at which the saturation signal reaches FULL strength; between [satEnterZ] and
+     *  this the easing ramps linearly from 0 to [satMaxDampFraction]. Mirrors Swift `satFullZ`. */
+    const val satFullZ: Double = 1.5
+
+    /** Maximum fraction of the low-HRV penalty the easing would ever credit back. 0.5 = at most HALF the
+     *  penalty would be eased, so a genuinely low-HRV night would NEVER be scored as if HRV sat at baseline.
+     *  The core conservatism knob for when the easing is enabled; today it only bounds the reported would-be
+     *  delta. Mirrors Swift `satMaxDampFraction`. */
+    const val satMaxDampFraction: Double = 0.5
 
     /**
-     * Minimum HR samples a 5-min bin must hold before its mean is eligible to WIN the resting
-     * floor (#686). A thinly-populated bin — at the limit a single lone beat — lets one artifact
-     * (a dropout, a decode glitch) become the bin "mean" and win the night's minimum, dragging
-     * resting HR implausibly low. Requiring a handful of samples means the floor is a genuine
-     * sustained dip, not a one-sample fluke. Worn nights stream ~1 Hz HR so a real 5-min bin holds
-     * hundreds of samples and clears this trivially; only sparse/edge bins fall below it. Does NOT
-     * change the floor DEFINITION — still the min of 5-min bin means — only stops an under-sampled
-     * artifact bin from being that min. Mirrors Swift `RecoveryScorer.restingHRMinBinSamples`.
+     * Outcome of the parasympathetic-saturation check for one night. Mirrors Swift
+     * `RecoveryScorer.ParasympatheticSaturation`.
+     *
+     * COUNTERFACTUAL, not applied: [easedHrvZ] / [dampFraction] describe the easing this guard WOULD
+     * apply. recovery() does not consume them (see the header above for why). Today they exist to be
+     * logged by the Charge trace and to flag the RecoveryDrivers HRV verdict, so that real firings can
+     * be counted before the easing is ever allowed to move the score.
+     *
+     * @property easedHrvZ the HRV z the easing WOULD use: the input z shrunk toward 0 (never past it),
+     *   lightening the low-HRV penalty. Equals the input hrvZ when the guard is inactive. NOT fed to
+     *   the score.
+     * @property active true iff the saturation regime was detected, i.e. the guard WOULD have eased the
+     *   penalty. The Charge number is the same either way.
+     * @property dampFraction fraction of the HRV penalty the easing WOULD credit back, in
+     *   [0, satMaxDampFraction]. 0 when inactive.
      */
-    const val restingHRMinBinSamples: Int = 5
+    data class ParasympatheticSaturation(
+        val easedHrvZ: Double,
+        val active: Boolean,
+        val dampFraction: Double,
+    )
 
     /**
-     * Physiological resting-HR floor (bpm) below which a bin mean is rejected as a dropout artifact
-     * (#686), never the resting floor. An adult's true sleeping resting HR essentially never sits
-     * below this; a 5-min mean that does is a run of dropout/decode-zero beats, not a real cardiac
-     * dip. 25 bpm clears even deeply-bradycardic trained athletes (resting HRs in the low 30s) with
-     * margin while rejecting the implausible artifact range. Mirrors Swift
-     * `RecoveryScorer.restingHRMinPlausibleBpm`.
+     * Detect parasympathetic saturation from tonight's HRV and resting-HR z-scores and compute the
+     * easing that WOULD be applied to the low-HRV penalty (shrinking its negative z toward 0). Mirrors
+     * Swift `RecoveryScorer.parasympatheticSaturation` byte-for-byte.
+     *
+     * This is pure detection + a counterfactual. It has no effect on Charge: recovery() scores the raw
+     * HRV z regardless of what this returns. See the header above for the validation gap and the
+     * contested premise that keep the easing switched off.
+     *
+     * @param hrvZ the HRV term as recovery() builds it, (hrv - mu)/sigma. Higher is better; a NEGATIVE
+     *   value means HRV is below baseline (the penalty direction).
+     * @param rhrZ the resting-HR term as recovery() builds it, (mu - rhr)/sigma. Higher is better; a
+     *   POSITIVE value means resting HR is below baseline (the recovery-good direction). null when there
+     *   is no resting-HR baseline — with nothing to corroborate the low HRV, the guard never fires.
      */
-    const val restingHRMinPlausibleBpm: Double = 25.0
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Resting HR
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Lowest sustained HR during the in-bed window (bpm, rounded), or null.
-     *
-     * "Sustained" = the minimum of 5-minute non-overlapping bin means of the HR
-     * samples whose ts ∈ [start, end]. Rejects single-beat dips while capturing
-     * the night's true floor. Returns null when there are no HR samples in window.
-     *
-     * Artifact hardening (#686): a bin may only WIN the floor when it is BOTH well-populated
-     * (≥ [restingHRMinBinSamples], so one lone artifact beat can't be a bin "mean") AND
-     * physiologically plausible (mean ≥ [restingHRMinPlausibleBpm], rejecting dropout-driven
-     * sub-physiological dips). The floor DEFINITION is unchanged — still the minimum of the 5-min
-     * bin means — only artifact bins are barred from being that minimum. If no bin qualifies (a
-     * wholly sparse/degenerate window), fall back to the lowest of ALL bin means, else the
-     * all-sample mean, preserving the never-null-on-data behaviour. Mirrors Swift `restingHR`.
-     *
-     * @param start / @param end window bounds, unix SECONDS (Long).
-     */
-    fun restingHR(hr: List<HrSample>, start: Long, end: Long): Int? {
-        val seg = hr.filter { it.ts in start..end }
-        if (seg.isEmpty()) return null
-
-        val means = ArrayList<Double>()      // every bin mean (legacy floor, the fallback)
-        val qualified = ArrayList<Double>()  // bins eligible to WIN the floor (#686)
-        var t = start
-        while (t < end) {
-            val binEnd = t + restingHRWindowS
-            val win = seg.filter { it.ts >= t && it.ts < binEnd }
-            if (win.isNotEmpty()) {
-                val mean = win.sumOf { it.bpm }.toDouble() / win.size.toDouble()
-                means.add(mean)
-                // A bin wins the floor only if it is well-populated AND physiologically plausible —
-                // a thin (single-artifact) or sub-physiological (dropout) bin can't be the minimum.
-                if (win.size >= restingHRMinBinSamples && mean >= restingHRMinPlausibleBpm) {
-                    qualified.add(mean)
-                }
-            }
-            t += restingHRWindowS
+    internal fun parasympatheticSaturation(hrvZ: Double, rhrZ: Double?): ParasympatheticSaturation {
+        // Without a resting-HR term there is nothing to corroborate the low HRV: benign saturation and
+        // real fatigue are indistinguishable from HRV alone, so report no saturation.
+        if (rhrZ == null) {
+            return ParasympatheticSaturation(easedHrvZ = hrvZ, active = false, dampFraction = 0.0)
         }
-        val floor: Double = qualified.minOrNull()
-            ?: means.minOrNull()
-            ?: (seg.sumOf { it.bpm }.toDouble() / seg.size.toDouble())
-        return floor.roundToInt()
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Recovery Index (overnight HR-decline slope)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Minimum 5-minute bins ([restingHR]'s SAME binning) required before a slope is trusted —
-     * below this, too little of the night has elapsed to fit a trend, and a 1-2-point
-     * regression is noise, not a night-long pattern. 6 bins = 30 minutes of binned coverage,
-     * a deliberately low floor so a short/partial night still gets a number rather than a
-     * routine null. Mirrors Swift `RecoveryScorer.recoveryIndexMinBins`.
-     */
-    const val recoveryIndexMinBins: Int = 6
-
-    /**
-     * Overnight resting-HR DECLINE slope (bpm/hour) across the in-bed window — the "Recovery
-     * Index" component of Oura's Readiness that Charge lacked (it previously only read the
-     * overnight FLOOR via [restingHR] above, never the trend that reaches it).
-     *
-     * Computed as the least-squares slope of the SAME non-overlapping 5-minute HR bin means
-     * [restingHR] uses ([restingHRWindowS]) against each bin's midpoint time (hours from
-     * `start`). NEGATIVE = declining (HR falling through the night — the physiologically
-     * expected, good pattern); POSITIVE = rising (restlessness, illness, alcohol, a late
-     * stimulant). Returns null when fewer than [recoveryIndexMinBins] bins have data (too
-     * little of the window to fit a trend) or there are no samples at all — it never
-     * fabricates a slope from a sliver of the night. Mirrors Swift `recoveryIndexSlope`.
-     *
-     * @param start / @param end window bounds, unix SECONDS (Long).
-     */
-    fun recoveryIndexSlope(hr: List<HrSample>, start: Long, end: Long): Double? {
-        val seg = hr.filter { it.ts in start..end }
-        if (seg.isEmpty()) return null
-
-        // Same non-overlapping 5-minute binning as restingHR: both read the identical
-        // underlying series, one as a floor, one as a trend across it.
-        val points = ArrayList<Pair<Double, Double>>() // (tHours, meanBpm)
-        var t = start
-        while (t < end) {
-            val binEnd = t + restingHRWindowS
-            val win = seg.filter { it.ts >= t && it.ts < binEnd }
-            if (win.isNotEmpty()) {
-                val mean = win.sumOf { it.bpm }.toDouble() / win.size.toDouble()
-                val midpointS = (t - start).toDouble() + restingHRWindowS / 2.0
-                points.add((midpointS / 3600.0) to mean)
-            }
-            t += restingHRWindowS
+        // Saturation SIGNATURE, in personal-sigma units:
+        //   hrvLow > 0 <=> HRV below baseline (the penalty we might ease)
+        //   rhrLow > 0 <=> resting HR below baseline (the corroborating "also low" signal)
+        // Both must clear satEnterZ, so only a clear low-HRV + low-RHR decoupling is ever eased and a
+        // low-HRV + HIGH-RHR fatigue night (rhrLow < 0) can never qualify.
+        val hrvLow = -hrvZ
+        val rhrLow = rhrZ
+        if (hrvLow < satEnterZ || rhrLow < satEnterZ) {
+            return ParasympatheticSaturation(easedHrvZ = hrvZ, active = false, dampFraction = 0.0)
         }
-        if (points.size < recoveryIndexMinBins) return null
-
-        // Least-squares slope: Σ((t−t̄)(y−ȳ)) / Σ((t−t̄)²), bpm per hour.
-        val n = points.size.toDouble()
-        val tBar = points.sumOf { it.first } / n
-        val yBar = points.sumOf { it.second } / n
-        var num = 0.0
-        var den = 0.0
-        for ((tHours, meanBpm) in points) {
-            val dt = tHours - tBar
-            num += dt * (meanBpm - yBar)
-            den += dt * dt
-        }
-        // Degenerate (all bins at the same instant): no time spread to fit against.
-        if (den <= 1e-9) return 0.0
-        return num / den
+        // Strength is driven by the WEAKER of the two arms (min), normalized from the entry gate to
+        // satFullZ and clamped to [0, 1]. Using the weaker arm is deliberately conservative.
+        val couplingStrength = min(hrvLow, rhrLow)
+        val s = max(0.0, min(1.0, (couplingStrength - satEnterZ) / (satFullZ - satEnterZ)))
+        val dampFraction = satMaxDampFraction * s
+        // The easing this WOULD apply: shrink the (negative) HRV z toward 0. (1 - dampFraction) stays
+        // in [1 - satMaxDampFraction, 1], so the penalty would only ever be REDUCED — never removed,
+        // never sign-flipped into a bonus. Computed for reporting only; recovery() ignores it.
+        val easedHrvZ = hrvZ * (1.0 - dampFraction)
+        return ParasympatheticSaturation(
+            easedHrvZ = easedHrvZ,
+            active = dampFraction > 0.0,
+            dampFraction = dampFraction,
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -303,8 +292,9 @@ object RecoveryScorer {
      * @param rhr tonight's resting HR (bpm).
      * @param resp tonight's respiration (raw or calibrated — z is scale-invariant);
      *   null drops the term.
-     * @param hrvBaseline HRV baseline (required for a score).
-     * @param rhrBaseline resting-HR baseline; null drops the RHR term.
+     * @param hrvBaseline HRV baseline (required for a score — null returns null).
+     * @param rhrBaseline resting-HR baseline; null drops the RHR term. On the BaselineState overload an
+     *   UNUSABLE baseline (#1988) is treated as null, so a synthetic cold-start midpoint never scores.
      * @param respBaseline respiration baseline; null drops the resp term.
      * @param sleepPerf sleep-performance proxy (Rest composite 0..1, or efficiency
      *   0..1 for legacy callers); null drops the term.
@@ -314,8 +304,8 @@ object RecoveryScorer {
      *   identical to the pre-skin-temp model).
      * @param hrvBaselineUsable whether the HRV baseline has enough nights
      *   (BaselineState.usable). When false, returns null (cold-start).
-     * @param recoveryIndexSlope overnight resting-HR DECLINE slope (bpm/hour, from
-     *   [recoveryIndexSlope]). Negative (declining) supports recovery; positive (rising)
+     * @param recoveryIndexSlope overnight resting-HR DECLINE slope (bpm/hour), supplied by the
+     *   caller. Negative (declining) supports recovery; positive (rising)
      *   limits it, weight [wRecoveryIndex]. null (the default) drops the term and the
      *   weights renormalize, so the no-slope score is IDENTICAL to before this parameter
      *   existed.
@@ -345,13 +335,22 @@ object RecoveryScorer {
         // Cold-start gate: HRV is the dominant driver; if its baseline isn't
         // usable, refuse to score (more honest than a fabricated value).
         if (!hrvBaselineUsable) return null
+        // Required-driver gate: the HRV baseline is REQUIRED for a score. It is nullable here only
+        // for callers that may not have one yet, and hrvBaselineUsable defaults to true, so without
+        // this an absent baseline let any other optional term (sleepPerf alone, say) produce a
+        // Charge score carrying no HRV term at all.
+        val hrvB = hrvBaseline ?: return null
 
         val terms = ArrayList<Pair<Double, Double>>() // (z, weight)
 
         // HRV term: higher is better.
-        hrvBaseline?.let { b ->
-            terms.add(zScore(hrv, b.mean, b.spread) to wHRV)
-        }
+        //
+        // INSTRUMENT-FIRST CALL SITE for the parasympathetic-saturation guard. The guard is NOT applied
+        // here: this term is the RAW z, so Charge is byte-identical to pre-guard behaviour. The
+        // signature is still detected and reported out-of-band (Charge trace + RecoveryDrivers verdict)
+        // so real firings can be counted first. See the header above for why, and swap in
+        // parasympatheticSaturation(hrvZ, rhrZ).easedHrvZ here to enable it.
+        terms.add(zScore(hrv, hrvB.mean, hrvB.spread) to wHRV)
         // RHR term: lower is better → (μ − x) / σ.
         rhrBaseline?.let { b ->
             terms.add(zScore(b.mean, rhr, b.spread) to wRHR)
@@ -389,13 +388,25 @@ object RecoveryScorer {
         if (totalWeight <= 0.0) return null
 
         val z = terms.sumOf { it.first * it.second } / totalWeight
-        val score = 100.0 / (1.0 + exp(-logisticK * (z - logisticZ0)))
+        return logisticScore(z)
+    }
+
+    /**
+     * The Charge logistic: weighted-composite z -> 0-100, clamped. Factored out of recovery() so the
+     * trace's saturation counterfactual ("what Charge WOULD read if the easing were applied") runs
+     * through the EXACT same curve the real score does and cannot drift from it. Same expression as
+     * before it was extracted, so every existing score is unchanged. Mirrors Swift
+     * `RecoveryScorer.logisticScore(compositeZ:)`.
+     */
+    internal fun logisticScore(compositeZ: Double): Double {
+        val score = 100.0 / (1.0 + exp(-logisticK * (compositeZ - logisticZ0)))
         return max(0.0, min(100.0, score))
     }
 
     /**
-     * Convenience overload taking [BaselineState] directly. Enforces the cold-start
-     * gate using `hrvBaseline.usable`. Mirrors the Swift `recovery(...)` overload.
+     * Convenience overload taking [BaselineState] directly. HRV must be usable for a score;
+     * unusable optional personal baselines are omitted before weight renormalization.
+     * Mirrors the Swift `recovery(...)` overload.
      */
     fun recovery(
         hrv: Double,
@@ -414,13 +425,19 @@ object RecoveryScorer {
         rhr = rhr,
         resp = resp,
         hrvBaseline = DriverBaseline(hrvBaseline),
-        rhrBaseline = rhrBaseline?.let { DriverBaseline(it) },
-        respBaseline = respBaseline?.let { DriverBaseline(it) },
+        // #1988: an UNUSABLE resting-HR baseline is treated as absent. foldHistory returns the
+        // config's synthetic midpoint (about 75 bpm) for an empty or all-implausible history, which is
+        // nobody's resting HR, so scoring against it moved Charge on a baseline the user never had.
+        // Gated here, in the one place every BaselineState caller passes through, rather than at each
+        // call site: the headline and the driver breakdown then agree by construction. Mirrors how
+        // hrvBaselineUsable is already derived below.
+        rhrBaseline = rhrBaseline?.takeIf { it.usable }?.let { DriverBaseline(it) },
+        respBaseline = respBaseline?.takeIf { it.usable }?.let { DriverBaseline(it) },
         sleepPerf = sleepPerf,
         skinTempDev = skinTempDev,
         hrvBaselineUsable = hrvBaseline.usable,
         recoveryIndexSlope = recoveryIndexSlope,
-        effortBaseline = effortBaseline?.let { DriverBaseline(it) },
+        effortBaseline = effortBaseline?.takeIf { it.usable }?.let { DriverBaseline(it) },
         priorDayEffort = priorDayEffort,
     )
 }

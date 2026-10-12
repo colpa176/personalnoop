@@ -8,19 +8,20 @@ import kotlin.math.roundToInt
 //
 // NOOP stores EVERYTHING in SI (km, kg, cm, °C) — the importers normalise on the way in, so this is a
 // purely cosmetic, display-only layer. There is no data migration and nothing in Room changes when the
-// user flips this. One Metric/Imperial switch for length+mass with a SEPARATE temperature override,
-// because plenty of people think in kg/cm but still read body temperature in °F (and vice versa).
+// user flips this. Body measurements and exercise distance each have their own Metric/Imperial choice,
+// with a SEPARATE temperature override, because regional conventions commonly mix pounds with kilometres
+// (or kg/cm with °F).
 // Default is Metric — most of the world, and it matches what we store.
 //
 // Persisted via NoopPrefs (SharedPreferences), the same mechanism every other Android preference uses.
 // This mirrors the macOS Units.swift + @AppStorage side exactly.
 
-/** Length+mass unit system. Temperature has its own override (see [UnitPrefs.temperature]). */
+/** A Metric/Imperial display choice. Body measurements and exercise distance persist separate values. */
 enum class UnitSystem(val raw: String) {
     METRIC("metric"),
     IMPERIAL("imperial");
 
-    /** Pairs temperature with the length/mass choice when no explicit override is set. */
+    /** Pairs temperature with the body-measurement choice when no explicit override is set. */
     val temperatureMatching: TemperatureUnit
         get() = if (this == IMPERIAL) TemperatureUnit.FAHRENHEIT else TemperatureUnit.CELSIUS
 
@@ -87,7 +88,19 @@ enum class HrvWindow(val raw: String) {
     /** RMSSD averaged over every 5-min window of the night (NOOP's long-standing value). */
     WHOLE_NIGHT("whole"),
 
-    /** RMSSD over DEEP (slow-wave) sleep windows only — comparable to WHOOP's reading. */
+    /**
+     * RMSSD over DEEP (slow-wave) sleep windows only — the window WHOOP samples.
+     *
+     * "Comparable to WHOOP" describes the METHOD, not the accuracy of the resulting number: the deep
+     * windows come from NOOP's own stager, not the strap. `Tools/SleepPSG` scores that stager against
+     * PSG truth over 31 subjects / 26 773 epochs and measures deep at 18.94 % predicted vs 13.76 %
+     * truth — a +5.18 pp bias, roughly 38 % more deep epochs than exist, at four-class kappa 0.356.
+     * An over-inclusive deep window pulls this value back toward the whole-night mean, which is the
+     * one thing the setting exists not to be.
+     *
+     * So this stays opt-in and WHOLE_NIGHT stays the default. #1008 tracks moving it, gated on that
+     * bias coming down; re-run the benchmark before changing the default rather than assuming it has.
+     */
     DEEP_SLEEP("deep");
 
     companion object {
@@ -97,16 +110,75 @@ enum class HrvWindow(val raw: String) {
 }
 
 /**
- * Reads the two unit preferences from [NoopPrefs] and resolves the "match the system" default for
- * temperature. SharedPreferences isn't reactive, so Compose screens read these once into remembered
- * state (exactly like the other toggles) and re-read on a recomposition triggered by the Settings write.
+ * How the Sleep tab draws the night's stage timeline (#sleep-chart-style). Display-only — no metric or
+ * stored value changes; it only picks which chart renders. Default [CLASSIC] so nobody's view changes
+ * unless they opt in.
+ */
+enum class SleepChartStyle(val raw: String) {
+    /** The long-standing per-stage-rows timeline (Awake/Light/Deep/REM each on their own track). */
+    CLASSIC("classic"),
+
+    /** A single stepped hypnogram FILLED to the baseline, in NOOP's sleep colours. Needs the night's real
+     *  timestamped segments, else falls back to CLASSIC. */
+    FILLED("filled"),
+
+    /** The same filled chart drawn in Garmin's blue/magenta ramp. */
+    GARMIN_FILLED("garminFilled"),
+
+    /** The stepped chart drawn as a slim RIBBON (a uniform band at each stage level, not filled to the
+     *  baseline), in Oura's cream/blue ramp. */
+    RIBBON("ribbon");
+
+    /** Whether the stepped chart fills to the baseline (Fill / Garmin Fill) or draws a slim ribbon. */
+    val isFilled: Boolean get() = this == FILLED || this == GARMIN_FILLED
+
+    /** The stage-colour ramp this style draws with. */
+    val stagePalette: SleepStagePalette
+        get() = when (this) {
+            CLASSIC, FILLED -> SleepStagePalette.NOOP
+            GARMIN_FILLED -> SleepStagePalette.GARMIN
+            RIBBON -> SleepStagePalette.OURA
+        }
+
+    companion object {
+        fun fromRaw(raw: String?): SleepChartStyle = entries.firstOrNull { it.raw == raw } ?: CLASSIC
+    }
+}
+
+/** Which stage-colour ramp a sleep chart draws with. Twin of the Swift `SleepStagePalette`. */
+enum class SleepStagePalette { NOOP, OURA, GARMIN }
+
+/**
+ * Reads the display preferences and resolves backwards-compatible fallbacks. SharedPreferences isn't
+ * reactive, so Compose screens read these once into remembered state (exactly like other toggles).
  */
 object UnitPrefs {
-    /** The length/mass system (default Metric). */
+    /** Body measurement system (default Metric); retains the original combined preference key. */
     fun system(context: Context): UnitSystem =
         UnitSystem.fromRaw(NoopPrefs.of(context).getString(NoopPrefs.KEY_UNIT_SYSTEM, null))
 
-    /** The resolved temperature unit, applying the "match the length/mass system" default. */
+    /** Exercise distance + pace. Unset/unknown follows the original combined preference. */
+    fun distanceSystem(context: Context): UnitSystem = resolveDistance(
+        system(context),
+        NoopPrefs.of(context).getString(NoopPrefs.KEY_DISTANCE_UNIT_SYSTEM, null),
+    )
+
+    /** Pure resolver shared with tests and Apple: an explicit valid value wins, otherwise legacy wins. */
+    fun resolveDistance(system: UnitSystem, override: String?): UnitSystem =
+        UnitSystem.entries.firstOrNull { it.raw == override } ?: system
+
+    /**
+     * Which skin-temp number the cards LEAD with (#1846). Absolute by default — a temperature is what a
+     * temperature reading should say — with DEVIATION for wearers who track the ±baseline move. Only a
+     * preference: [com.noop.analytics.SkinTempDisplay.leadReading] still falls back to the other number,
+     * so a night that measured only one is never blanked by this choice.
+     */
+    fun skinTempPreferred(context: Context): com.noop.analytics.SkinTempDisplay.Kind =
+        com.noop.analytics.SkinTempDisplay.Kind.fromRaw(
+            NoopPrefs.of(context).getString(NoopPrefs.KEY_SKIN_TEMP_DISPLAY, null),
+        ) ?: com.noop.analytics.SkinTempDisplay.Kind.ABSOLUTE
+
+    /** The resolved temperature unit, following body measurements by default. */
     fun temperature(context: Context): TemperatureUnit {
         val override = TemperatureUnit.fromRaw(
             NoopPrefs.of(context).getString(NoopPrefs.KEY_TEMPERATURE_UNIT, null),
@@ -152,6 +224,18 @@ object UnitPrefs {
     /** Persist the nightly-HRV window. Changing it re-scores + re-baselines (the value itself moves). */
     fun setHrvWindow(context: Context, window: HrvWindow) {
         NoopPrefs.of(context).edit().putString(KEY_HRV_WINDOW, window.raw).apply()
+    }
+
+    /** SharedPreferences key for the Sleep tab's stage-chart style (#sleep-chart-style). */
+    const val KEY_SLEEP_CHART_STYLE = "sleep.chart.style"
+
+    /** The Sleep stage-chart style (default CLASSIC per-stage rows). Display-only. */
+    fun sleepChartStyle(context: Context): SleepChartStyle =
+        SleepChartStyle.fromRaw(NoopPrefs.of(context).getString(KEY_SLEEP_CHART_STYLE, null))
+
+    /** Persist the Sleep stage-chart style. Display-only — no re-score. */
+    fun setSleepChartStyle(context: Context, style: SleepChartStyle) {
+        NoopPrefs.of(context).edit().putString(KEY_SLEEP_CHART_STYLE, style.raw).apply()
     }
 }
 
@@ -200,6 +284,21 @@ object UnitFormatter {
     }
 
     /**
+     * Average pace for display: "m:ss /km" (metric) or "m:ss /mi" (imperial). "—" when pace is undefined
+     * (null or ≤ 0, i.e. no distance yet). [secPerKm] is the seconds-per-kilometre the GPS session
+     * publishes. Byte-identical to the Swift `UnitFormatter.paceFromSecPerKm`. (#1195)
+     */
+    fun paceFromSecPerKm(secPerKm: Double?, system: UnitSystem): String {
+        if (secPerKm == null || secPerKm <= 0) return "—"
+        val (secs, label) = when (system) {
+            UnitSystem.IMPERIAL -> (secPerKm / MILES_PER_KILOMETER) to "/mi"
+            UnitSystem.METRIC -> secPerKm to "/km"
+        }
+        val s = secs.roundToInt()
+        return "${s / 60}:${(s % 60).toString().padStart(2, '0')} $label"
+    }
+
+    /**
      * Format a distance given in KILOMETRES (e.g. the Workouts "Total Distance" sum), with one decimal
      * and a unit label. Metric: "12.4 km". Imperial: "7.7 mi".
      */
@@ -210,6 +309,15 @@ object UnitFormatter {
 
     /** Unit label only, for sites that format the number separately. "km" / "mi". */
     fun distanceUnit(system: UnitSystem): String = if (system == UnitSystem.IMPERIAL) "mi" else "km"
+
+    /** Format speed stored in kilometres/hour in the exercise-distance system. */
+    fun speedFromKilometersPerHour(kmh: Double?, system: UnitSystem): String? {
+        if (kmh == null || !kmh.isFinite() || kmh < 0) return null
+        return when (system) {
+            UnitSystem.METRIC -> oneDecimal(kmh) + " km/h"
+            UnitSystem.IMPERIAL -> oneDecimal(kmToMiles(kmh)) + " mph"
+        }
+    }
 
     // MARK: Mass (stored kg)
 

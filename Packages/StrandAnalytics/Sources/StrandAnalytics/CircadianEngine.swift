@@ -27,7 +27,35 @@ public enum CircadianEngine {
     /// Days at/above which the fit reads as full-confidence.
     public static let goodDaysForFit: Int = 14
     /// A cosinor fit with amplitude below this fraction of the mesor is "arrhythmic" — too flat to phase.
+    ///
+    /// #982 — RELATIVE, applied to a signal (mean HR, see `ActivityBin`) whose mesor is ~45-75 bpm rather
+    /// than the near-zero mesor a motion volume would have. So the effective bar is an absolute amplitude
+    /// of `0.10 x mesor`: about 6.5 bpm at a 65 bpm mesor, about 4.5 bpm at 45. It scales WITH the mesor,
+    /// so a low-resting wearer faces a LOWER absolute bar, not a higher one — the opposite of the concern
+    /// raised in #982, which assumed the gate penalises the fittest.
+    ///
+    /// The VALUE is still not re-tuned — every candidate remains unvalidated. What changed is the SHAPE:
+    /// `minAbsoluteAmplitudeBpm` now passes a swing large enough in bpm regardless of mesor. This note
+    /// asked for "a wearer whose amplitude is disproportionately small for their mesor — an n=1
+    /// observation" before that could happen, and one arrived: 5.5 bpm on a 74.7 bpm mesor with a coherent
+    /// acrophase. "Nobody is currently silenced by it" was true when written and is no longer.
+    /// `CircadianEngineTests` pins what the gate costs at each mesor so the trade stays visible.
     public static let minRelativeAmplitude: Double = 0.10
+    /// Absolute amplitude (bpm) that reads as rhythmic whatever the mesor — the relative bar's escape hatch.
+    ///
+    /// The relative test scales the requirement WITH resting HR, so the identical swing is accepted on one
+    /// body and refused on another: 5.5 bpm passes at a 55 bpm mesor and fails at 74.7. That is not a
+    /// judgement about the rhythm, it is a judgement about the baseline, and a measured wearer sat exactly
+    /// there — 5.5 bpm on a 74.7 bpm mesor, acrophase 16.1 h implying a CBTmin near 04:06, which is a
+    /// textbook phase rather than noise. `minRelativeAmplitude`'s own note called for precisely that
+    /// observation ("a wearer whose amplitude is disproportionately small for their mesor") before the
+    /// shape could be revisited.
+    ///
+    /// 4.5 bpm is NOT a new tuning constant: it is the absolute amplitude the relative gate ALREADY
+    /// accepts at the bottom of the ~45-75 bpm mesor range it was described against. The rule this
+    /// encodes is internal consistency — an amplitude good enough for some wearer is good enough for all
+    /// — so the change is strictly more permissive and no one who reads rhythmic today stops.
+    public static let minAbsoluteAmplitudeBpm: Double = 4.5
     /// Max clock-shift the planner steps per day (hours) — the well-established ~1 h/day re-entrainment rate.
     public static let maxShiftPerDayHours: Double = 1.0
     /// CBTmin sits roughly this many hours before habitual wake; used to translate the activity acrophase
@@ -36,11 +64,34 @@ public enum CircadianEngine {
     /// Activity acrophase (peak activity) sits roughly this many hours after CBTmin in a typical day — the
     /// offset used to convert the cosinor acrophase into an estimated temperature-minimum time.
     public static let acrophaseAfterCbtMinHours: Double = 12.0
+    /// Population-typical wake hour, used ONLY to place the chronotype reference point.
+    ///
+    /// `offsetVsScheduleMinutes` compares the clock to the USER'S OWN schedule, so it cannot name a
+    /// chronotype: someone reliably asleep 03:00-11:00 has an offset near zero and would read
+    /// "intermediate" while being strongly evening-type. A named lean needs an ABSOLUTE phase, so it is
+    /// bucketed from `tempMinHour` against a population reference instead.
+    public static let chronotypeReferenceWakeHour: Double = 7.0
+    /// Half-width of the "intermediate" band around the reference CBTmin, in hours.
+    ///
+    /// Deliberately wide. `tempMinHour` is derived from an activity cosinor (`acrophase - 12 h`) unless a
+    /// measured `observedTempMinHour` is supplied, and NO production caller supplies one today — so this
+    /// is a lean inferred from movement, not a thermal measurement. A one-hour band either side keeps the
+    /// three buckets coarse enough to be honest about that.
+    public static let chronotypeBandHours: Double = 1.0
 
     // MARK: - Inputs
 
-    /// One per-hour rest-activity sample: the local clock hour (0..<24, may be fractional) and the motion
-    /// volume in that bin (e.g. StepsEstimateEngine.dayMotionIntensity per hour). Higher = more active.
+    /// One per-hour rest-activity sample: the local clock hour (0..<24, may be fractional) and the
+    /// rhythm signal in that bin. Higher = more active.
+    ///
+    /// #982 — this said "motion volume (e.g. StepsEstimateEngine.dayMotionIntensity per hour)". It has
+    /// never been fed that. The only production caller pools per-hour MEAN HEART RATE in bpm
+    /// (`AppModel.swift`, `sums[hour] += b.bpm`), and that is the right choice on this hardware: WHOOP 4.0
+    /// motion is too sparse to stage sleep at all (#345), while HR carries a strong circadian rhythm.
+    ///
+    /// The domain matters because `minRelativeAmplitude` gates on `amplitude / |mesor|`, and HR arrives
+    /// with a large DC offset that motion does not have — see that constant for what the gate actually
+    /// costs in bpm.
     public struct ActivityBin: Equatable, Sendable {
         public let hour: Double
         public let activity: Double
@@ -159,7 +210,10 @@ public enum CircadianEngine {
         guard let fit = cosinor(bins) else { return nil }
 
         let relativeAmplitude = fit.mesor != 0 ? fit.amplitude / abs(fit.mesor) : 0
-        if daysObserved < minDaysForFit || relativeAmplitude < minRelativeAmplitude {
+        // Rhythmic on EITHER measure: a proportional swing, or an absolute one large enough to read on
+        // any baseline. See `minAbsoluteAmplitudeBpm` for why the relative test alone was self-inconsistent.
+        let rhythmic = relativeAmplitude >= minRelativeAmplitude || fit.amplitude >= minAbsoluteAmplitudeBpm
+        if daysObserved < minDaysForFit || !rhythmic {
             // A reading is returned, but flagged unreadable so the surface says "hard to read right now."
             let tmin = observedTempMinHour ?? wrap24(fit.acrophaseHours - acrophaseAfterCbtMinHours)
             return PhaseEstimate(tempMinHour: tmin, acrophaseHours: fit.acrophaseHours,
@@ -177,7 +231,13 @@ public enum CircadianEngine {
         let offsetHours = signedHourDelta(from: idealTempMin, to: tempMinHour)
         let offsetMinutes = offsetHours * 60.0
 
-        let confidence: PhaseConfidence = daysObserved >= goodDaysForFit ? .solid : .wide
+        // SOLID means strong on BOTH axes, not just enough days. A rhythm admitted by
+        // `minAbsoluteAmplitudeBpm` alone is real but modest, and a smaller swing pins its acrophase less
+        // tightly — so it stays `.wide`. That matters because `.wide` is what withholds `chronotype`,
+        // which names a category off exactly that acrophase: widening the readable gate should give more
+        // people a body clock, not give a thinner fit a firmer label.
+        let confidence: PhaseConfidence =
+            (daysObserved >= goodDaysForFit && relativeAmplitude >= minRelativeAmplitude) ? .solid : .wide
         let lean: String
         if offsetMinutes > 20 { lean = "later (a night-owl lean)" }
         else if offsetMinutes < -20 { lean = "earlier (a morning-lark lean)" }
@@ -299,6 +359,86 @@ public enum CircadianEngine {
         var x = h.truncatingRemainder(dividingBy: 24.0)
         if x < 0 { x += 24.0 }
         return x
+    }
+
+    /// A coarse, ABSOLUTE body-clock category: where the temperature minimum sits on the clock.
+    ///
+    /// NOT the "chronotype lean" wording used elsewhere. `estimatePhase` builds a `lean` string from
+    /// `offsetVsScheduleMinutes` ("a night-owl lean"), and the v5 skin-temp design spec defines chronotype
+    /// lean as "earlier/later than your sleep schedule implies" — both RELATIVE to the wearer's own
+    /// schedule. This is relative to the CLOCK, and the two genuinely disagree: a consistent 03:00-11:00
+    /// sleeper is well-aligned by the relative read and `.evening` by this one. Keep the vocabularies
+    /// disjoint in anything user-facing, or the two readings look like a contradiction (#1409).
+    ///
+    /// Three buckets, not a score: the underlying phase estimate is an activity fit, and a finer grain
+    /// would imply precision it does not have.
+    public enum Chronotype: String, Equatable, Sendable, Codable {
+        case morning        // CBTmin earlier than the population reference
+        case intermediate
+        case evening        // CBTmin later than the population reference
+    }
+
+    /// The reference CBTmin clock hour a lean is measured against: the population wake hour minus the
+    /// same `cbtMinBeforeWakeHours` the phase estimator already uses, so the anchor moves with the
+    /// engine's own model rather than being a second, independently-drifting constant.
+    public static var chronotypeAnchorHour: Double {
+        wrap24(chronotypeReferenceWakeHour - cbtMinBeforeWakeHours)
+    }
+
+    /// The chronotype-ideal sleep window for a night of `durationHours`, as clock hours.
+    ///
+    /// Anchored on the temperature minimum: a well-entrained sleeper wakes about `cbtMinBeforeWakeHours`
+    /// after CBTmin, so the ideal wake is `tempMinHour + cbtMinBeforeWakeHours` and the ideal bedtime is
+    /// that minus the night's own length.
+    ///
+    /// USING THE ACTUAL DURATION IS THE POINT. Giving the ideal arc the same length as the real one makes
+    /// the comparison purely about PHASE — did you sleep at the right TIME — so a short night reads as
+    /// aligned-but-short rather than as misaligned. Feeding a "needed" duration instead would fold two
+    /// different failures into one arc and make a debt look like a body-clock problem.
+    ///
+    /// nil for a non-positive or impossible duration; a window longer than a day cannot be placed on a
+    /// 24 h ring, and silently wrapping it would draw a full circle that means nothing.
+    public static func idealSleepWindow(tempMinHour: Double,
+                                        durationHours: Double) -> (bedHour: Double, wakeHour: Double)? {
+        guard durationHours > 0, durationHours < 24 else { return nil }
+        let wake = wrap24(tempMinHour + cbtMinBeforeWakeHours)
+        return (bedHour: wrap24(wake - durationHours), wakeHour: wake)
+    }
+
+    /// Signed hours the ACTUAL sleep window sits later (+) or earlier (−) than the chronotype-ideal one.
+    ///
+    /// Deliberately NOT `offsetVsScheduleMinutes`. That field compares the body clock to the wearer's own
+    /// SCHEDULE; this compares the night actually slept to where the CLOCK wanted it. A dial that draws an
+    /// actual arc against an ideal arc must caption itself with the distance between those two arcs, or
+    /// the number contradicts the picture — the two disagree exactly when someone keeps a consistent
+    /// schedule that does not suit their clock, which is the case the dial exists to show.
+    ///
+    /// Anchored on wake rather than bedtime because `idealSleepWindow` builds the ideal window from the
+    /// wake end; comparing bedtimes would fold the night's DURATION into a phase reading.
+    public static func sleepWindowOffsetHours(tempMinHour: Double, actualWakeHour: Double) -> Double {
+        signedHourDelta(from: wrap24(tempMinHour + cbtMinBeforeWakeHours), to: wrap24(actualWakeHour))
+    }
+
+    /// Bucket an ABSOLUTE temperature-minimum clock hour into a lean.
+    ///
+    /// Compared CIRCULARLY. A `tempMinHour` of 23:30 is five hours BEFORE the 04:30 anchor — a strong
+    /// morning lean — and a naive `23.5 > 5.5` would call it evening instead. Pure, so the boundaries are
+    /// assertable without building a fit.
+    public static func chronotype(tempMinHour: Double) -> Chronotype {
+        let delta = signedHourDelta(from: chronotypeAnchorHour, to: wrap24(tempMinHour))
+        if delta < -chronotypeBandHours { return .morning }
+        if delta > chronotypeBandHours { return .evening }
+        return .intermediate
+    }
+
+    /// The lean for a phase estimate, or nil when the fit is not strong enough to name one.
+    ///
+    /// Gated to `.solid` on purpose. `.wide` is a real fit on thin data and is fine for the continuous
+    /// offset the card already shows, but a NAMED category reads as a fact about the person rather than a
+    /// reading of the week, so it waits for the stronger tier. `.unreadable` never names one.
+    public static func chronotype(_ estimate: PhaseEstimate) -> Chronotype? {
+        guard estimate.confidence == .solid else { return nil }
+        return chronotype(tempMinHour: estimate.tempMinHour)
     }
 
     /// Signed shortest delta in hours from `a` to `b` on the 24 h clock, in (−12, 12].

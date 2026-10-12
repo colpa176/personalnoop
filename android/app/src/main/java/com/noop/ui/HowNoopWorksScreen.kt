@@ -203,9 +203,7 @@ private fun IntroCard() {
         Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Overline("The one rule")
             Text(
-                uiString(R.string.l10n_how_noop_works_screen_noop_never_shows_you_a_number_d1db9958) +
-                    "it tells you why and what to do next. Everything here runs on your " +
-                    "device, from your strap.",
+                uiString(R.string.l10n_how_noop_works_screen_noop_never_shows_you_a_number_d1db9958),
                 style = NoopType.subhead,
                 color = Palette.textSecondary,
             )
@@ -259,8 +257,7 @@ private fun PrimerCard(section: PrimerSection) {
 @Composable
 private fun FooterNote() {
     Text(
-        uiString(R.string.l10n_how_noop_works_screen_noop_never_makes_up_a_number_da29aca5) +
-            "what's missing and what to do, rather than showing a fake value.",
+        uiString(R.string.l10n_how_noop_works_screen_noop_never_makes_up_a_number_da29aca5),
         style = NoopType.footnote,
         color = Palette.textTertiary,
         modifier = Modifier

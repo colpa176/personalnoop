@@ -34,6 +34,9 @@ internal fun selectNight(
     // group order onto HeroNight.groupMotion. Empty/absent → honest empty state. Default empty so existing
     // callers/tests compile unchanged.
     motionByStart: Map<Long, List<Double>> = emptyMap(),
+    // #1821: the reader's chosen clock, for the hero's onset-wake label. Defaults to the 24h the label
+    // was hardcoded to, so existing callers and tests are unchanged until they opt in.
+    is24h: Boolean = true,
 ): HeroNight? {
     if (navDays.isEmpty()) return null
     val dayIdx = offset.coerceIn(0, navDays.size - 1)
@@ -114,8 +117,8 @@ internal fun selectNight(
     val groupInBedMin = if (heroGroup.size > 1) {
         heroGroup.sumOf { (it.endTs - it.effectiveStartTs).coerceAtLeast(0L) } / 60.0
     } else null
-    return HeroNight(session, dayKey, segments, clockLabelFor(heroOnsetTs, heroWakeTs), napBlocks, groupStages,
-        groupSegments, groupMotion, groupInBedMin, heroOnsetTs, heroWakeTs)
+    return HeroNight(session, dayKey, segments, clockLabelFor(heroOnsetTs, heroWakeTs, is24h), napBlocks, groupStages,
+        groupSegments, groupMotion, groupInBedMin, heroOnsetTs, heroWakeTs, heroGroup)
 }
 
 /**
@@ -159,6 +162,24 @@ internal fun mainSleepGroup(blocks: List<SleepSession>, habitualMidsleepSec: Lon
     ) ?: return emptyList()
     return idx.map { blocks[it] }.sortedBy { it.effectiveStartTs }
 }
+
+/**
+ * Actual asleep minutes in blocks outside each day's canonical main-night group. The Sleep screen's
+ * session union has already removed cross-namespace duplicates; this helper only applies the same
+ * main-vs-nap classification the hero uses and decodes the persisted stage minutes. A stage-less nap
+ * contributes nothing rather than substituting its in-bed window. Mirrors `SleepView.napSleepMinutesByDay`.
+ */
+internal fun napSleepMinutesByDay(
+    sleeps: List<SleepSession>,
+    habitualMidsleepSec: Long? = null,
+): Map<String, Double> = sleeps
+    .groupBy { localDayString(it.endTs) }
+    .mapValues { (_, blocks) ->
+        val mainStarts = mainSleepGroup(blocks, habitualMidsleepSec).mapTo(hashSetOf()) { it.startTs }
+        blocks.asSequence()
+            .filter { it.startTs !in mainStarts }
+            .sumOf { decodedAsleepMinutes(it.stagesJSON, it.effectiveStartTs) }
+    }
 
 /**
  * The day's main-night bridged SPAN (onset -> wake), the same window [mainSleepGroup] bridges into one
